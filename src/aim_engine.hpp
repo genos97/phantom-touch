@@ -2,6 +2,7 @@
 
 #include "profile.hpp"
 #include "protocol.hpp"
+#include "fps_view.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -88,11 +89,12 @@ private:
     void stepJoystickGlideLocked(double nowMs);
     void reactivateJoystickLocked(double nowMs);
 
-    void liftAimFingerLocked();
+    static void fpsViewEmitBridge(void* ctx, TouchAction action, uint64_t pointerId,
+                                  int32_t px, int32_t py, bool clampToScreen);
+    void syncFpsViewConfigLocked(uint32_t w, uint32_t h);
+
     void liftFireFingerLocked();
-    void liftHoldViewLocked();
     void pressFireLocked(double nowMs);
-    void ensureAimDownLocked(double anchorX, double anchorY);
     void releaseMouseTouchesLocked();
     void releaseAllLocked();
 
@@ -128,26 +130,10 @@ private:
     double smoothDx_ = 0.0;
     double smoothDy_ = 0.0;
 
-    // Main Aim virtual finger state (alternates between PTR_AIM_A=2 and PTR_AIM_B=4)
-    bool aimDown_ = false;
-    uint64_t activeAimPtr_ = 2;
-    double aimOriginX_ = 0.0;
-    double aimOriginY_ = 0.0;
-    double aimCurX_ = 0.0;
-    double aimCurY_ = 0.0;
-    int32_t aimLastSentX_ = -1;
-    int32_t aimLastSentY_ = -1;
-    double lastMouseMoveMs_ = 0.0;
-    bool pendingAimFirstMove_ = false;
-
-    // Secondary temporary drag-look view (NODE_HOLD_VIEW, e.g. Free Look Eye)
-    bool holdViewActive_ = false;
-    int holdViewBtnIdx_ = -1;
-    bool holdViewDown_ = false;
-    double holdViewCurX_ = 0.0;
-    double holdViewCurY_ = 0.0;
-    int32_t holdViewLastX_ = -1;
-    int32_t holdViewLastY_ = -1;
+    // Dedicated standalone 360° Virtual-Finger FPS View Stack (main camera + Free Look overlay)
+    FpsViewStack viewStack_;
+    uint32_t lastConfiguredW_ = 0;
+    uint32_t lastConfiguredH_ = 0;
 
     // Scope sensitivity state (NODE_SWITCH_SENS or switchScopeSens on SCOPE node)
     bool scopeSensActive_ = false;

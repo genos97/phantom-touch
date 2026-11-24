@@ -49,7 +49,66 @@ bool isMouseVk(int vk) {
 
 } // namespace
 
-AimEngine::AimEngine(ScrcpyBridge* bridge) : bridge_(bridge) {
+void AimEngine::fpsViewEmitBridge(void* ctx, TouchAction action, uint64_t pointerId,
+                                  int32_t px, int32_t py, bool clampToScreen) {
+    ScrcpyBridge* br = reinterpret_cast<ScrcpyBridge*>(ctx);
+    if (br) {
+        br->sendTouchPixels(action, pointerId, px, py, clampToScreen);
+    }
+}
+
+void AimEngine::syncFpsViewConfigLocked(uint32_t w, uint32_t h) {
+    if (w == 0) w = 1920;
+    if (h == 0) h = 1080;
+    double dw = static_cast<double>(w);
+    double dh = static_cast<double>(h);
+
+    FpsViewConfig cfg;
+    cfg.screenW = dw;
+    cfg.screenH = dh;
+    cfg.centerX = static_cast<double>(profile_.aimX) * dw;
+    cfg.centerY = static_cast<double>(profile_.aimY) * dh;
+    cfg.sensX = static_cast<double>(profile_.sensX);
+    cfg.sensY = static_cast<double>(profile_.sensY);
+    cfg.ffCounterAccel = static_cast<double>(profile_.ffCounterAccel);
+    cfg.invertY = profile_.invertY;
+    cfg.unbounded = profile_.unboundedAim;
+    cfg.clampInsteadOfRelease = false;
+    cfg.touchDownDelayMs = (profile_.touchDownDelayMs >= 15) ? profile_.touchDownDelayMs : 15;
+    cfg.touchUpDelayMs = profile_.touchUpDelayMs;
+    cfg.idleReleaseMs = profile_.idleResetMs;
+    cfg.edgeReleaseOnly = (profile_.idleResetMs <= 0);
+
+    if (profile_.unboundedAim) {
+        cfg.rectLeft   = -99999999.0;
+        cfg.rectTop    = -99999999.0;
+        cfg.rectRight  =  99999999.0;
+        cfg.rectBottom =  99999999.0;
+        cfg.touchDownRandomRangePx = 0; // Exact center landing in Free Fire
+    } else {
+        // Bounded 360° box safely inset by 50px from physical screen edges (with ±50px landing jitter)
+        double margin = 50.0;
+        double minX = clampd(cfg.centerX - static_cast<double>(profile_.aimHalfW) * dw, margin, dw - margin);
+        double maxX = clampd(cfg.centerX + static_cast<double>(profile_.aimHalfW) * dw, margin, dw - margin);
+        double minY = clampd(cfg.centerY - static_cast<double>(profile_.aimHalfH) * dh, margin, dh - margin);
+        double maxY = clampd(cfg.centerY + static_cast<double>(profile_.aimHalfH) * dh, margin, dh - margin);
+        if (maxX - minX < 120.0) { minX = margin; maxX = dw - margin; }
+        if (maxY - minY < 120.0) { minY = margin; maxY = dh - margin; }
+        cfg.rectLeft   = minX;
+        cfg.rectTop    = minY;
+        cfg.rectRight  = maxX;
+        cfg.rectBottom = maxY;
+        cfg.touchDownRandomRangePx = 50;
+    }
+
+    viewStack_.configureMain(cfg);
+    lastConfiguredW_ = w;
+    lastConfiguredH_ = h;
+}
+
+AimEngine::AimEngine(ScrcpyBridge* bridge)
+    : bridge_(bridge),
+      viewStack_(PTR_AIM_A, PTR_AIM_B, PTR_HOLD_VIEW) {
     InitializeCriticalSection(&lock_);
     InitializeCriticalSection(&inputLock_);
     wakeEvent_ = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -57,6 +116,10 @@ AimEngine::AimEngine(ScrcpyBridge* bridge) : bridge_(bridge) {
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
     profile_ = createDefaultFreeFireProfile();
     btnState_.resize(profile_.buttons.size());
+    viewStack_.setTouchSink(fpsViewEmitBridge, bridge_);
+    uint32_t w = 1920, h = 1080;
+    if (bridge_) bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
     EnterCriticalSection(&inputLock_);
     rebuildKeyRouteCacheLocked();
     LeaveCriticalSection(&inputLock_);
@@ -115,6 +178,9 @@ void AimEngine::setProfile(const Profile& profile) {
     releaseAllLocked();
     profile_ = profile;
     btnState_.assign(profile_.buttons.size(), ButtonRuntime());
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
     EnterCriticalSection(&inputLock_);
     pendingKeys_.clear();
     pendingCursor_.clear();
@@ -135,11 +201,20 @@ void AimEngine::setAimMode(bool enabled) {
     bool wasEnabled = (aimMode_ != 0);
     if (wasEnabled == enabled) return;
 
+    double nowMs = getTimeMs();
     EnterCriticalSection(&lock_);
     // Only release mouse/aim/fire/cursor fingers — KEEP WASD and held keyboard keys alive!
     // That way unlocking the mouse to loot/click NEVER interrupts running or disables the keyboard!
     releaseMouseTouchesLocked();
     InterlockedExchange(&aimMode_, enabled ? 1 : 0);
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
+    if (enabled) {
+        viewStack_.onFocusGain(nowMs);
+    } else {
+        viewStack_.onFocusLose(nowMs);
+    }
     EnterCriticalSection(&inputLock_);
     accumRawDx_ = 0.0;
     accumRawDy_ = 0.0;
@@ -278,20 +353,25 @@ void AimEngine::triggerButtonStartLocked(size_t idx, double nowMs, bool& outRequ
         }
         case NODE_HOLD_VIEW: {
             if (!aimMode_) break; // Free-look drag requires mouse lock
-            // Push temporary drag-look view (e.g. Free Look Eye) onto view stack!
-            liftAimFingerLocked();
-            liftHoldViewLocked();
-            holdViewActive_ = true;
-            holdViewBtnIdx_ = static_cast<int>(idx);
-            holdViewCurX_ = static_cast<double>(b.x) * static_cast<double>(w);
-            holdViewCurY_ = static_cast<double>(b.y) * static_cast<double>(h);
-            int32_t px = static_cast<int32_t>(std::floor(holdViewCurX_ + 0.5));
-            int32_t py = static_cast<int32_t>(std::floor(holdViewCurY_ + 0.5));
-            bridge_->sendTouchPixels(TOUCH_DOWN, PTR_HOLD_VIEW, px, py, true);
-            holdViewDown_ = true;
-            holdViewLastX_ = px;
-            holdViewLastY_ = py;
-            ++packetsThisSec_;
+            // Push temporary mouse-linked drag view (e.g. Free Look Eye) onto FpsViewStack!
+            FpsViewConfig ovCfg;
+            ovCfg.screenW = static_cast<double>(w);
+            ovCfg.screenH = static_cast<double>(h);
+            ovCfg.centerX = static_cast<double>(b.x) * ovCfg.screenW;
+            ovCfg.centerY = static_cast<double>(b.y) * ovCfg.screenH;
+            ovCfg.rectLeft = 4.0;
+            ovCfg.rectTop = 4.0;
+            ovCfg.rectRight = ovCfg.screenW - 5.0;
+            ovCfg.rectBottom = ovCfg.screenH - 5.0;
+            ovCfg.sensX = static_cast<double>(profile_.sensX);
+            ovCfg.sensY = static_cast<double>(profile_.sensY);
+            ovCfg.ffCounterAccel = 0.0;
+            ovCfg.invertY = profile_.invertY;
+            ovCfg.unbounded = profile_.unboundedAim;
+            ovCfg.clampInsteadOfRelease = !profile_.unboundedAim;
+            ovCfg.edgeReleaseOnly = true;
+            ovCfg.touchDownRandomRangePx = 0;
+            viewStack_.pushOverlay(static_cast<int>(idx), ovCfg, nowMs, packetsThisSec_);
             break;
         }
         case NODE_SWIPE: {
@@ -321,8 +401,7 @@ void AimEngine::triggerButtonStartLocked(size_t idx, double nowMs, bool& outRequ
             break;
         }
         case NODE_RESET_VIEW: {
-            liftAimFingerLocked();
-            liftHoldViewLocked();
+            viewStack_.resetMainView(nowMs);
             scopeSensActive_ = false;
             aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
             break;
@@ -382,8 +461,8 @@ void AimEngine::triggerButtonStopLocked(size_t idx, double nowMs) {
             break;
         }
         case NODE_HOLD_VIEW: {
-            if (holdViewActive_ && holdViewBtnIdx_ == static_cast<int>(idx)) {
-                liftHoldViewLocked();
+            if (viewStack_.isOverlayActive() && viewStack_.overlayOwnerId() == static_cast<int>(idx)) {
+                viewStack_.popOverlay(static_cast<int>(idx), nowMs, packetsThisSec_);
                 aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
             }
             break;
@@ -590,16 +669,12 @@ void AimEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
         }
         if (fireHeld_ != down) {
             fireHeld_ = down;
-            uint32_t w = 1920, h = 1080;
-            bridge_->getScreenSize(w, h);
-            double dw = static_cast<double>(w);
-            double dh = static_cast<double>(h);
 
             if (profile_.fireMode == FIRE_MODE_DRAG_RIGHT) {
                 if (down) {
                     quickTapFireReleaseAtMs_ = 0.0;
-                    if (aimDown_) {
-                        liftAimFingerLocked();
+                    if (viewStack_.mainView().isFingerPlaced()) {
+                        viewStack_.resetMainView(nowMs);
                         pendingFireDown_ = true;
                         pendingFireAtMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs > 0 ? profile_.touchDownDelayMs : 12);
                     } else {
@@ -616,9 +691,8 @@ void AimEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
                 }
             } else if (profile_.fireMode == FIRE_MODE_CLAW_LEFT) {
                 if (down) {
-                    if (isAim && !holdViewActive_) {
-                        ensureAimDownLocked(static_cast<double>(profile_.aimX) * dw,
-                                            static_cast<double>(profile_.aimY) * dh);
+                    if (isAim && !viewStack_.isOverlayActive()) {
+                        viewStack_.ensureMainFingerDown(nowMs, packetsThisSec_);
                     }
                     pressFireLocked(nowMs);
                 } else {
@@ -627,9 +701,8 @@ void AimEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
             } else {
                 // FIRE_MODE_DUAL_DRAG
                 if (down) {
-                    if (isAim && !holdViewActive_) {
-                        ensureAimDownLocked(static_cast<double>(profile_.aimX) * dw,
-                                            static_cast<double>(profile_.aimY) * dh);
+                    if (isAim && !viewStack_.isOverlayActive()) {
+                        viewStack_.ensureMainFingerDown(nowMs, packetsThisSec_);
                     }
                     pressFireLocked(nowMs);
                 } else {
@@ -790,23 +863,6 @@ void AimEngine::reactivateJoystickLocked(double nowMs) {
     updateJoystickLocked(nowMs);
 }
 
-void AimEngine::ensureAimDownLocked(double anchorX, double anchorY) {
-    if (!aimDown_) {
-        aimOriginX_ = anchorX;
-        aimOriginY_ = anchorY;
-        aimCurX_ = anchorX;
-        aimCurY_ = anchorY;
-        int32_t apx = static_cast<int32_t>(std::floor(aimCurX_ + 0.5));
-        int32_t apy = static_cast<int32_t>(std::floor(aimCurY_ + 0.5));
-        bridge_->sendTouchPixels(TOUCH_DOWN, activeAimPtr_, apx, apy, true);
-        aimDown_ = true;
-        aimLastSentX_ = apx;
-        aimLastSentY_ = apy;
-        pendingAimFirstMove_ = true;
-        ++packetsThisSec_;
-    }
-}
-
 void AimEngine::pressFireLocked(double /*nowMs*/) {
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
@@ -832,30 +888,6 @@ void AimEngine::pressFireLocked(double /*nowMs*/) {
     ++packetsThisSec_;
 }
 
-void AimEngine::liftAimFingerLocked() {
-    if (aimDown_) {
-        bridge_->sendTouchPixels(TOUCH_UP, activeAimPtr_, aimLastSentX_, aimLastSentY_, !profile_.unboundedAim);
-        aimDown_ = false;
-        pendingAimFirstMove_ = false;
-        aimLastSentX_ = -1;
-        aimLastSentY_ = -1;
-        activeAimPtr_ = (activeAimPtr_ == PTR_AIM_A) ? PTR_AIM_B : PTR_AIM_A;
-        ++packetsThisSec_;
-    }
-}
-
-void AimEngine::liftHoldViewLocked() {
-    if (holdViewDown_) {
-        bridge_->sendTouchPixels(TOUCH_UP, PTR_HOLD_VIEW, holdViewLastX_, holdViewLastY_, !profile_.unboundedAim);
-        holdViewDown_ = false;
-        holdViewLastX_ = -1;
-        holdViewLastY_ = -1;
-        ++packetsThisSec_;
-    }
-    holdViewActive_ = false;
-    holdViewBtnIdx_ = -1;
-}
-
 void AimEngine::liftFireFingerLocked() {
     if (fireDown_) {
         int32_t dx = fireLastSentX_ - fireStartX_;
@@ -877,8 +909,8 @@ void AimEngine::liftFireFingerLocked() {
 }
 
 void AimEngine::releaseMouseTouchesLocked() {
-    liftAimFingerLocked();
-    liftHoldViewLocked();
+    double nowMs = getTimeMs();
+    viewStack_.onFocusLose(nowMs);
     liftFireFingerLocked();
     fireHeld_ = false;
     scopeSensActive_ = false;
@@ -941,10 +973,10 @@ void AimEngine::releaseAllTouches() {
 
 void AimEngine::resetAimView() {
     EnterCriticalSection(&lock_);
-    liftAimFingerLocked();
-    liftHoldViewLocked();
+    double nowMs = getTimeMs();
+    viewStack_.resetMainView(nowMs);
     scopeSensActive_ = false;
-    aimCooldownUntilMs_ = getTimeMs() + static_cast<double>(profile_.touchDownDelayMs);
+    aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
     LeaveCriticalSection(&lock_);
 }
 
@@ -1037,16 +1069,16 @@ void AimEngine::processTick(double nowMs) {
     accumRawDy_ = 0.0;
     LeaveCriticalSection(&inputLock_);
 
-    if (profile_.invertY) {
-        rawDy = -rawDy;
+    // Keep FpsViewStack screen geometry synced on rotation
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    if (w != lastConfiguredW_ || h != lastConfiguredH_) {
+        syncFpsViewConfigLocked(w, h);
     }
+    double dw = static_cast<double>(w);
+    double dh = static_cast<double>(h);
 
-    bool hasRawInput = (std::fabs(rawDx) > 0.0001 || std::fabs(rawDy) > 0.0001);
-    if (hasRawInput) {
-        lastMouseMoveMs_ = nowMs;
-    }
-
-    // 4. Compute velocity curve + independent X/Y + Fire + Scope multipliers
+    // 4. Compute velocity curve + Scope/Fire multipliers + optional smoothing
     bool firingActive = fireHeld_ || fireDown_;
     double speed = std::sqrt(rawDx * rawDx + rawDy * rawDy);
     double accelGain = 1.0;
@@ -1058,73 +1090,51 @@ void AimEngine::processTick(double nowMs) {
         }
     }
 
-    double sx = static_cast<double>(profile_.sensX);
-    double sy = static_cast<double>(profile_.sensY);
+    double multX = accelGain;
+    double multY = accelGain;
     if (scopeSensActive_) {
-        sx *= static_cast<double>(profile_.scopeSensX);
-        sy *= static_cast<double>(profile_.scopeSensY);
+        multX *= static_cast<double>(profile_.scopeSensX);
+        multY *= static_cast<double>(profile_.scopeSensY);
     }
     if (firingActive) {
-        sx *= static_cast<double>(profile_.fireSensX);
-        sy *= static_cast<double>(profile_.fireSensY);
+        multX *= static_cast<double>(profile_.fireSensX);
+        multY *= static_cast<double>(profile_.fireSensY);
     }
 
-    double targetDx = rawDx * sx * accelGain;
-    double targetDy = rawDy * sy * accelGain;
-
-    double stepX = targetDx;
-    double stepY = targetDy;
+    double feedDx = rawDx;
+    double feedDy = rawDy;
     if (profile_.smoothing > 0.001f) {
         double alpha = clampd(static_cast<double>(profile_.smoothing), 0.0, 0.85);
-        smoothDx_ = smoothDx_ * alpha + targetDx * (1.0 - alpha);
-        smoothDy_ = smoothDy_ * alpha + targetDy * (1.0 - alpha);
+        smoothDx_ = smoothDx_ * alpha + rawDx * (1.0 - alpha);
+        smoothDy_ = smoothDy_ * alpha + rawDy * (1.0 - alpha);
         if (std::fabs(smoothDx_) < 0.02) smoothDx_ = 0.0;
         if (std::fabs(smoothDy_) < 0.02) smoothDy_ = 0.0;
-        stepX = smoothDx_;
-        stepY = smoothDy_;
+        feedDx = smoothDx_;
+        feedDy = smoothDy_;
     }
 
-    bool hasStep = (std::fabs(stepX) > 0.0001 || std::fabs(stepY) > 0.0001);
+    bool hasFeed = (std::fabs(feedDx) > 0.0001 || std::fabs(feedDy) > 0.0001);
 
-    uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
-    double dw = static_cast<double>(w);
-    double dh = static_cast<double>(h);
-
-    // 5a. If a temporary HOLD_VIEW (e.g. Free Look Eye) is pushed onto the stack, it owns mouse movement!
-    if (holdViewActive_ && holdViewDown_) {
-        if (hasStep) {
-            holdViewCurX_ += stepX;
-            holdViewCurY_ += stepY;
-            if (!profile_.unboundedAim) {
-                holdViewCurX_ = clampd(holdViewCurX_, 4.0, dw - 5.0);
-                holdViewCurY_ = clampd(holdViewCurY_, 4.0, dh - 5.0);
-            }
-            int32_t px = static_cast<int32_t>(std::floor(holdViewCurX_ + 0.5));
-            int32_t py = static_cast<int32_t>(std::floor(holdViewCurY_ + 0.5));
-            if (px != holdViewLastX_ || py != holdViewLastY_) {
-                bridge_->sendTouchPixels(TOUCH_MOVE, PTR_HOLD_VIEW, px, py, !profile_.unboundedAim);
-                holdViewLastX_ = px;
-                holdViewLastY_ = py;
-                ++packetsThisSec_;
-            }
+    // 5a. If a temporary HOLD_VIEW (e.g. Free Look Eye) is pushed onto FpsViewStack, it owns mouse movement!
+    if (viewStack_.isOverlayActive()) {
+        if (hasFeed) {
+            viewStack_.onMouseDelta(feedDx, feedDy, 1.0, 1.0, nowMs, packetsThisSec_);
         }
+        viewStack_.tick(nowMs, true, packetsThisSec_);
         LeaveCriticalSection(&lock_);
         return;
     }
 
-    // Restored original Free Fire horizontal counter-acceleration curve
-    auto applyFreeFireCounterAccel = [&](double curX, double originX, double inDx) -> double {
-        if (profile_.ffCounterAccel <= 0.01f || dw <= 1.0) return inDx;
-        double r = std::fabs(curX - originX) / dw;
-        double k = static_cast<double>(profile_.ffCounterAccel);
-        return inDx * ((0.98 / (k * r * r + 1.0)) + 0.02);
-    };
-
     auto moveFireFinger = [&]() {
-        if (!hasStep || !fireDown_) return;
-        double dx = applyFreeFireCounterAccel(fireCurX_, static_cast<double>(fireStartX_), stepX);
-        double dy = stepY;
+        if (!hasFeed || !fireDown_) return;
+        double dx = feedDx * static_cast<double>(profile_.sensX) * multX;
+        double dy = feedDy * static_cast<double>(profile_.sensY) * multY;
+        if (profile_.invertY) dy = -dy;
+        if (profile_.ffCounterAccel > 0.01f && dw > 1.0) {
+            double r = std::fabs(fireCurX_ - static_cast<double>(fireStartX_)) / dw;
+            double k = static_cast<double>(profile_.ffCounterAccel);
+            dx *= ((0.98 / (k * r * r + 1.0)) + 0.02);
+        }
 
         if (profile_.unboundedAim) {
             fireCurX_ += clampd(dx, -160.0, 160.0);
@@ -1150,80 +1160,22 @@ void AimEngine::processTick(double nowMs) {
         }
     };
 
-    auto moveAimFinger = [&]() {
+    auto moveMainCamera = [&]() {
         if (nowMs < aimCooldownUntilMs_) return;
-
-        double anchorX = static_cast<double>(profile_.aimX) * dw;
-        double anchorY = static_cast<double>(profile_.aimY) * dh;
-
-        if (hasStep) {
-            if (!aimDown_) {
-                // Clean first-event-place: send TOUCH_DOWN first, carry delta to next tick
-                ensureAimDownLocked(anchorX, anchorY);
-                EnterCriticalSection(&inputLock_);
-                accumRawDx_ += rawDx;
-                accumRawDy_ += rawDy;
-                LeaveCriticalSection(&inputLock_);
-                return;
-            }
-            pendingAimFirstMove_ = false;
-
-            double dx = applyFreeFireCounterAccel(aimCurX_, aimOriginX_, stepX);
-            double dy = stepY;
-
-            double nextX = aimCurX_ + clampd(dx, -160.0, 160.0);
-            double nextY = aimCurY_ + clampd(dy, -160.0, 160.0);
-
-            if (!profile_.unboundedAim) {
-                double minX = clampd(anchorX - static_cast<double>(profile_.aimHalfW) * dw, dw * 0.30, dw - 5.0);
-                double maxX = clampd(anchorX + static_cast<double>(profile_.aimHalfW) * dw, dw * 0.30, dw - 5.0);
-                double minY = clampd(anchorY - static_cast<double>(profile_.aimHalfH) * dh, dh * 0.06, dh - 5.0);
-                double maxY = clampd(anchorY + static_cast<double>(profile_.aimHalfH) * dh, dh * 0.06, dh * 0.94);
-
-                if (nextX < minX || nextX > maxX || nextY < minY || nextY > maxY) {
-                    liftAimFingerLocked();
-                    aimCurX_ = anchorX;
-                    aimCurY_ = anchorY;
-                    int delay = (profile_.touchDownDelayMs >= 15) ? profile_.touchDownDelayMs : 15;
-                    aimCooldownUntilMs_ = nowMs + static_cast<double>(delay);
-                    smoothDx_ = 0.0;
-                    smoothDy_ = 0.0;
-                    return;
-                }
-            }
-
-            aimCurX_ = nextX;
-            aimCurY_ = nextY;
-            int32_t px = static_cast<int32_t>(std::floor(aimCurX_ + 0.5));
-            int32_t py = static_cast<int32_t>(std::floor(aimCurY_ + 0.5));
-            if (px != aimLastSentX_ || py != aimLastSentY_) {
-                bridge_->sendTouchPixels(TOUCH_MOVE, activeAimPtr_, px, py, !profile_.unboundedAim);
-                aimLastSentX_ = px;
-                aimLastSentY_ = py;
-                ++packetsThisSec_;
-            }
-        } else if (aimDown_ && !firingActive && profile_.idleResetMs > 0) {
-            // Between fights (after idleResetMs of stillness), quietly re-center so counter-accel starts fresh
-            if ((nowMs - lastMouseMoveMs_) >= static_cast<double>(profile_.idleResetMs)) {
-                bool displaced = (std::fabs(aimCurX_ - aimOriginX_) > dw * 0.20 ||
-                                  std::fabs(aimCurY_ - aimOriginY_) > dh * 0.20);
-                if (!profile_.unboundedAim || displaced) {
-                    liftAimFingerLocked();
-                    aimCurX_ = anchorX;
-                    aimCurY_ = anchorY;
-                }
-            }
+        if (hasFeed) {
+            viewStack_.onMouseDelta(feedDx, feedDy, multX, multY, nowMs, packetsThisSec_);
         }
+        viewStack_.tick(nowMs, firingActive, packetsThisSec_);
     };
 
     // 5b. Route movement according to selected FireMode
     if (profile_.fireMode == FIRE_MODE_DRAG_RIGHT && fireDown_) {
         moveFireFinger();
     } else if (profile_.fireMode == FIRE_MODE_DUAL_DRAG && fireDown_) {
-        moveAimFinger();
+        moveMainCamera();
         moveFireFinger();
     } else {
-        moveAimFinger();
+        moveMainCamera();
     }
 
     LeaveCriticalSection(&lock_);
@@ -1277,19 +1229,21 @@ EngineTelemetry AimEngine::getTelemetry() const {
     t.screenH = h;
     t.aimMode = (aimMode_ != 0);
     t.scopeActive = scopeSensActive_;
-    t.holdViewActive = holdViewActive_;
-    t.aimFingerDown = aimDown_ || holdViewDown_ || (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_);
+    t.holdViewActive = viewStack_.isOverlayActive();
+    bool mainDown = viewStack_.mainView().isFingerPlaced();
+    bool ovDown = viewStack_.isOverlayActive() && viewStack_.overlayView().isFingerPlaced();
+    t.aimFingerDown = mainDown || ovDown || (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_);
     t.fireHeld = fireHeld_;
     t.joyDown = joyDown_;
-    if (holdViewDown_) {
-        t.aimFingerNormX = static_cast<float>(clampd(holdViewCurX_ / static_cast<double>(w), 0.0, 1.0));
-        t.aimFingerNormY = static_cast<float>(clampd(holdViewCurY_ / static_cast<double>(h), 0.0, 1.0));
+    if (ovDown) {
+        t.aimFingerNormX = static_cast<float>(clampd(viewStack_.overlayView().curX() / static_cast<double>(w), 0.0, 1.0));
+        t.aimFingerNormY = static_cast<float>(clampd(viewStack_.overlayView().curY() / static_cast<double>(h), 0.0, 1.0));
     } else if (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_) {
         t.aimFingerNormX = static_cast<float>(clampd(fireCurX_ / static_cast<double>(w), 0.0, 1.0));
         t.aimFingerNormY = static_cast<float>(clampd(fireCurY_ / static_cast<double>(h), 0.0, 1.0));
-    } else if (aimDown_) {
-        t.aimFingerNormX = static_cast<float>(clampd(aimCurX_ / static_cast<double>(w), 0.0, 1.0));
-        t.aimFingerNormY = static_cast<float>(clampd(aimCurY_ / static_cast<double>(h), 0.0, 1.0));
+    } else if (mainDown) {
+        t.aimFingerNormX = static_cast<float>(clampd(viewStack_.mainView().curX() / static_cast<double>(w), 0.0, 1.0));
+        t.aimFingerNormY = static_cast<float>(clampd(viewStack_.mainView().curY() / static_cast<double>(h), 0.0, 1.0));
     } else {
         t.aimFingerNormX = profile_.aimX;
         t.aimFingerNormY = profile_.aimY;

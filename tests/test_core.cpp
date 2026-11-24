@@ -2,6 +2,7 @@
 #include "../src/profile.hpp"
 #include "../src/config_ui.hpp"
 #include "../src/protocol.hpp"
+#include "../src/fps_view.hpp"
 #include "../src/aim_engine.hpp"
 
 #include <cassert>
@@ -330,12 +331,128 @@ static void testLowLatencyAimDefaultsAnd360Consistency() {
     std::printf("[Test] Non-blocking KB+Mouse concurrency, unlocked keyboard/WASD & Scroll Up/Down OK!\n");
 }
 
+struct RecordedTouch {
+    TouchAction action;
+    uint64_t ptrId;
+    int32_t px;
+    int32_t py;
+    bool clamped;
+};
+
+static void recordTouchCb(void* ctx, TouchAction action, uint64_t ptrId,
+                          int32_t px, int32_t py, bool clamped) {
+    std::vector<RecordedTouch>* log = reinterpret_cast<std::vector<RecordedTouch>*>(ctx);
+    RecordedTouch rt = { action, ptrId, px, py, clamped };
+    log->push_back(rt);
+}
+
+static void testFpsViewController() {
+    std::vector<RecordedTouch> log;
+    uint32_t pkts = 0;
+
+    // 1. Boxed 360° mode: lazy touch-down, sub-pixel accumulator, ±50px jitter, edge-release + >=15ms re-plant!
+    FpsViewFinger boxed(2, 4);
+    boxed.setTouchSink(recordTouchCb, &log);
+    FpsViewConfig bcfg;
+    bcfg.screenW = 2000.0; bcfg.screenH = 1000.0;
+    bcfg.centerX = 1200.0; bcfg.centerY = 500.0;
+    bcfg.rectLeft = 50.0;  bcfg.rectTop = 50.0;
+    bcfg.rectRight = 1950.0; bcfg.rectBottom = 950.0;
+    bcfg.sensX = 1.0; bcfg.sensY = 1.0;
+    bcfg.ffCounterAccel = 0.0;
+    bcfg.unbounded = false;
+    bcfg.touchDownRandomRangePx = 50;
+    bcfg.touchDownDelayMs = 15;
+    bcfg.idleReleaseMs = 700;
+    boxed.configure(bcfg);
+
+    boxed.onFocusGain(100.0);
+    assert(!boxed.isFingerPlaced() && log.empty()); // Lazy: locking doesn't touch screen yet!
+
+    // Sub-pixel deltas <1px accumulate without touching
+    boxed.onMouseDelta(0.4, 0.0, 1.0, 1.0, 102.0, pkts);
+    assert(!boxed.isFingerPlaced() && log.empty());
+    // Crossing 1.0px places finger within center ±50px and consumes first delta cleanly
+    boxed.onMouseDelta(0.7, 0.0, 1.0, 1.0, 104.0, pkts);
+    assert(boxed.isFingerPlaced() && log.size() == 1 && log[0].action == TOUCH_DOWN && log[0].ptrId == 2);
+    assert(std::abs(log[0].px - 1200) <= 50 && std::abs(log[0].py - 500) <= 50);
+
+    // Sub-pixel preservation: ten 0.3px moves = +3px exact total travel (plus 0.1px carried = +3px)
+    int32_t startPx = log[0].px;
+    for (int i = 0; i < 10; ++i) {
+        boxed.onMouseDelta(0.3, 0.0, 1.0, 1.0, 110.0 + i * 2.0, pkts);
+    }
+    assert(log.back().action == TOUCH_MOVE);
+    assert(log.back().px == startPx + 3);
+
+    // Drag right across rectRight (1950) -> triggers TOUCH_UP (edge-release), swaps ptrId 2->4!
+    double t = 200.0;
+    while (boxed.isFingerPlaced()) {
+        boxed.onMouseDelta(120.0, 0.0, 1.0, 1.0, t, pkts);
+        t += 4.0;
+        assert(t < 400.0);
+    }
+    assert(log.back().action == TOUCH_UP && log.back().ptrId == 2);
+    assert(boxed.activePointerId() == 4);
+    double releaseT = t - 4.0;
+
+    // Within <15ms cooldown: must NOT re-plant yet!
+    boxed.onMouseDelta(20.0, 0.0, 1.0, 1.0, releaseT + 8.0, pkts);
+    assert(!boxed.isFingerPlaced());
+    // After >=15ms cooldown: re-plants cleanly near center on alternating pointer ID 4!
+    boxed.onMouseDelta(20.0, 0.0, 1.0, 1.0, releaseT + 16.0, pkts);
+    assert(boxed.isFingerPlaced() && log.back().action == TOUCH_DOWN && log.back().ptrId == 4);
+
+    // Idle auto-release after 700ms
+    boxed.tick(releaseT + 800.0, false, pkts);
+    assert(!boxed.isFingerPlaced() && log.back().action == TOUCH_UP);
+
+    // 2. Free Fire Unbounded mode + FpsViewStack Free-Look Overlay push/pop
+    log.clear();
+    FpsViewStack stack(2, 4, 5);
+    stack.setTouchSink(recordTouchCb, &log);
+    FpsViewConfig ffCfg = bcfg;
+    ffCfg.unbounded = true;
+    ffCfg.rectLeft = -99999999.0; ffCfg.rectTop = -99999999.0;
+    ffCfg.rectRight = 99999999.0; ffCfg.rectBottom = 99999999.0;
+    ffCfg.touchDownRandomRangePx = 0;
+    ffCfg.ffCounterAccel = 7.0;
+    stack.configureMain(ffCfg);
+    stack.onFocusGain(1000.0);
+
+    // First delta lands at EXACT center (1200, 500)
+    stack.onMouseDelta(5.0, 0.0, 1.0, 1.0, 1004.0, pkts);
+    assert(log.size() == 1 && log[0].action == TOUCH_DOWN && log[0].px == 1200 && log[0].py == 500);
+    // Large upward headshot drag past y=0 stays DOWN & emits unclamped negative Y!
+    for (int i = 0; i < 6; ++i) {
+        stack.onMouseDelta(0.0, -150.0, 1.0, 1.0, 1010.0 + i * 4.0, pkts);
+    }
+    assert(stack.mainView().isFingerPlaced());
+    assert(log.back().action == TOUCH_MOVE && log.back().py < 0 && log.back().clamped == false);
+
+    // Push Free-Look Eye overlay -> lifts main view, plants overlay on ptr 5, routes deltas, then pops!
+    FpsViewConfig eyeCfg = bcfg;
+    eyeCfg.centerX = 1600.0; eyeCfg.centerY = 300.0;
+    eyeCfg.clampInsteadOfRelease = true;
+    eyeCfg.unbounded = false;
+    stack.pushOverlay(7, eyeCfg, 1100.0, pkts);
+    assert(stack.isOverlayActive() && !stack.mainView().isFingerPlaced());
+    assert(log.back().action == TOUCH_DOWN && log.back().ptrId == 5 && log.back().px == 1600 && log.back().py == 300);
+    stack.onMouseDelta(50.0, -20.0, 1.0, 1.0, 1104.0, pkts);
+    assert(log.back().action == TOUCH_MOVE && log.back().ptrId == 5 && log.back().px == 1650 && log.back().py == 280);
+    stack.popOverlay(7, 1120.0, pkts);
+    assert(!stack.isOverlayActive() && log.back().action == TOUCH_UP && log.back().ptrId == 5);
+
+    std::printf("[Test] Standalone FpsViewFinger & FpsViewStack (lazy down, sub-pixel, 360 edge-reset, FF unbounded, overlay) OK!\n");
+}
+
 int main() {
     testSpsParser();
     testProfileV3RoundTrip();
     testMouseAndLShiftRebind();
     testAimEngineLShiftCursorToggle();
     testLowLatencyAimDefaultsAnd360Consistency();
+    testFpsViewController();
     std::printf("ALL V3 CORE TESTS PASSED!\n");
     return 0;
 }

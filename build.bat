@@ -8,6 +8,7 @@ g++ -std=c++11 -O2 -Wall -Wextra ^
     src\sps_parser.cpp ^
     src\profile.cpp ^
     src\protocol.cpp ^
+    src\fps_view.cpp ^
     src\aim_engine.cpp ^
     src\config_ui.cpp ^
     src\overlay.cpp ^
