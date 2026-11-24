@@ -10,12 +10,13 @@
 #include <winsock2.h>
 #include <windows.h>
 
-#include "profile.hpp"
+#include "config/Profile.hpp"
+#include "ui/GdiDraw.hpp"
 
 #include <string>
 #include <vector>
 
-struct ConfigUIResult {
+struct StudioUIResult {
     bool profileModified = false;  // Settings or buttons changed -> push to AimEngine
     bool requestSave = false;      // Save current profile to disk
     bool requestCloseEdit = false; // Exit F2 Edit Mode
@@ -30,9 +31,9 @@ struct ConfigUIResult {
     std::string toastMessage;
 };
 
-class ConfigPanelUI {
+class StudioPanel {
 public:
-    ConfigPanelUI();
+    StudioPanel();
 
     void setProfilesDir(const std::string& dir, const std::string& activePath);
     void refreshProfileList();
@@ -55,13 +56,13 @@ public:
 
     // Mouse / Keyboard handlers (returns true if event was consumed by panel/inspector)
     bool onMouseDown(int x, int y, int canvasW, int canvasH,
-                     Profile& profile, int& selectedBtnIndex, ConfigUIResult& out);
+                     Profile& profile, int& selectedBtnIndex, StudioUIResult& out);
     bool onMouseMove(int x, int y, int canvasW, int canvasH,
-                     Profile& profile, int selectedBtnIndex, ConfigUIResult& out);
+                     Profile& profile, int selectedBtnIndex, StudioUIResult& out);
     void onMouseUp();
-    bool onKeyDown(int vk, Profile& profile, int selectedBtnIndex, ConfigUIResult& out);
-    bool onMouseBind(int mouseVk, Profile& profile, int selectedBtnIndex, ConfigUIResult& out);
-    bool onChar(char ch, Profile& profile, int selectedBtnIndex, ConfigUIResult& out);
+    bool onKeyDown(int vk, Profile& profile, int selectedBtnIndex, StudioUIResult& out);
+    bool onMouseBind(int mouseVk, Profile& profile, int selectedBtnIndex, StudioUIResult& out);
+    bool onChar(char ch, Profile& profile, int selectedBtnIndex, StudioUIResult& out);
 
     void clearTextFocus() {
         editingNewProfileName_ = false;

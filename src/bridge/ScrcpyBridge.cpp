@@ -1,5 +1,5 @@
-#include "protocol.hpp"
-#include "sps_parser.hpp"
+#include "bridge/ScrcpyBridge.hpp"
+#include "bridge/SpsParser.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -630,7 +630,7 @@ void ScrcpyBridge::runVideoReader() {
         const bool isConfig = (ptsAndFlags & (3ULL << 62)) != 0;
         if (isConfig && pktSize > 4) {
             uint32_t newW = 0, newH = 0;
-            if (parseH264SpsResolution(payload.data(), payload.size(), newW, newH)) {
+            if (SpsParser::parseH264Resolution(payload.data(), payload.size(), newW, newH)) {
                 EnterCriticalSection(&metaLock_);
                 bool changed = (newW != screenW_ || newH != screenH_);
                 screenW_ = newW;

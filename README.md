@@ -1,52 +1,76 @@
-# Scrcpy Keymapper Pro (100% PC-Side C++ Wrapper)
+# Phantom Touch — PC-Side C++11 Multi-Touch Keymapper
 
-A lightweight, native Win32 C++ mouse & keyboard multi-touch keymapper built around official `scrcpy`.
-**Zero Android code is written or installed on your phone** — all input capture, independent X/Y sensitivity math, fire-drag physics, multi-touch scheduling, and visual HUD editing run 100% on Windows.
+A lightweight, native Win32 C++11 mouse & keyboard multi-touch keymapper and visual HUD Studio built around official `scrcpy`.
+**Zero Android code is written or installed on your phone** — all raw mouse capture, 360° virtual-finger camera control, independent X/Y sensitivity physics, WASD joystick glide, hotkey combos, and Keymap Studio UI run 100% on Windows.
 
-> **Important Notice for Online Games:** Using external mouse/keyboard keymappers in competitive mobile games (such as Free Fire) may violate the game's Terms of Service and risk account flags or bans. Use responsibly and avoid testing on a main account.
+> **Important Notice for Online Games:** Using external mouse/keyboard keymappers in competitive mobile games may violate a game's Terms of Service and risk account restrictions. Use responsibly.
 
 ---
 
-## Features
+## Project Architecture
 
-- **100% PC-Side Code (Unmodified `scrcpy`):** Uses standard `adb.exe`, `scrcpy.exe`, and `scrcpy-server`.
-- **Windows Raw Mouse Input (`WM_INPUT`) + 120–240 Hz Coalescing:** Reads raw mouse counts at 1000 Hz without Windows pointer acceleration and flushes clean multi-touch packets at your phone's refresh rate (eliminates crosshair jitter).
-- **Independent X / Y Sensitivity + Separate Fire X / Y Multipliers:**
-  - `sens_x` / `sens_y` for camera tracking
-  - `fire_sens_x` / `fire_sens_y` applied while Fire is held (e.g., tuned vertical drag speed for drag shots)
-  - Sub-pixel floating-point accumulator (zero dropped micro-movements)
-  - Optional dynamic velocity curve (`accel_power`) and exponential anti-jitter smoothing (`smoothing`)
-- **Two Fire Modes (`F3` to toggle live):**
-  - **Drag-on-Fire (`fire_drag_mode = 1`):** Left-Click presses the Right Fire button and routes mouse X/Y drag directly onto the Fire finger (just like thumb drag on a phone).
-  - **Separate Fire (`fire_drag_mode = 0`):** Left-Click presses the Left Fire button on its own `pointer_id` while Aim stays uninterrupted on the Camera `pointer_id`.
-- **Smart Anchor Box & Idle Auto-Recenter:** Infinite 360° camera rotation with automatic edge reset + idle auto-recenter so you always have maximum vertical drag space ready.
-- **Auto-Rotation Support (Built-in H.264 SPS Parser):** Automatically detects when your phone switches between Portrait and Landscape and updates 1:1 native touch coordinates immediately.
-- **Visual Drag-and-Drop HUD & X/Y Editor (`F2`):** Transparent always-on-top overlay pinned to the `scrcpy` mirror window — drag buttons onto your exact in-game HUD, resize boxes with the scroll wheel, tune X/Y live, and save with `Ctrl+S`.
-- **Offline Demo Mode (`--demo`):** Test Aim Mode, HUD drag-and-drop, and X/Y settings even without plugging in a phone.
+```text
+phantom-touch/
+├── src/
+│   ├── app/
+│   │   ├── main.cpp                       # Entry point
+│   │   └── Application.hpp / .cpp         # CLI bootstrap, DPI setup, lifecycle orchestration
+│   ├── bridge/
+│   │   ├── TouchTypes.hpp                 # TouchAction enum, PointerId slots, TouchEmitFn sink
+│   │   ├── SpsParser.hpp / .cpp           # H.264 Annex-B SPS RBSP resolution parser (auto-rotation)
+│   │   └── ScrcpyBridge.hpp / .cpp        # Official scrcpy v2-v5 ADB/TCP bridge & display launcher
+│   ├── config/
+│   │   ├── KeyCodes.hpp / .cpp            # VK <-> name, combos, modifier side normalization, mouse/scroll VKs
+│   │   ├── Profile.hpp / .cpp             # KeyNode, Profile schema, Free Fire & blank defaults
+│   │   └── ProfileStore.hpp / .cpp        # .cfg load/save, profile discovery, last-active persistence
+│   ├── engine/
+│   │   ├── FpsViewController.hpp / .cpp   # Standalone FpsViewFinger + FpsViewStack (360° camera pointer)
+│   │   ├── JoystickController.hpp / .cpp  # Virtual WASD joystick, 3-stage stepped glide, Sprint/Walk
+│   │   ├── ActionDispatcher.hpp / .cpp    # 2-level hotkey combos + 10 KeyActionType runners
+│   │   └── InputEngine.hpp / .cpp         # Non-blocking hook queue, QPC polling loop, fire modes, telemetry
+│   └── ui/
+│       ├── GdiDraw.hpp / .cpp             # Shared Win32 GDI drawing primitives
+│       ├── HudRenderer.hpp / .cpp         # Play/Edit HUD badges, floating CFG ball, status bar, prompts
+│       ├── StudioPanel.hpp / .cpp         # Draggable 4-tab Keymap Studio & Key Inspector (Mouse + Scroll UI)
+│       └── OverlayWindow.hpp / .cpp       # Topmost layered window, WM_INPUT Raw Mouse, WH_MOUSE/KEYBOARD_LL
+├── tests/
+│   └── test_core.cpp                      # Unit tests covering bridge, config, engine, and UI modules
+├── profiles/
+│   └── freefire.cfg                       # Calibrated Free Fire MAX profile
+├── build.bat                              # Zero-dependency MinGW C++11 build script
+├── run.bat                                # One-click launcher
+└── setup_scrcpy.ps1                       # Official scrcpy Windows downloader
+```
+
+---
+
+## Key Features
+
+- **Standalone 360° Virtual-Finger FPS Controller (`FpsViewController`):** Lazy touch-down, exact `double` sub-pixel accumulation, Free Fire unbounded mode (`ff_counter_accel`) + boxed 360° edge-release (`>=15 ms` non-blocking re-plant with alternating pointer IDs & `±50 px` jitter), idle auto-recenter, and a 2-level `FpsViewStack` for Free Look Eye (`NODE_HOLD_VIEW`).
+- **Non-Blocking Keyboard + Mouse Concurrency (`InputEngine`):** `WH_KEYBOARD_LL` and `WH_MOUSE_LL` enqueue into a microsecond lock without ever blocking on TCP `send()`. Keyboard & `WASD` remain fully usable even when the mouse cursor is unlocked.
+- **Full Mouse & Scroll Wheel Support:** Bind `LMB`, `RMB`, `MMB`, `X1`, `X2`, `SCROLL UP`, `SCROLL DOWN`, keyboard keys, or 2-key combos (`LALT+1`) to any of 10 action types (`PRESS`, `CLICK`, `DOWN_UP`, `UP_TRIGGER`, `HOLD_VIEW`, `SWIPE`, `CURSOR_TOGGLE`, `RESET_VIEW`, `SWITCH_SENS`, `REACTIVATE_JOY`).
+- **Visual Keymap Studio (`F2` or Floating `CFG` Ball):** Drag keys anywhere, double-click any key to replace it, tune X/Y/Fire/Scope sensitivity sliders live, and create/clone/switch saved `.cfg` profiles.
 
 ---
 
 ## Quick Start
 
 ### 1. Download Official `scrcpy` (One-Time Setup)
-Run the included PowerShell helper script to download the latest official Windows `scrcpy` release into `.\scrcpy\`:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup_scrcpy.ps1
 ```
-*(Or manually unzip official `scrcpy` from [github.com/Genymobile/scrcpy/releases](https://github.com/Genymobile/scrcpy/releases) into the `scrcpy\` folder next to `scrcpy_keymapper.exe`.)*
 
-### 2. Enable USB Debugging on Your Phone
-1. On Android: **Settings → About Phone** → tap **Build Number** 7 times.
-2. **Settings → Developer Options** → turn on **USB Debugging**.
-   *(On Xiaomi / MIUI / HyperOS / POCO, also enable **USB Debugging (Security Settings)** so Android allows simulated touch events.)*
-3. Plug your phone in via USB and tap **Allow** on the USB debugging prompt.
+### 2. Build from Source (MinGW `g++`, Zero External Dependencies)
+```bat
+build.bat
+```
 
 ### 3. Run
 ```powershell
-# Live phone mode (opens scrcpy display + transparent overlay):
-.\scrcpy_keymapper.exe
+# Live Android device over USB debugging:
+.\run.bat
 
-# Offline Demo / HUD Editor mode (no phone required):
+# Offline Keymap Studio demo (no phone required):
 .\scrcpy_keymapper.exe --demo
 ```
 
@@ -56,27 +80,11 @@ powershell -ExecutionPolicy Bypass -File .\setup_scrcpy.ps1
 
 | Hotkey | Action |
 | :--- | :--- |
-| **`~`** (Tilde) or **`F1`** | Toggle **Aim Mode** (locked 360° Raw Mouse) ↔ **Cursor Mode** (direct screen clicks for lobby/looting) |
-| **`F2`** | Toggle **Visual HUD & X/Y Editor** (drag & drop buttons over your live game HUD) |
-| **`F3`** | Toggle **Drag-on-Fire** (Right Fire) ↔ **Separate Fire** (Left Fire) |
-| **`F4`** | Show / Hide key badges while playing |
-| **`F5`** | Quick Reset all virtual fingers (anti-stuck failsafe) |
-| **`[` / `]`** | Decrease / Increase **X Sensitivity** live (`±0.05`) |
-| **`-` / `=`** | Decrease / Increase **Y Sensitivity** live (`±0.05`) |
-| **`Tab` / `M`** | Taps Bag / Map and automatically frees the mouse cursor (tap again to snap back to Aim Mode) |
-| **`Ctrl + S`** *(in F2 Edit Mode)* | Save your layout & X/Y settings to `profiles\freefire.cfg` |
-
-### In `F2` Edit Mode
-- **Left-Drag** any button, `WASD` circle, `AIM` anchor, or `FIRE` node to position it over your HUD.
-- **Mouse Wheel** over `WASD`, `AIM`, or `FIRE` resizes its radius / safe box (`Shift + Wheel` adjusts `WASD` sprint ring or `AIM` vertical box height).
-- **Right-Click** anywhere to add a new button and press any key to bind it.
-- Click a button and press **`Enter`** to rebind it, or **`Delete`** to remove it.
-
----
-
-## Rebuilding from Source
-
-Requires only MinGW `g++` (zero external libraries):
-```bat
-build.bat
-```
+| **`~`** (configurable) or **`F1`** | Toggle **Aim Mode** (locked 360° Raw Mouse) ↔ **Cursor Mode** (free cursor; keyboard & WASD stay active) |
+| **`F2`** or **`CFG` Ball** | Open / Close **Visual Keymap Studio** |
+| **`F3`** | Cycle Fire Mode (`CLAW-LEFT` / `DRAG-FIRE` / `DUAL-DRAG`) |
+| **`F4`** | Show / Hide HUD key badges while playing |
+| **`F5`** | Quick reset all virtual touches |
+| **`[` / `]`** & **`-` / `=`** | Live adjust X / Y sensitivity (`±0.05`) |
+| **Double-Click Key** *(in F2)* | Prompt to replace key (Keyboard / Mouse / Scroll Up / Scroll Down / Combo) |
+| **`Ctrl + S`** *(in F2)* | Save active profile to disk |

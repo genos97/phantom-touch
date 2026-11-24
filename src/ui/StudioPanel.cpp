@@ -1,4 +1,6 @@
-#include "config_ui.hpp"
+#include "ui/StudioPanel.hpp"
+#include "config/KeyCodes.hpp"
+#include "config/ProfileStore.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -75,9 +77,6 @@ enum SliderId {
     SL_NODE_DUR
 };
 
-bool ptInRect(const RECT& r, int x, int y) {
-    return (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom);
-}
 
 float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -85,71 +84,37 @@ float clampf(float v, float lo, float hi) {
     return v;
 }
 
-void drawBox(HDC hdc, const RECT& rc, int rad, COLORREF fill, COLORREF border, int bw = 1) {
-    HPEN pen = CreatePen(PS_SOLID, bw, border);
-    HBRUSH br = CreateSolidBrush(fill);
-    HGDIOBJ op = SelectObject(hdc, pen);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
-    SelectObject(hdc, op);
-    SelectObject(hdc, ob);
-    DeleteObject(pen);
-    DeleteObject(br);
-}
-
-void drawCenterText(HDC hdc, const std::string& txt, int cx, int cy, COLORREF col) {
-    SetTextColor(hdc, col);
-    SetBkMode(hdc, TRANSPARENT);
-    SIZE sz;
-    GetTextExtentPoint32A(hdc, txt.c_str(), static_cast<int>(txt.size()), &sz);
-    TextOutA(hdc, cx - sz.cx / 2, cy - sz.cy / 2, txt.c_str(), static_cast<int>(txt.size()));
-}
-
-void drawLeftText(HDC hdc, const std::string& txt, int x, int cy, COLORREF col) {
-    SetTextColor(hdc, col);
-    SetBkMode(hdc, TRANSPARENT);
-    SIZE sz;
-    GetTextExtentPoint32A(hdc, txt.c_str(), static_cast<int>(txt.size()), &sz);
-    TextOutA(hdc, x, cy - sz.cy / 2, txt.c_str(), static_cast<int>(txt.size()));
-}
-
 std::string getFileBaseName(const std::string& fullPath) {
     size_t pos = fullPath.find_last_of("\\/");
     return (pos == std::string::npos) ? fullPath : fullPath.substr(pos + 1);
 }
 
-int normalizeModVk(int vk) {
-    if (vk == VK_SHIFT)   return ((GetKeyState(VK_RSHIFT)   & 0x8000) || (GetAsyncKeyState(VK_RSHIFT)   & 0x8000)) ? VK_RSHIFT   : VK_LSHIFT;
-    if (vk == VK_CONTROL) return ((GetKeyState(VK_RCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000)) ? VK_RCONTROL : VK_LCONTROL;
-    if (vk == VK_MENU)    return ((GetKeyState(VK_RMENU)    & 0x8000) || (GetAsyncKeyState(VK_RMENU)    & 0x8000)) ? VK_RMENU    : VK_LMENU;
-    return vk;
-}
 
 } // namespace
 
-ConfigPanelUI::ConfigPanelUI() {
+StudioPanel::StudioPanel() {
     ZeroMemory(&panelRect_, sizeof(panelRect_));
     ZeroMemory(&titleBarRect_, sizeof(titleBarRect_));
     ZeroMemory(&inspectorRect_, sizeof(inspectorRect_));
     ZeroMemory(&activeSliderTrack_, sizeof(activeSliderTrack_));
 }
 
-void ConfigPanelUI::setProfilesDir(const std::string& dir, const std::string& activePath) {
+void StudioPanel::setProfilesDir(const std::string& dir, const std::string& activePath) {
     profilesDir_ = dir;
     activeProfilePath_ = activePath;
     refreshProfileList();
 }
 
-void ConfigPanelUI::refreshProfileList() {
+void StudioPanel::refreshProfileList() {
     profileEntries_.clear();
     if (profilesDir_.empty()) return;
-    std::vector<std::string> files = listProfileFiles(profilesDir_);
+    std::vector<std::string> files = ProfileStore::listProfiles(profilesDir_);
     for (size_t i = 0; i < files.size(); ++i) {
         ProfileEntry e;
         e.path = files[i];
         e.fileName = getFileBaseName(files[i]);
         Profile tmp;
-        if (loadProfile(files[i], tmp)) {
+        if (ProfileStore::load(files[i], tmp)) {
             e.displayName = tmp.name;
         } else {
             e.displayName = e.fileName;
@@ -158,7 +123,7 @@ void ConfigPanelUI::refreshProfileList() {
     }
 }
 
-void ConfigPanelUI::drawSlider(HDC hdc, int x, int y, int w,
+void StudioPanel::drawSlider(HDC hdc, int x, int y, int w,
                                const char* label, float val, float minV, float maxV,
                                const char* valText, COLORREF accent, int sliderId,
                                HFONT fontSmall, HFONT fontBold, int labelW) {
@@ -168,17 +133,17 @@ void ConfigPanelUI::drawSlider(HDC hdc, int x, int y, int w,
     const int cy = y + 12;
 
     SelectObject(hdc, fontSmall);
-    drawLeftText(hdc, label, x, cy, RGB(205, 218, 235));
+    GdiDraw::leftText(hdc, label, x, cy, RGB(205, 218, 235));
 
     RECT tr = { trackX, cy - 3, trackX + trackW, cy + 4 };
-    drawBox(hdc, tr, 4, RGB(34, 42, 58), RGB(58, 70, 92), 1);
+    GdiDraw::roundedBox(hdc, tr, 4, RGB(34, 42, 58), RGB(58, 70, 92), 1);
 
     float norm = (maxV > minV) ? clampf((val - minV) / (maxV - minV), 0.0f, 1.0f) : 0.0f;
     int knobX = trackX + static_cast<int>(norm * static_cast<float>(trackW) + 0.5f);
 
     if (knobX > trackX + 2) {
         RECT fillR = { trackX, cy - 3, knobX, cy + 4 };
-        drawBox(hdc, fillR, 4, accent, accent, 1);
+        GdiDraw::roundedBox(hdc, fillR, 4, accent, accent, 1);
     }
 
     // Crisp circular thumb knob
@@ -193,7 +158,7 @@ void ConfigPanelUI::drawSlider(HDC hdc, int x, int y, int w,
     DeleteObject(kBr);
 
     SelectObject(hdc, fontBold);
-    drawCenterText(hdc, valText, x + w - valW / 2, cy, accent);
+    GdiDraw::centeredText(hdc, valText, x + w - valW / 2, cy, accent);
 
     SliderHit sh;
     sh.trackRc = tr;
@@ -204,7 +169,7 @@ void ConfigPanelUI::drawSlider(HDC hdc, int x, int y, int w,
     sliders_.push_back(sh);
 }
 
-void ConfigPanelUI::paint(HDC hdc, int canvasW, int canvasH,
+void StudioPanel::paint(HDC hdc, int canvasW, int canvasH,
                           const Profile& profile, const std::string& activeProfilePath,
                           int selectedBtnIndex, bool waitingForNodeRebind,
                           HFONT fontSmall, HFONT fontBold, HFONT fontTitle) {
@@ -229,27 +194,27 @@ void ConfigPanelUI::paint(HDC hdc, int canvasW, int canvasH,
     titleBarRect_ = { px, py, px + panelW - 60, py + 34 };
 
     // Main panel background
-    drawBox(hdc, panelRect_, 12, RGB(17, 22, 33), RGB(0, 195, 255), 2);
+    GdiDraw::roundedBox(hdc, panelRect_, 12, RGB(17, 22, 33), RGB(0, 195, 255), 2);
 
     // Title bar strip
     RECT hdrBg = { px + 1, py + 1, px + panelW - 1, py + 34 };
-    drawBox(hdc, hdrBg, 10, RGB(24, 32, 48), RGB(38, 52, 74), 1);
+    GdiDraw::roundedBox(hdc, hdrBg, 10, RGB(24, 32, 48), RGB(38, 52, 74), 1);
 
     SelectObject(hdc, fontTitle);
     std::string title = "KEYMAP STUDIO  |  " + profile.name;
     if (title.size() > 38) title = title.substr(0, 37) + "...";
-    drawLeftText(hdc, title, px + 14, py + 18, RGB(0, 225, 255));
+    GdiDraw::leftText(hdc, title, px + 14, py + 18, RGB(0, 225, 255));
 
     // Collapse & Close buttons in top-right of title bar
     RECT rMin = { px + panelW - 56, py + 6, px + panelW - 32, py + 28 };
-    drawBox(hdc, rMin, 5, RGB(38, 48, 68), RGB(95, 130, 175), 1);
+    GdiDraw::roundedBox(hdc, rMin, 5, RGB(38, 48, 68), RGB(95, 130, 175), 1);
     SelectObject(hdc, fontBold);
-    drawCenterText(hdc, collapsed_ ? "+" : "-", (rMin.left + rMin.right) / 2, (rMin.top + rMin.bottom) / 2, RGB(230, 240, 255));
+    GdiDraw::centeredText(hdc, collapsed_ ? "+" : "-", (rMin.left + rMin.right) / 2, (rMin.top + rMin.bottom) / 2, RGB(230, 240, 255));
     hotspots_.push_back(Hotspot{ rMin, PA_TOGGLE_COLLAPSE, 0 });
 
     RECT rCls = { px + panelW - 28, py + 6, px + panelW - 6, py + 28 };
-    drawBox(hdc, rCls, 5, RGB(95, 32, 38), RGB(255, 95, 95), 1);
-    drawCenterText(hdc, "X", (rCls.left + rCls.right) / 2, (rCls.top + rCls.bottom) / 2, RGB(255, 230, 230));
+    GdiDraw::roundedBox(hdc, rCls, 5, RGB(95, 32, 38), RGB(255, 95, 95), 1);
+    GdiDraw::centeredText(hdc, "X", (rCls.left + rCls.right) / 2, (rCls.top + rCls.bottom) / 2, RGB(255, 230, 230));
     hotspots_.push_back(Hotspot{ rCls, PA_CLOSE_EDIT, 0 });
 
     if (!collapsed_) {
@@ -261,12 +226,12 @@ void ConfigPanelUI::paint(HDC hdc, int canvasW, int canvasH,
         for (int i = 0; i < 4; ++i) {
             RECT tr = { px + 12 + i * tabW, tabY, px + 12 + (i + 1) * tabW - 4, tabY + 26 };
             bool active = (activeTab_ == i);
-            drawBox(hdc, tr, 6,
+            GdiDraw::roundedBox(hdc, tr, 6,
                     active ? RGB(0, 120, 165) : RGB(28, 36, 52),
                     active ? RGB(0, 230, 255) : RGB(56, 70, 96),
                     active ? 2 : 1);
             SelectObject(hdc, fontBold);
-            drawCenterText(hdc, tabNames[i], (tr.left + tr.right) / 2, (tr.top + tr.bottom) / 2,
+            GdiDraw::centeredText(hdc, tabNames[i], (tr.left + tr.right) / 2, (tr.top + tr.bottom) / 2,
                            active ? RGB(255, 255, 255) : RGB(170, 190, 215));
             hotspots_.push_back(Hotspot{ tr, tabActs[i], 0 });
         }
@@ -289,19 +254,19 @@ void ConfigPanelUI::paint(HDC hdc, int canvasW, int canvasH,
         // Persistent Footer Bar (Save / Done)
         int footY = py + panelH - 38;
         RECT rSave = { px + 14, footY, px + 170, footY + 28 };
-        drawBox(hdc, rSave, 6, RGB(22, 95, 56), RGB(60, 235, 135), 1);
+        GdiDraw::roundedBox(hdc, rSave, 6, RGB(22, 95, 56), RGB(60, 235, 135), 1);
         SelectObject(hdc, fontBold);
-        drawCenterText(hdc, "SAVE CONFIG (Ctrl+S)", (rSave.left + rSave.right) / 2, (rSave.top + rSave.bottom) / 2, RGB(240, 255, 245));
+        GdiDraw::centeredText(hdc, "SAVE CONFIG (Ctrl+S)", (rSave.left + rSave.right) / 2, (rSave.top + rSave.bottom) / 2, RGB(240, 255, 245));
         hotspots_.push_back(Hotspot{ rSave, PA_SAVE, 0 });
 
         RECT rRst = { px + 178, footY, px + 312, footY + 28 };
-        drawBox(hdc, rRst, 6, RGB(50, 44, 30), RGB(220, 175, 65), 1);
-        drawCenterText(hdc, "RESET DEFAULTS", (rRst.left + rRst.right) / 2, (rRst.top + rRst.bottom) / 2, RGB(255, 230, 150));
+        GdiDraw::roundedBox(hdc, rRst, 6, RGB(50, 44, 30), RGB(220, 175, 65), 1);
+        GdiDraw::centeredText(hdc, "RESET DEFAULTS", (rRst.left + rRst.right) / 2, (rRst.top + rRst.bottom) / 2, RGB(255, 230, 150));
         hotspots_.push_back(Hotspot{ rRst, PA_RESET_SENS, 0 });
 
         RECT rDone = { px + 320, footY, px + panelW - 14, footY + 28 };
-        drawBox(hdc, rDone, 6, RGB(34, 62, 112), RGB(95, 185, 255), 1);
-        drawCenterText(hdc, "DONE (F2)", (rDone.left + rDone.right) / 2, (rDone.top + rDone.bottom) / 2, RGB(240, 248, 255));
+        GdiDraw::roundedBox(hdc, rDone, 6, RGB(34, 62, 112), RGB(95, 185, 255), 1);
+        GdiDraw::centeredText(hdc, "DONE (F2)", (rDone.left + rDone.right) / 2, (rDone.top + rDone.bottom) / 2, RGB(240, 248, 255));
         hotspots_.push_back(Hotspot{ rDone, PA_CLOSE_EDIT, 0 });
     }
 
@@ -322,7 +287,7 @@ void ConfigPanelUI::paint(HDC hdc, int canvasW, int canvasH,
     }
 }
 
-void ConfigPanelUI::paintTabSensitivity(HDC hdc, int x, int y, int w,
+void StudioPanel::paintTabSensitivity(HDC hdc, int x, int y, int w,
                                         const Profile& p, HFONT fS, HFONT fB) {
     char buf[24];
     int cy = y;
@@ -366,7 +331,7 @@ void ConfigPanelUI::paintTabSensitivity(HDC hdc, int x, int y, int w,
 
     // Fire Mode 3-way selector
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Fire Mode:", x, cy + 13, RGB(200, 215, 235));
+    GdiDraw::leftText(hdc, "Fire Mode:", x, cy + 13, RGB(200, 215, 235));
     const char* fLbls[3] = { "CLAW-LEFT", "DRAG-FIRE", "DUAL-DRAG" };
     const int fActs[3]   = { PA_FIRE_CLAW, PA_FIRE_DRAG, PA_FIRE_DUAL };
     const int fVals[3]   = { FIRE_MODE_CLAW_LEFT, FIRE_MODE_DRAG_RIGHT, FIRE_MODE_DUAL_DRAG };
@@ -375,18 +340,18 @@ void ConfigPanelUI::paintTabSensitivity(HDC hdc, int x, int y, int w,
     for (int i = 0; i < 3; ++i) {
         RECT r = { bx + i * bw, cy, bx + (i + 1) * bw - 4, cy + 26 };
         bool on = (p.fireMode == fVals[i]);
-        drawBox(hdc, r, 5, on ? RGB(155, 50, 50) : RGB(32, 38, 52),
+        GdiDraw::roundedBox(hdc, r, 5, on ? RGB(155, 50, 50) : RGB(32, 38, 52),
                 on ? RGB(255, 110, 90) : RGB(65, 76, 98), on ? 2 : 1);
         SelectObject(hdc, fB);
-        drawCenterText(hdc, fLbls[i], (r.left + r.right) / 2, (r.top + r.bottom) / 2,
+        GdiDraw::centeredText(hdc, fLbls[i], (r.left + r.right) / 2, (r.top + r.bottom) / 2,
                        on ? RGB(255, 245, 240) : RGB(170, 185, 205));
         hotspots_.push_back(Hotspot{ r, fActs[i], 0 });
     }
 }
 
-void ConfigPanelUI::paintTabAddKeys(HDC hdc, int x, int y, int w, HFONT fS, HFONT fB) {
+void StudioPanel::paintTabAddKeys(HDC hdc, int x, int y, int w, HFONT fS, HFONT fB) {
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Click control -> bind Key, Mouse (LMB/RMB/MMB/X1/X2) or Scroll:", x, y + 8, RGB(175, 200, 225));
+    GdiDraw::leftText(hdc, "Click control -> bind Key, Mouse (LMB/RMB/MMB/X1/X2) or Scroll:", x, y + 8, RGB(175, 200, 225));
 
     struct PaletteItem {
         const char* title;
@@ -416,52 +381,52 @@ void ConfigPanelUI::paintTabAddKeys(HDC hdc, int x, int y, int w, HFONT fS, HFON
         int tx = x + col * (colW + 8);
         int ty = startY + row * (tileH + 6);
         RECT r = { tx, ty, tx + colW, ty + tileH };
-        drawBox(hdc, r, 7, RGB(26, 33, 48), items[i].accent, 1);
+        GdiDraw::roundedBox(hdc, r, 7, RGB(26, 33, 48), items[i].accent, 1);
         SelectObject(hdc, fB);
-        drawLeftText(hdc, items[i].title, tx + 10, ty + 14, items[i].accent);
+        GdiDraw::leftText(hdc, items[i].title, tx + 10, ty + 14, items[i].accent);
         SelectObject(hdc, fS);
-        drawLeftText(hdc, items[i].desc, tx + 10, ty + 31, RGB(175, 192, 212));
+        GdiDraw::leftText(hdc, items[i].desc, tx + 10, ty + 31, RGB(175, 192, 212));
         hotspots_.push_back(Hotspot{ r, PA_ADD_NODE, static_cast<int>(items[i].type) });
     }
 
     int botY = startY + 5 * (tileH + 6) + 4;
     RECT rClr = { x, botY, x + w, botY + 26 };
-    drawBox(hdc, rClr, 6, RGB(65, 28, 32), RGB(220, 90, 90), 1);
+    GdiDraw::roundedBox(hdc, rClr, 6, RGB(65, 28, 32), RGB(220, 90, 90), 1);
     SelectObject(hdc, fB);
-    drawCenterText(hdc, "CLEAR ALL EXTRA KEYS (Keep WASD / AIM / FIRE)", (rClr.left + rClr.right) / 2, (rClr.top + rClr.bottom) / 2, RGB(255, 185, 185));
+    GdiDraw::centeredText(hdc, "CLEAR ALL EXTRA KEYS (Keep WASD / AIM / FIRE)", (rClr.left + rClr.right) / 2, (rClr.top + rClr.bottom) / 2, RGB(255, 185, 185));
     hotspots_.push_back(Hotspot{ rClr, PA_CLEAR_BUTTONS, 0 });
 }
 
-void ConfigPanelUI::paintTabProfiles(HDC hdc, int x, int y, int w,
+void StudioPanel::paintTabProfiles(HDC hdc, int x, int y, int w,
                                      const std::string& activePath, HFONT fS, HFONT fB) {
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Create a new saved config or click any saved config below to load:", x, y + 8, RGB(175, 200, 225));
+    GdiDraw::leftText(hdc, "Create a new saved config or click any saved config below to load:", x, y + 8, RGB(175, 200, 225));
 
     // Inline text box for New Config Name
     RECT rName = { x, y + 22, x + w, y + 48 };
-    drawBox(hdc, rName, 6, RGB(12, 16, 25),
+    GdiDraw::roundedBox(hdc, rName, 6, RGB(12, 16, 25),
             editingNewProfileName_ ? RGB(0, 235, 255) : RGB(75, 92, 120),
             editingNewProfileName_ ? 2 : 1);
     SelectObject(hdc, fB);
     std::string shownName = "Name: " + newProfileName_ + (editingNewProfileName_ ? "_" : "");
-    drawLeftText(hdc, shownName, x + 10, y + 35, RGB(240, 248, 255));
+    GdiDraw::leftText(hdc, shownName, x + 10, y + 35, RGB(240, 248, 255));
     hotspots_.push_back(Hotspot{ rName, PA_FOCUS_NEW_NAME, 0 });
 
     // Create Blank / Clone Current buttons
     int halfW = (w - 8) / 2;
     RECT rBlank = { x, y + 54, x + halfW, y + 82 };
-    drawBox(hdc, rBlank, 6, RGB(24, 72, 105), RGB(75, 205, 255), 1);
-    drawCenterText(hdc, "+ CREATE BLANK CONFIG", (rBlank.left + rBlank.right) / 2, (rBlank.top + rBlank.bottom) / 2, RGB(230, 248, 255));
+    GdiDraw::roundedBox(hdc, rBlank, 6, RGB(24, 72, 105), RGB(75, 205, 255), 1);
+    GdiDraw::centeredText(hdc, "+ CREATE BLANK CONFIG", (rBlank.left + rBlank.right) / 2, (rBlank.top + rBlank.bottom) / 2, RGB(230, 248, 255));
     hotspots_.push_back(Hotspot{ rBlank, PA_CREATE_BLANK, 0 });
 
     RECT rClone = { x + halfW + 8, y + 54, x + w, y + 82 };
-    drawBox(hdc, rClone, 6, RGB(28, 80, 62), RGB(80, 235, 160), 1);
-    drawCenterText(hdc, "+ CLONE CURRENT", (rClone.left + rClone.right) / 2, (rClone.top + rClone.bottom) / 2, RGB(230, 255, 240));
+    GdiDraw::roundedBox(hdc, rClone, 6, RGB(28, 80, 62), RGB(80, 235, 160), 1);
+    GdiDraw::centeredText(hdc, "+ CLONE CURRENT", (rClone.left + rClone.right) / 2, (rClone.top + rClone.bottom) / 2, RGB(230, 255, 240));
     hotspots_.push_back(Hotspot{ rClone, PA_CREATE_CLONE, 0 });
 
     // Saved profiles list
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Saved Configs (profiles\\*.cfg):", x, y + 98, RGB(165, 185, 210));
+    GdiDraw::leftText(hdc, "Saved Configs (profiles\\*.cfg):", x, y + 98, RGB(165, 185, 210));
 
     int listY = y + 110;
     int maxShow = 6;
@@ -470,41 +435,41 @@ void ConfigPanelUI::paintTabProfiles(HDC hdc, int x, int y, int w,
         bool isActive = (lstrcmpiA(e.path.c_str(), activePath.c_str()) == 0);
 
         RECT rRow = { x, listY, x + w - 58, listY + 28 };
-        drawBox(hdc, rRow, 6,
+        GdiDraw::roundedBox(hdc, rRow, 6,
                 isActive ? RGB(20, 68, 52) : RGB(26, 33, 48),
                 isActive ? RGB(60, 240, 145) : RGB(62, 76, 102),
                 isActive ? 2 : 1);
         SelectObject(hdc, fB);
         std::string rowText = (isActive ? "* " : "  ") + e.displayName + "  (" + e.fileName + ")";
         if (rowText.size() > 42) rowText = rowText.substr(0, 41) + "...";
-        drawLeftText(hdc, rowText, x + 8, listY + 14, isActive ? RGB(170, 255, 210) : RGB(220, 232, 245));
+        GdiDraw::leftText(hdc, rowText, x + 8, listY + 14, isActive ? RGB(170, 255, 210) : RGB(220, 232, 245));
         hotspots_.push_back(Hotspot{ rRow, PA_LOAD_PROFILE, static_cast<int>(i) });
 
         RECT rDel = { x + w - 52, listY, x + w, listY + 28 };
-        drawBox(hdc, rDel, 6, RGB(70, 26, 32), RGB(215, 85, 85), 1);
+        GdiDraw::roundedBox(hdc, rDel, 6, RGB(70, 26, 32), RGB(215, 85, 85), 1);
         SelectObject(hdc, fS);
-        drawCenterText(hdc, "DEL", (rDel.left + rDel.right) / 2, (rDel.top + rDel.bottom) / 2, RGB(255, 180, 180));
+        GdiDraw::centeredText(hdc, "DEL", (rDel.left + rDel.right) / 2, (rDel.top + rDel.bottom) / 2, RGB(255, 180, 180));
         hotspots_.push_back(Hotspot{ rDel, PA_DELETE_PROFILE, static_cast<int>(i) });
 
         listY += 32;
     }
 }
 
-void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
+void StudioPanel::paintTabAdvanced(HDC hdc, int x, int y, int w,
                                      const Profile& p, HFONT fS, HFONT fB) {
     int cy = y + 4;
     auto drawSeg2 = [&](const char* lbl, const char* a, const char* b, bool firstOn, int actA, int actB) {
         SelectObject(hdc, fS);
-        drawLeftText(hdc, lbl, x, cy + 13, RGB(200, 215, 235));
+        GdiDraw::leftText(hdc, lbl, x, cy + 13, RGB(200, 215, 235));
         int bx = x + 124;
         int bw = (w - 124) / 2;
         RECT rA = { bx, cy, bx + bw - 4, cy + 26 };
         RECT rB = { bx + bw, cy, x + w, cy + 26 };
-        drawBox(hdc, rA, 5, firstOn ? RGB(0, 115, 155) : RGB(30, 38, 54), firstOn ? RGB(0, 230, 255) : RGB(62, 76, 100), firstOn ? 2 : 1);
-        drawBox(hdc, rB, 5, !firstOn ? RGB(0, 115, 155) : RGB(30, 38, 54), !firstOn ? RGB(0, 230, 255) : RGB(62, 76, 100), !firstOn ? 2 : 1);
+        GdiDraw::roundedBox(hdc, rA, 5, firstOn ? RGB(0, 115, 155) : RGB(30, 38, 54), firstOn ? RGB(0, 230, 255) : RGB(62, 76, 100), firstOn ? 2 : 1);
+        GdiDraw::roundedBox(hdc, rB, 5, !firstOn ? RGB(0, 115, 155) : RGB(30, 38, 54), !firstOn ? RGB(0, 230, 255) : RGB(62, 76, 100), !firstOn ? 2 : 1);
         SelectObject(hdc, fB);
-        drawCenterText(hdc, a, (rA.left + rA.right) / 2, (rA.top + rA.bottom) / 2, firstOn ? RGB(255, 255, 255) : RGB(170, 185, 205));
-        drawCenterText(hdc, b, (rB.left + rB.right) / 2, (rB.top + rB.bottom) / 2, !firstOn ? RGB(255, 255, 255) : RGB(170, 185, 205));
+        GdiDraw::centeredText(hdc, a, (rA.left + rA.right) / 2, (rA.top + rA.bottom) / 2, firstOn ? RGB(255, 255, 255) : RGB(170, 185, 205));
+        GdiDraw::centeredText(hdc, b, (rB.left + rB.right) / 2, (rB.top + rB.bottom) / 2, !firstOn ? RGB(255, 255, 255) : RGB(170, 185, 205));
         hotspots_.push_back(Hotspot{ rA, actA, 0 });
         hotspots_.push_back(Hotspot{ rB, actB, 0 });
         cy += 34;
@@ -514,7 +479,7 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
 
     // Polling rate 4-way selector
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Mouse Polling:", x, cy + 13, RGB(200, 215, 235));
+    GdiDraw::leftText(hdc, "Mouse Polling:", x, cy + 13, RGB(200, 215, 235));
     const char* pLbls[4] = { "125Hz", "250Hz", "500Hz", "MAX" };
     const int pActs[4]   = { PA_POLL_125, PA_POLL_250, PA_POLL_500, PA_POLL_MAX };
     const int pVals[4]   = { 125, 250, 500, 0 };
@@ -523,10 +488,10 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
     for (int i = 0; i < 4; ++i) {
         RECT r = { bx + i * bw4, cy, bx + (i + 1) * bw4 - 3, cy + 26 };
         bool on = (p.pollHz == pVals[i]);
-        drawBox(hdc, r, 5, on ? RGB(78, 52, 140) : RGB(30, 38, 54),
+        GdiDraw::roundedBox(hdc, r, 5, on ? RGB(78, 52, 140) : RGB(30, 38, 54),
                 on ? RGB(180, 145, 255) : RGB(62, 76, 100), on ? 2 : 1);
         SelectObject(hdc, fB);
-        drawCenterText(hdc, pLbls[i], (r.left + r.right) / 2, (r.top + r.bottom) / 2,
+        GdiDraw::centeredText(hdc, pLbls[i], (r.left + r.right) / 2, (r.top + r.bottom) / 2,
                        on ? RGB(255, 255, 255) : RGB(170, 185, 205));
         hotspots_.push_back(Hotspot{ r, pActs[i], 0 });
     }
@@ -536,12 +501,12 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
 
     // Invert Y toggle
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Invert Y Axis:", x, cy + 13, RGB(200, 215, 235));
+    GdiDraw::leftText(hdc, "Invert Y Axis:", x, cy + 13, RGB(200, 215, 235));
     RECT rInv = { x + 124, cy, x + 215, cy + 26 };
-    drawBox(hdc, rInv, 5, p.invertY ? RGB(130, 60, 40) : RGB(30, 38, 54),
+    GdiDraw::roundedBox(hdc, rInv, 5, p.invertY ? RGB(130, 60, 40) : RGB(30, 38, 54),
             p.invertY ? RGB(255, 130, 90) : RGB(62, 76, 100), 1);
     SelectObject(hdc, fB);
-    drawCenterText(hdc, p.invertY ? "ON" : "OFF", (rInv.left + rInv.right) / 2, (rInv.top + rInv.bottom) / 2, RGB(240, 248, 255));
+    GdiDraw::centeredText(hdc, p.invertY ? "ON" : "OFF", (rInv.left + rInv.right) / 2, (rInv.top + rInv.bottom) / 2, RGB(240, 248, 255));
     hotspots_.push_back(Hotspot{ rInv, PA_TOGGLE_INVERT_Y, 0 });
     cy += 36;
 
@@ -557,70 +522,70 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
 
     // Toggle Aim Key & Hold-to-Unlock Key rebinders
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Lock/Unlock Key:", x, cy + 13, RGB(200, 215, 235));
+    GdiDraw::leftText(hdc, "Lock/Unlock Key:", x, cy + 13, RGB(200, 215, 235));
     RECT rAimK = { x + 124, cy, x + w - 90, cy + 26 };
-    drawBox(hdc, rAimK, 5, rebindingToggleAim_ ? RGB(115, 85, 20) : RGB(30, 38, 54),
+    GdiDraw::roundedBox(hdc, rAimK, 5, rebindingToggleAim_ ? RGB(115, 85, 20) : RGB(30, 38, 54),
             rebindingToggleAim_ ? RGB(255, 215, 60) : RGB(80, 180, 255), 1);
     SelectObject(hdc, fB);
-    std::string aimKLbl = rebindingToggleAim_ ? "Press Key/Mouse..." : vkToName(p.toggleAimVk);
-    drawCenterText(hdc, aimKLbl, (rAimK.left + rAimK.right) / 2, (rAimK.top + rAimK.bottom) / 2, RGB(245, 250, 255));
+    std::string aimKLbl = rebindingToggleAim_ ? "Press Key/Mouse..." : KeyCodes::toName(p.toggleAimVk);
+    GdiDraw::centeredText(hdc, aimKLbl, (rAimK.left + rAimK.right) / 2, (rAimK.top + rAimK.bottom) / 2, RGB(245, 250, 255));
     hotspots_.push_back(Hotspot{ rAimK, PA_REBIND_TOGGLE_AIM, 0 });
 
     RECT rMmbAim = { x + w - 82, cy, x + w, cy + 26 };
     bool isMmbAim = (p.toggleAimVk == VK_MBUTTON);
-    drawBox(hdc, rMmbAim, 5, isMmbAim ? RGB(0, 115, 155) : RGB(34, 44, 62),
+    GdiDraw::roundedBox(hdc, rMmbAim, 5, isMmbAim ? RGB(0, 115, 155) : RGB(34, 44, 62),
             isMmbAim ? RGB(0, 230, 255) : RGB(90, 140, 195), 1);
     SelectObject(hdc, fS);
-    drawCenterText(hdc, "MMB", (rMmbAim.left + rMmbAim.right) / 2, (rMmbAim.top + rMmbAim.bottom) / 2, RGB(225, 242, 255));
+    GdiDraw::centeredText(hdc, "MMB", (rMmbAim.left + rMmbAim.right) / 2, (rMmbAim.top + rMmbAim.bottom) / 2, RGB(225, 242, 255));
     hotspots_.push_back(Hotspot{ rMmbAim, PA_SET_TOGGLE_MMB, 0 });
     cy += 34;
 
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Hold-Unlock Key:", x, cy + 13, RGB(200, 215, 235));
+    GdiDraw::leftText(hdc, "Hold-Unlock Key:", x, cy + 13, RGB(200, 215, 235));
     RECT rHoldK = { x + 124, cy, x + w - 90, cy + 26 };
-    drawBox(hdc, rHoldK, 5, rebindingHoldUnlock_ ? RGB(115, 85, 20) : RGB(30, 38, 54),
+    GdiDraw::roundedBox(hdc, rHoldK, 5, rebindingHoldUnlock_ ? RGB(115, 85, 20) : RGB(30, 38, 54),
             rebindingHoldUnlock_ ? RGB(255, 215, 60) : RGB(80, 180, 255), 1);
     SelectObject(hdc, fB);
-    std::string holdKLbl = rebindingHoldUnlock_ ? "Press Key/Mouse..." : vkToName(p.holdUnlockVk);
-    drawCenterText(hdc, holdKLbl, (rHoldK.left + rHoldK.right) / 2, (rHoldK.top + rHoldK.bottom) / 2, RGB(245, 250, 255));
+    std::string holdKLbl = rebindingHoldUnlock_ ? "Press Key/Mouse..." : KeyCodes::toName(p.holdUnlockVk);
+    GdiDraw::centeredText(hdc, holdKLbl, (rHoldK.left + rHoldK.right) / 2, (rHoldK.top + rHoldK.bottom) / 2, RGB(245, 250, 255));
     hotspots_.push_back(Hotspot{ rHoldK, PA_REBIND_HOLD_UNLOCK, 0 });
 
     RECT rClrH = { x + w - 82, cy, x + w, cy + 26 };
-    drawBox(hdc, rClrH, 5, RGB(58, 32, 36), RGB(200, 95, 95), 1);
+    GdiDraw::roundedBox(hdc, rClrH, 5, RGB(58, 32, 36), RGB(200, 95, 95), 1);
     SelectObject(hdc, fS);
-    drawCenterText(hdc, "CLEAR", (rClrH.left + rClrH.right) / 2, (rClrH.top + rClrH.bottom) / 2, RGB(255, 195, 195));
+    GdiDraw::centeredText(hdc, "CLEAR", (rClrH.left + rClrH.right) / 2, (rClrH.top + rClrH.bottom) / 2, RGB(255, 195, 195));
     hotspots_.push_back(Hotspot{ rClrH, PA_CLEAR_HOLD_UNLOCK, 0 });
 }
 
-void ConfigPanelUI::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNode& node,
+void StudioPanel::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNode& node,
                                        bool waitingRebind, HFONT fS, HFONT fB) {
     RECT rc = { x, y, x + w, y + 276 };
-    drawBox(hdc, rc, 10, RGB(19, 25, 38), RGB(0, 230, 255), 2);
+    GdiDraw::roundedBox(hdc, rc, 10, RGB(19, 25, 38), RGB(0, 230, 255), 2);
 
     SelectObject(hdc, fB);
-    drawLeftText(hdc, "KEY INSPECTOR  (Dbl-Click to Rebind)", x + 12, y + 16, RGB(0, 225, 255));
+    GdiDraw::leftText(hdc, "KEY INSPECTOR  (Dbl-Click to Rebind)", x + 12, y + 16, RGB(0, 225, 255));
 
     int cy = y + 32;
     // Label field
     RECT rLbl = { x + 12, cy, x + w - 12, cy + 26 };
-    drawBox(hdc, rLbl, 5, RGB(12, 16, 24),
+    GdiDraw::roundedBox(hdc, rLbl, 5, RGB(12, 16, 24),
             editingNodeLabel_ ? RGB(0, 235, 255) : RGB(65, 82, 110),
             editingNodeLabel_ ? 2 : 1);
     SelectObject(hdc, fB);
     std::string ltxt = "Label: " + node.label + (editingNodeLabel_ ? "_" : "");
-    drawLeftText(hdc, ltxt, x + 20, cy + 13, RGB(240, 248, 255));
+    GdiDraw::leftText(hdc, ltxt, x + 20, cy + 13, RGB(240, 248, 255));
     hotspots_.push_back(Hotspot{ rLbl, PA_INSP_FOCUS_LABEL, 0 });
     cy += 34;
 
     // Bind Key button
     RECT rBind = { x + 12, cy, x + w - 12, cy + 26 };
-    drawBox(hdc, rBind, 5, waitingRebind ? RGB(120, 88, 22) : RGB(32, 46, 72),
+    GdiDraw::roundedBox(hdc, rBind, 5, waitingRebind ? RGB(120, 88, 22) : RGB(32, 46, 72),
             waitingRebind ? RGB(255, 215, 65) : RGB(90, 190, 255), 1);
     std::string keyDisplay = (node.comboVk == 0 && node.vk == VK_CUSTOM_MWHEEL_UP)   ? "SCROLL UP"
                            : (node.comboVk == 0 && node.vk == VK_CUSTOM_MWHEEL_DOWN) ? "SCROLL DOWN"
-                                                                                     : comboToName(node.comboVk, node.vk);
+                                                                                     : KeyCodes::comboToName(node.comboVk, node.vk);
     std::string ktxt = waitingRebind ? "Press Key / Mouse / Scroll..." : ("Key: " + keyDisplay + "  [Rebind]");
-    drawCenterText(hdc, ktxt, x + w / 2, cy + 13, RGB(245, 250, 255));
+    GdiDraw::centeredText(hdc, ktxt, x + w / 2, cy + 13, RGB(245, 250, 255));
     hotspots_.push_back(Hotspot{ rBind, PA_INSP_REBIND_KEY, 0 });
     cy += 32;
 
@@ -632,10 +597,10 @@ void ConfigPanelUI::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNo
         int cx = x + 12 + i * (chipW + 3);
         RECT rcM = { cx, cy, cx + chipW, cy + 22 };
         bool on = (node.comboVk == 0 && node.vk == mVks[i]);
-        drawBox(hdc, rcM, 4, on ? RGB(0, 120, 165) : RGB(28, 36, 52),
+        GdiDraw::roundedBox(hdc, rcM, 4, on ? RGB(0, 120, 165) : RGB(28, 36, 52),
                 on ? RGB(0, 235, 255) : RGB(65, 80, 108), 1);
         SelectObject(hdc, fS);
-        drawCenterText(hdc, mLbls[i], (rcM.left + rcM.right) / 2, cy + 11,
+        GdiDraw::centeredText(hdc, mLbls[i], (rcM.left + rcM.right) / 2, cy + 11,
                        on ? RGB(255, 255, 255) : RGB(180, 200, 225));
         hotspots_.push_back(Hotspot{ rcM, PA_INSP_SET_MOUSE_VK, mVks[i] });
     }
@@ -647,14 +612,14 @@ void ConfigPanelUI::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNo
     RECT rcScDn = { x + 12 + halfScrollW + 6, cy, x + w - 12, cy + 24 };
     bool upOn = (node.comboVk == 0 && node.vk == VK_CUSTOM_MWHEEL_UP);
     bool dnOn = (node.comboVk == 0 && node.vk == VK_CUSTOM_MWHEEL_DOWN);
-    drawBox(hdc, rcScUp, 4, upOn ? RGB(0, 120, 165) : RGB(28, 36, 52),
+    GdiDraw::roundedBox(hdc, rcScUp, 4, upOn ? RGB(0, 120, 165) : RGB(28, 36, 52),
             upOn ? RGB(0, 235, 255) : RGB(75, 115, 158), upOn ? 2 : 1);
-    drawBox(hdc, rcScDn, 4, dnOn ? RGB(0, 120, 165) : RGB(28, 36, 52),
+    GdiDraw::roundedBox(hdc, rcScDn, 4, dnOn ? RGB(0, 120, 165) : RGB(28, 36, 52),
             dnOn ? RGB(0, 235, 255) : RGB(75, 115, 158), dnOn ? 2 : 1);
     SelectObject(hdc, fB);
-    drawCenterText(hdc, "SCROLL UP", (rcScUp.left + rcScUp.right) / 2, cy + 12,
+    GdiDraw::centeredText(hdc, "SCROLL UP", (rcScUp.left + rcScUp.right) / 2, cy + 12,
                    upOn ? RGB(255, 255, 255) : RGB(175, 220, 255));
-    drawCenterText(hdc, "SCROLL DOWN", (rcScDn.left + rcScDn.right) / 2, cy + 12,
+    GdiDraw::centeredText(hdc, "SCROLL DOWN", (rcScDn.left + rcScDn.right) / 2, cy + 12,
                    dnOn ? RGB(255, 255, 255) : RGB(175, 220, 255));
     hotspots_.push_back(Hotspot{ rcScUp, PA_INSP_SET_MOUSE_VK, VK_CUSTOM_MWHEEL_UP });
     hotspots_.push_back(Hotspot{ rcScDn, PA_INSP_SET_MOUSE_VK, VK_CUSTOM_MWHEEL_DOWN });
@@ -664,13 +629,13 @@ void ConfigPanelUI::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNo
     RECT rPrev = { x + 12, cy, x + 38, cy + 26 };
     RECT rAct  = { x + 42, cy, x + w - 42, cy + 26 };
     RECT rNext = { x + w - 38, cy, x + w - 12, cy + 26 };
-    drawBox(hdc, rPrev, 5, RGB(34, 42, 60), RGB(95, 165, 230), 1);
-    drawBox(hdc, rAct,  5, RGB(14, 20, 32), RGB(70, 95, 130), 1);
-    drawBox(hdc, rNext, 5, RGB(34, 42, 60), RGB(95, 165, 230), 1);
+    GdiDraw::roundedBox(hdc, rPrev, 5, RGB(34, 42, 60), RGB(95, 165, 230), 1);
+    GdiDraw::roundedBox(hdc, rAct,  5, RGB(14, 20, 32), RGB(70, 95, 130), 1);
+    GdiDraw::roundedBox(hdc, rNext, 5, RGB(34, 42, 60), RGB(95, 165, 230), 1);
     SelectObject(hdc, fB);
-    drawCenterText(hdc, "<", (rPrev.left + rPrev.right) / 2, cy + 13, RGB(255, 255, 255));
-    drawCenterText(hdc, actionTypeToName(node.action), (rAct.left + rAct.right) / 2, cy + 13, RGB(120, 235, 195));
-    drawCenterText(hdc, ">", (rNext.left + rNext.right) / 2, cy + 13, RGB(255, 255, 255));
+    GdiDraw::centeredText(hdc, "<", (rPrev.left + rPrev.right) / 2, cy + 13, RGB(255, 255, 255));
+    GdiDraw::centeredText(hdc, ProfileDefaults::actionTypeToName(node.action), (rAct.left + rAct.right) / 2, cy + 13, RGB(120, 235, 195));
+    GdiDraw::centeredText(hdc, ">", (rNext.left + rNext.right) / 2, cy + 13, RGB(255, 255, 255));
     hotspots_.push_back(Hotspot{ rPrev, PA_INSP_ACT_PREV, 0 });
     hotspots_.push_back(Hotspot{ rNext, PA_INSP_ACT_NEXT, 0 });
     cy += 34;
@@ -683,27 +648,27 @@ void ConfigPanelUI::paintNodeInspector(HDC hdc, int x, int y, int w, const KeyNo
 
     // Scope Sens Link toggle + Delete button
     RECT rScp = { x + 12, cy, x + 156, cy + 28 };
-    drawBox(hdc, rScp, 5, node.switchScopeSens ? RGB(75, 48, 125) : RGB(30, 38, 52),
+    GdiDraw::roundedBox(hdc, rScp, 5, node.switchScopeSens ? RGB(75, 48, 125) : RGB(30, 38, 52),
             node.switchScopeSens ? RGB(195, 145, 255) : RGB(70, 84, 108), 1);
     SelectObject(hdc, fS);
-    drawCenterText(hdc, node.switchScopeSens ? "Scope Sens: ON" : "Scope Sens: OFF",
+    GdiDraw::centeredText(hdc, node.switchScopeSens ? "Scope Sens: ON" : "Scope Sens: OFF",
                    (rScp.left + rScp.right) / 2, cy + 14, RGB(235, 240, 255));
     hotspots_.push_back(Hotspot{ rScp, PA_INSP_TOGGLE_SCOPE, 0 });
 
     RECT rDel = { x + 164, cy, x + w - 12, cy + 28 };
-    drawBox(hdc, rDel, 5, RGB(95, 28, 34), RGB(255, 90, 90), 1);
+    GdiDraw::roundedBox(hdc, rDel, 5, RGB(95, 28, 34), RGB(255, 90, 90), 1);
     SelectObject(hdc, fB);
-    drawCenterText(hdc, "DELETE", (rDel.left + rDel.right) / 2, cy + 14, RGB(255, 210, 210));
+    GdiDraw::centeredText(hdc, "DELETE", (rDel.left + rDel.right) / 2, cy + 14, RGB(255, 210, 210));
     hotspots_.push_back(Hotspot{ rDel, PA_INSP_DELETE, 0 });
 }
 
-bool ConfigPanelUI::containsPoint(int x, int y) const {
-    if (ptInRect(panelRect_, x, y)) return true;
-    if (inspectorVisible_ && ptInRect(inspectorRect_, x, y)) return true;
+bool StudioPanel::containsPoint(int x, int y) const {
+    if (GdiDraw::ptInRect(panelRect_, x, y)) return true;
+    if (inspectorVisible_ && GdiDraw::ptInRect(inspectorRect_, x, y)) return true;
     return false;
 }
 
-void ConfigPanelUI::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
+void StudioPanel::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
     normT = clampf(normT, 0.0f, 1.0f);
     for (size_t i = 0; i < sliders_.size(); ++i) {
         if (sliders_[i].id != sliderId) continue;
@@ -731,8 +696,8 @@ void ConfigPanelUI::applySliderValue(int sliderId, float normT, Profile& p, int 
     }
 }
 
-bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
-                                Profile& profile, int& selectedBtnIndex, ConfigUIResult& out) {
+bool StudioPanel::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
+                                Profile& profile, int& selectedBtnIndex, StudioUIResult& out) {
     if (!containsPoint(x, y)) {
         editingNewProfileName_ = false;
         editingNodeLabel_ = false;
@@ -740,7 +705,7 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
     }
 
     // Check title bar drag first
-    if (ptInRect(titleBarRect_, x, y)) {
+    if (GdiDraw::ptInRect(titleBarRect_, x, y)) {
         draggingPanel_ = true;
         dragOffX_ = x - panelRect_.left;
         dragOffY_ = y - panelRect_.top;
@@ -751,7 +716,7 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
 
     // Check interactive sliders
     for (size_t i = 0; i < sliders_.size(); ++i) {
-        if (ptInRect(sliders_[i].hitRc, x, y)) {
+        if (GdiDraw::ptInRect(sliders_[i].hitRc, x, y)) {
             activeSliderId_ = sliders_[i].id;
             activeSliderTrack_ = sliders_[i].trackRc;
             float w = static_cast<float>(activeSliderTrack_.right - activeSliderTrack_.left);
@@ -767,7 +732,7 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
     // Check clickable UI hotspots
     for (size_t i = 0; i < hotspots_.size(); ++i) {
         const Hotspot& hs = hotspots_[i];
-        if (!ptInRect(hs.rc, x, y)) continue;
+        if (!GdiDraw::ptInRect(hs.rc, x, y)) continue;
 
         editingNewProfileName_ = false;
         editingNodeLabel_ = false;
@@ -787,7 +752,7 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
             case PA_SAVE:            out.requestSave = true; return true;
 
             case PA_RESET_SENS: {
-                Profile def = createDefaultFreeFireProfile();
+                Profile def = ProfileDefaults::createFreeFire();
                 profile.sensX = def.sensX;
                 profile.sensY = def.sensY;
                 profile.fireSensX = def.fireSensX;
@@ -809,14 +774,14 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
             case PA_ADD_NODE:
                 out.requestAddNode = true;
                 out.addNodeType = static_cast<KeyActionType>(hs.extra);
-                out.addNodeLabel = actionTypeToName(out.addNodeType);
+                out.addNodeLabel = ProfileDefaults::actionTypeToName(out.addNodeType);
                 return true;
 
             case PA_CLEAR_BUTTONS:
                 profile.buttons.clear();
                 selectedBtnIndex = -1;
                 out.profileModified = true;
-                out.toastMessage = "Cleared extra keys — add your own from the palette!";
+                out.toastMessage = "Cleared extra keys â€” add your own from the palette!";
                 return true;
 
             case PA_FOCUS_NEW_NAME:
@@ -825,13 +790,13 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
 
             case PA_CREATE_BLANK:
             case PA_CREATE_CLONE: {
-                std::string fname = sanitizeProfileFilename(newProfileName_);
+                std::string fname = ProfileStore::sanitizeFilename(newProfileName_);
                 std::string fullPath = profilesDir_ + "\\" + fname + ".cfg";
                 Profile np = (hs.id == PA_CREATE_BLANK)
-                    ? createBlankProfile(newProfileName_)
+                    ? ProfileDefaults::createBlank(newProfileName_)
                     : profile;
                 np.name = newProfileName_.empty() ? fname : newProfileName_;
-                if (saveProfile(fullPath, np)) {
+                if (ProfileStore::save(fullPath, np)) {
                     refreshProfileList();
                     out.requestSwitchProfile = true;
                     out.switchProfilePath = fullPath;
@@ -884,7 +849,7 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
                     profile.buttons[selectedBtnIndex].comboVk = 0;
                     profile.buttons[selectedBtnIndex].vk = hs.extra;
                     out.profileModified = true;
-                    out.toastMessage = "Bound '" + profile.buttons[selectedBtnIndex].label + "' -> " + vkToName(hs.extra);
+                    out.toastMessage = "Bound '" + profile.buttons[selectedBtnIndex].label + "' -> " + KeyCodes::toName(hs.extra);
                 }
                 return true;
             case PA_INSP_ACT_PREV:
@@ -920,8 +885,8 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
     return true; // Click landed inside panel background; swallow so we don't accidentally drag canvas nodes behind panel
 }
 
-bool ConfigPanelUI::onMouseMove(int x, int y, int canvasW, int canvasH,
-                                Profile& profile, int selectedBtnIndex, ConfigUIResult& out) {
+bool StudioPanel::onMouseMove(int x, int y, int canvasW, int canvasH,
+                                Profile& profile, int selectedBtnIndex, StudioUIResult& out) {
     if (draggingPanel_ && canvasW > 0 && canvasH > 0) {
         int nx = x - dragOffX_;
         int ny = y - dragOffY_;
@@ -941,28 +906,28 @@ bool ConfigPanelUI::onMouseMove(int x, int y, int canvasW, int canvasH,
     return false;
 }
 
-void ConfigPanelUI::onMouseUp() {
+void StudioPanel::onMouseUp() {
     draggingPanel_ = false;
     activeSliderId_ = 0;
 }
 
-bool ConfigPanelUI::onKeyDown(int vk, Profile& profile, int selectedBtnIndex, ConfigUIResult& out) {
+bool StudioPanel::onKeyDown(int vk, Profile& profile, int selectedBtnIndex, StudioUIResult& out) {
     if (rebindingToggleAim_) {
         if (vk != VK_ESCAPE) {
-            vk = normalizeModVk(vk); // Fix: VK_SHIFT (0x10) -> VK_LSHIFT (0xA0) to match WH_KEYBOARD_LL!
+            vk = KeyCodes::normalizeModifier(vk); // Fix: VK_SHIFT (0x10) -> VK_LSHIFT (0xA0) to match WH_KEYBOARD_LL!
             profile.toggleAimVk = vk;
             out.profileModified = true;
-            out.toastMessage = "Aim Lock Toggle bound to " + vkToName(vk);
+            out.toastMessage = "Aim Lock Toggle bound to " + KeyCodes::toName(vk);
         }
         rebindingToggleAim_ = false;
         return true;
     }
     if (rebindingHoldUnlock_) {
         if (vk != VK_ESCAPE) {
-            vk = normalizeModVk(vk);
+            vk = KeyCodes::normalizeModifier(vk);
             profile.holdUnlockVk = vk;
             out.profileModified = true;
-            out.toastMessage = "Hold-to-Unlock bound to " + vkToName(vk);
+            out.toastMessage = "Hold-to-Unlock bound to " + KeyCodes::toName(vk);
         }
         rebindingHoldUnlock_ = false;
         return true;
@@ -997,7 +962,7 @@ bool ConfigPanelUI::onKeyDown(int vk, Profile& profile, int selectedBtnIndex, Co
     return false;
 }
 
-bool ConfigPanelUI::onMouseBind(int mouseVk, Profile& profile, int /*selectedBtnIndex*/, ConfigUIResult& out) {
+bool StudioPanel::onMouseBind(int mouseVk, Profile& profile, int /*selectedBtnIndex*/, StudioUIResult& out) {
     if (rebindingToggleAim_) {
         if (mouseVk == VK_LBUTTON) {
             out.toastMessage = "Use Keyboard, MMB, RMB, X1, X2, or Wheel for Aim Lock (LMB is reserved)";
@@ -1006,7 +971,7 @@ bool ConfigPanelUI::onMouseBind(int mouseVk, Profile& profile, int /*selectedBtn
         profile.toggleAimVk = mouseVk;
         rebindingToggleAim_ = false;
         out.profileModified = true;
-        out.toastMessage = "Aim Lock Toggle bound to " + vkToName(mouseVk);
+        out.toastMessage = "Aim Lock Toggle bound to " + KeyCodes::toName(mouseVk);
         return true;
     }
     if (rebindingHoldUnlock_) {
@@ -1017,13 +982,13 @@ bool ConfigPanelUI::onMouseBind(int mouseVk, Profile& profile, int /*selectedBtn
         profile.holdUnlockVk = mouseVk;
         rebindingHoldUnlock_ = false;
         out.profileModified = true;
-        out.toastMessage = "Hold-to-Unlock bound to " + vkToName(mouseVk);
+        out.toastMessage = "Hold-to-Unlock bound to " + KeyCodes::toName(mouseVk);
         return true;
     }
     return false;
 }
 
-bool ConfigPanelUI::onChar(char ch, Profile& profile, int selectedBtnIndex, ConfigUIResult& out) {
+bool StudioPanel::onChar(char ch, Profile& profile, int selectedBtnIndex, StudioUIResult& out) {
     if (ch < 32 || ch > 126) return false;
     if (editingNewProfileName_) {
         if (newProfileName_.size() < 24) {

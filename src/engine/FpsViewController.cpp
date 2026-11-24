@@ -1,4 +1,4 @@
-#include "fps_view.hpp"
+#include "engine/FpsViewController.hpp"
 
 #include <cmath>
 
@@ -18,7 +18,7 @@ FpsViewFinger::FpsViewFinger(uint64_t primaryPtrId, uint64_t altPtrId)
       activePtrId_(primaryPtrId) {
 }
 
-void FpsViewFinger::setTouchSink(FpsTouchEmitFn fn, void* ctx) {
+void FpsViewFinger::setTouchSink(TouchEmitFn fn, void* ctx) {
     emitFn_ = fn;
     emitCtx_ = ctx;
 }
@@ -206,7 +206,7 @@ void FpsViewFinger::onMouseDelta(double rawDx, double rawDy, double multX, doubl
         return;
     }
 
-    // Guard single-tick extreme spikes while preserving fast 360° flicks
+    // Guard single-tick extreme spikes while preserving fast 360Â° flicks
     intDx = static_cast<int32_t>(clampVal(static_cast<double>(intDx), -240.0, 240.0));
     intDy = static_cast<int32_t>(clampVal(static_cast<double>(intDy), -240.0, 240.0));
 
@@ -218,7 +218,7 @@ void FpsViewFinger::onMouseDelta(double rawDx, double rawDy, double multX, doubl
         nextX = clampVal(nextX, cfg_.rectLeft, cfg_.rectRight);
         nextY = clampVal(nextY, cfg_.rectTop, cfg_.rectBottom);
     } else if (!cfg_.unbounded) {
-        // Boxed 360° mode: exiting moveRect triggers clean edge-release without out-of-bounds MOVE
+        // Boxed 360Â° mode: exiting moveRect triggers clean edge-release without out-of-bounds MOVE
         bool outOfBounds = (nextX < cfg_.rectLeft || nextX > cfg_.rectRight ||
                             nextY < cfg_.rectTop  || nextY > cfg_.rectBottom);
         if (outOfBounds) {
@@ -280,7 +280,7 @@ FpsViewStack::FpsViewStack(uint64_t mainPtrA, uint64_t mainPtrB, uint64_t overla
       overlayView_(overlayPtr, overlayPtr) {
 }
 
-void FpsViewStack::setTouchSink(FpsTouchEmitFn fn, void* ctx) {
+void FpsViewStack::setTouchSink(TouchEmitFn fn, void* ctx) {
     mainView_.setTouchSink(fn, ctx);
     overlayView_.setTouchSink(fn, ctx);
 }

@@ -1,4 +1,5 @@
-#include "sps_parser.hpp"
+#include "bridge/SpsParser.hpp"
+
 #include <vector>
 
 namespace {
@@ -74,10 +75,8 @@ void skipScalingList(BitReader& br, int sizeOfScalingList) {
 bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t& outHeight) {
     if (nalLen < 4) return false;
 
-    // Strip H.264 emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00)
     std::vector<uint8_t> rbsp;
     rbsp.reserve(nalLen);
-    // Skip 1-byte NAL header
     for (size_t i = 1; i < nalLen; ++i) {
         if (i + 2 < nalLen && nal[i] == 0x00 && nal[i + 1] == 0x00 && nal[i + 2] == 0x03) {
             rbsp.push_back(0x00);
@@ -90,9 +89,9 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t
 
     BitReader br(rbsp.data(), rbsp.size());
     uint32_t profileIdc = br.readBits(8);
-    br.readBits(8); // constraint flags + reserved
-    br.readBits(8); // level_idc
-    br.readUE();    // seq_parameter_set_id
+    br.readBits(8);
+    br.readBits(8);
+    br.readUE();
 
     uint32_t chromaFormatIdc = 1;
     uint32_t separateColourPlaneFlag = 0;
@@ -105,11 +104,10 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t
         if (chromaFormatIdc == 3) {
             separateColourPlaneFlag = br.readBits(1);
         }
-        br.readUE();    // bit_depth_luma_minus8
-        br.readUE();    // bit_depth_chroma_minus8
-        br.readBits(1); // qpprime_y_zero_transform_bypass_flag
-        uint32_t seqScalingMatrixPresent = br.readBits(1);
-        if (seqScalingMatrixPresent) {
+        br.readUE();
+        br.readUE();
+        br.readBits(1);
+        if (br.readBits(1)) {
             int count = (chromaFormatIdc != 3) ? 8 : 12;
             for (int i = 0; i < count && br.ok(); ++i) {
                 if (br.readBits(1)) {
@@ -119,35 +117,34 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t
         }
     }
 
-    br.readUE(); // log2_max_frame_num_minus4
+    br.readUE();
     uint32_t picOrderCntType = br.readUE();
     if (picOrderCntType == 0) {
-        br.readUE(); // log2_max_pic_order_cnt_lsb_minus4
+        br.readUE();
     } else if (picOrderCntType == 1) {
-        br.readBits(1); // delta_pic_order_always_zero_flag
-        br.readSE();    // offset_for_non_ref_pic
-        br.readSE();    // offset_for_top_to_bottom_field
-        uint32_t numRefFramesInPicOrderCntCycle = br.readUE();
-        if (numRefFramesInPicOrderCntCycle > 256) return false;
-        for (uint32_t i = 0; i < numRefFramesInPicOrderCntCycle && br.ok(); ++i) {
+        br.readBits(1);
+        br.readSE();
+        br.readSE();
+        uint32_t numRef = br.readUE();
+        if (numRef > 256) return false;
+        for (uint32_t i = 0; i < numRef && br.ok(); ++i) {
             br.readSE();
         }
     }
 
-    br.readUE();    // max_num_ref_frames
-    br.readBits(1); // gaps_in_frame_num_value_allowed_flag
+    br.readUE();
+    br.readBits(1);
 
     uint32_t picWidthInMbsMinus1 = br.readUE();
     uint32_t picHeightInMapUnitsMinus1 = br.readUE();
     uint32_t frameMbsOnlyFlag = br.readBits(1);
     if (!frameMbsOnlyFlag) {
-        br.readBits(1); // mb_adaptive_frame_field_flag
+        br.readBits(1);
     }
-    br.readBits(1); // direct_8x8_inference_flag
+    br.readBits(1);
 
     uint32_t cropLeft = 0, cropRight = 0, cropTop = 0, cropBottom = 0;
-    uint32_t frameCroppingFlag = br.readBits(1);
-    if (frameCroppingFlag) {
+    if (br.readBits(1)) {
         cropLeft   = br.readUE();
         cropRight  = br.readUE();
         cropTop    = br.readUE();
@@ -162,10 +159,10 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t
     uint32_t cropUnitX = 1;
     uint32_t cropUnitY = 2u - frameMbsOnlyFlag;
     if (separateColourPlaneFlag == 0) {
-        if (chromaFormatIdc == 1) { // 4:2:0
+        if (chromaFormatIdc == 1) {
             cropUnitX = 2;
             cropUnitY = 2u * (2u - frameMbsOnlyFlag);
-        } else if (chromaFormatIdc == 2) { // 4:2:2
+        } else if (chromaFormatIdc == 2) {
             cropUnitX = 2;
             cropUnitY = 2u - frameMbsOnlyFlag;
         }
@@ -186,10 +183,10 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, uint32_t& outWidth, uint32_t
 
 } // namespace
 
-bool parseH264SpsResolution(const uint8_t* data, size_t len, uint32_t& outWidth, uint32_t& outHeight) {
+bool SpsParser::parseH264Resolution(const uint8_t* data, size_t len,
+                                    uint32_t& outWidth, uint32_t& outHeight) {
     if (!data || len < 5) return false;
 
-    // Scan Annex-B start codes (00 00 01 or 00 00 00 01) for NAL type 7 (SPS)
     size_t i = 0;
     while (i + 4 < len) {
         size_t startCodeLen = 0;
@@ -207,7 +204,6 @@ bool parseH264SpsResolution(const uint8_t* data, size_t len, uint32_t& outWidth,
         size_t nalStart = i + startCodeLen;
         if (nalStart >= len) break;
 
-        // Find next start code
         size_t nalEnd = len;
         for (size_t j = nalStart + 1; j + 3 < len; ++j) {
             if (data[j] == 0x00 && data[j + 1] == 0x00 &&
@@ -218,7 +214,7 @@ bool parseH264SpsResolution(const uint8_t* data, size_t len, uint32_t& outWidth,
         }
 
         uint8_t nalType = data[nalStart] & 0x1Fu;
-        if (nalType == 7) { // SPS
+        if (nalType == 7) {
             if (parseSpsNal(data + nalStart, nalEnd - nalStart, outWidth, outHeight)) {
                 return true;
             }

@@ -1,14 +1,14 @@
 #pragma once
 
-#include "protocol.hpp"
+#include "bridge/TouchTypes.hpp"
 
 #include <cstdint>
 
 // ============================================================================
-// Phantom Touch — Standalone 360° Virtual-Finger FPS View Controller
+// Phantom Touch â€” Standalone 360Â° Virtual-Finger FPS View Controller
 // ============================================================================
 // Clean-room C++11 implementation of a touchscreen virtual-finger camera
-// state machine for 360° player view control over Android multi-touch:
+// state machine for 360Â° player view control over Android multi-touch:
 //
 //   1. Lazy Touch-Down: Locking the mouse focuses the view without touching
 //      the screen until the first >=1px mouse delta arrives.
@@ -18,10 +18,10 @@
 //   3. Dual Boundary Modes:
 //      - Unbounded (Free Fire): infinite travel rect, exact center landing,
 //        optional nonlinear horizontal counter-acceleration.
-//      - Boxed (PUBG/CODM/custom): bounded move rect with ±50px landing
+//      - Boxed (PUBG/CODM/custom): bounded move rect with Â±50px landing
 //        jitter; exiting the boundary emits TOUCH_UP, waits >=15ms
 //        non-blockingly (touchDownDelay floor), and seamlessly re-plants
-//        near center on the next delta for infinite 360° rotation.
+//        near center on the next delta for infinite 360Â° rotation.
 //   4. Idle Auto-Release: Re-centers after inactivity so the next flick
 //      starts near center with full travel room.
 //   5. View Stack (FpsViewStack): Supports pushing temporary mouse-linked
@@ -50,21 +50,17 @@ struct FpsViewConfig {
     // Virtual finger lifecycle policies
     bool clampInsteadOfRelease = false; // Clamp to moveRect (used by linked Free-Look buttons)
     bool edgeReleaseOnly = false;       // Disable idle auto-release timer when true
-    int touchDownRandomRangePx = 0;     // 0 in Free Fire; 50 in boxed mode (±50px around center)
+    int touchDownRandomRangePx = 0;     // 0 in Free Fire; 50 in boxed mode (Â±50px around center)
     int touchDownDelayMs = 15;          // Minimum 15ms separation between UP and next DOWN
     int touchUpDelayMs = 0;             // Optional pause before lifting at boundary
     int idleReleaseMs = 700;            // Inactivity auto-recenter interval (ms)
 };
 
-// Optional touch sink callback so FpsViewFinger can be tested offline without sockets
-typedef void (*FpsTouchEmitFn)(void* ctx, TouchAction action, uint64_t pointerId,
-                               int32_t px, int32_t py, bool clampToScreen);
-
 class FpsViewFinger {
 public:
     FpsViewFinger(uint64_t primaryPtrId, uint64_t altPtrId);
 
-    void setTouchSink(FpsTouchEmitFn fn, void* ctx);
+    void setTouchSink(TouchEmitFn fn, void* ctx);
     void configure(const FpsViewConfig& cfg);
     const FpsViewConfig& config() const { return cfg_; }
 
@@ -102,8 +98,8 @@ private:
     int nextRandRange(int range);
 
     FpsViewConfig cfg_;
-    FpsTouchEmitFn emitFn_ = NULL;
-    void* emitCtx_ = NULL;
+    TouchEmitFn emitFn_ = nullptr;
+    void* emitCtx_ = nullptr;
 
     uint64_t primaryPtrId_ = 2;
     uint64_t altPtrId_ = 4;
@@ -133,13 +129,13 @@ private:
 };
 
 // Manages the 2-level FPS View Stack:
-//   Index 0: Main 360° camera finger (PTR_AIM_A=2 / PTR_AIM_B=4)
+//   Index 0: Main 360Â° camera finger (PTR_AIM_A=2 / PTR_AIM_B=4)
 //   Index 1: Optional temporary mouse-linked drag view (e.g. Free Look Eye, PTR_HOLD_VIEW=5)
 class FpsViewStack {
 public:
     FpsViewStack(uint64_t mainPtrA, uint64_t mainPtrB, uint64_t overlayPtr);
 
-    void setTouchSink(FpsTouchEmitFn fn, void* ctx);
+    void setTouchSink(TouchEmitFn fn, void* ctx);
     void configureMain(const FpsViewConfig& cfg);
 
     void onFocusGain(double nowMs);

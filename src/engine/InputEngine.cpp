@@ -1,0 +1,824 @@
+#include "engine/InputEngine.hpp"
+
+#include "config/KeyCodes.hpp"
+
+#include <mmsystem.h>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+double getTimeMs() {
+    static LARGE_INTEGER freq;
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (static_cast<double>(now.QuadPart) * 1000.0) / static_cast<double>(freq.QuadPart);
+}
+
+double clampd(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+} // namespace
+
+void InputEngine::emitTouchToBridge(void* ctx, TouchAction action, uint64_t pointerId,
+                                    int32_t px, int32_t py, bool clampToScreen) {
+    ScrcpyBridge* br = reinterpret_cast<ScrcpyBridge*>(ctx);
+    if (br) {
+        br->sendTouchPixels(action, pointerId, px, py, clampToScreen);
+    }
+}
+
+InputEngine::InputEngine(ScrcpyBridge* bridge)
+    : bridge_(bridge),
+      viewStack_(PointerId::AIM_A, PointerId::AIM_B, PointerId::HOLD_VIEW) {
+    InitializeCriticalSection(&lock_);
+    InitializeCriticalSection(&inputLock_);
+    wakeEvent_ = CreateEventA(NULL, FALSE, FALSE, NULL);
+    std::memset(heldKeys_, 0, sizeof(heldKeys_));
+    std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
+
+    profile_ = ProfileDefaults::createFreeFire();
+
+    viewStack_.setTouchSink(emitTouchToBridge, bridge_);
+    joystick_.setTouchSink(emitTouchToBridge, bridge_);
+    actions_.setTouchSink(emitTouchToBridge, bridge_);
+    actions_.resetForProfile(profile_.buttons.size());
+
+    uint32_t w = 1920, h = 1080;
+    if (bridge_) bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
+
+    EnterCriticalSection(&inputLock_);
+    rebuildKeyRouteCacheLocked();
+    LeaveCriticalSection(&inputLock_);
+}
+
+InputEngine::~InputEngine() {
+    stop();
+    if (wakeEvent_) {
+        CloseHandle(wakeEvent_);
+        wakeEvent_ = NULL;
+    }
+    DeleteCriticalSection(&inputLock_);
+    DeleteCriticalSection(&lock_);
+}
+
+void InputEngine::rebuildKeyRouteCacheLocked() {
+    routeVkUp_     = profile_.vkUp;
+    routeVkDown_   = profile_.vkDown;
+    routeVkLeft_   = profile_.vkLeft;
+    routeVkRight_  = profile_.vkRight;
+    routeVkSprint_ = profile_.vkSprint;
+    routeVkWalk_   = profile_.vkWalk;
+    routeFireVk_   = profile_.fireVk;
+    routeButtons_.clear();
+    routeButtons_.reserve(profile_.buttons.size());
+    for (size_t i = 0; i < profile_.buttons.size(); ++i) {
+        KeyRouteEntry e;
+        e.comboVk = profile_.buttons[i].comboVk;
+        e.vk      = profile_.buttons[i].vk;
+        e.action  = profile_.buttons[i].action;
+        routeButtons_.push_back(e);
+    }
+}
+
+void InputEngine::syncFpsViewConfigLocked(uint32_t w, uint32_t h) {
+    if (w == 0) w = 1920;
+    if (h == 0) h = 1080;
+    double dw = static_cast<double>(w);
+    double dh = static_cast<double>(h);
+
+    FpsViewConfig cfg;
+    cfg.screenW = dw;
+    cfg.screenH = dh;
+    cfg.centerX = static_cast<double>(profile_.aimX) * dw;
+    cfg.centerY = static_cast<double>(profile_.aimY) * dh;
+    cfg.sensX = static_cast<double>(profile_.sensX);
+    cfg.sensY = static_cast<double>(profile_.sensY);
+    cfg.ffCounterAccel = static_cast<double>(profile_.ffCounterAccel);
+    cfg.invertY = profile_.invertY;
+    cfg.unbounded = profile_.unboundedAim;
+    cfg.clampInsteadOfRelease = false;
+    cfg.touchDownDelayMs = (profile_.touchDownDelayMs >= 15) ? profile_.touchDownDelayMs : 15;
+    cfg.touchUpDelayMs = profile_.touchUpDelayMs;
+    cfg.idleReleaseMs = profile_.idleResetMs;
+    cfg.edgeReleaseOnly = (profile_.idleResetMs <= 0);
+
+    if (profile_.unboundedAim) {
+        cfg.rectLeft   = -99999999.0;
+        cfg.rectTop    = -99999999.0;
+        cfg.rectRight  =  99999999.0;
+        cfg.rectBottom =  99999999.0;
+        cfg.touchDownRandomRangePx = 0;
+    } else {
+        double margin = 50.0;
+        double minX = clampd(cfg.centerX - static_cast<double>(profile_.aimHalfW) * dw, margin, dw - margin);
+        double maxX = clampd(cfg.centerX + static_cast<double>(profile_.aimHalfW) * dw, margin, dw - margin);
+        double minY = clampd(cfg.centerY - static_cast<double>(profile_.aimHalfH) * dh, margin, dh - margin);
+        double maxY = clampd(cfg.centerY + static_cast<double>(profile_.aimHalfH) * dh, margin, dh - margin);
+        if (maxX - minX < 120.0) { minX = margin; maxX = dw - margin; }
+        if (maxY - minY < 120.0) { minY = margin; maxY = dh - margin; }
+        cfg.rectLeft   = minX;
+        cfg.rectTop    = minY;
+        cfg.rectRight  = maxX;
+        cfg.rectBottom = maxY;
+        cfg.touchDownRandomRangePx = 50;
+    }
+
+    viewStack_.configureMain(cfg);
+    lastConfiguredW_ = w;
+    lastConfiguredH_ = h;
+}
+
+void InputEngine::start() {
+    if (thread_ != NULL) return;
+    InterlockedExchange(&stopFlag_, 0);
+    thread_ = CreateThread(NULL, 0, tickThreadProc, this, 0, NULL);
+    if (thread_) {
+        SetThreadPriority(thread_, THREAD_PRIORITY_HIGHEST);
+    }
+}
+
+void InputEngine::stop() {
+    if (thread_ == NULL) return;
+    InterlockedExchange(&stopFlag_, 1);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+    WaitForSingleObject(thread_, 1500);
+    CloseHandle(thread_);
+    thread_ = NULL;
+    releaseAllTouches();
+}
+
+void InputEngine::setProfile(const Profile& profile) {
+    EnterCriticalSection(&lock_);
+    releaseAllLocked();
+    profile_ = profile;
+    actions_.resetForProfile(profile_.buttons.size());
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
+    EnterCriticalSection(&inputLock_);
+    pendingKeys_.clear();
+    pendingCursor_.clear();
+    std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
+    rebuildKeyRouteCacheLocked();
+    LeaveCriticalSection(&inputLock_);
+    LeaveCriticalSection(&lock_);
+}
+
+Profile InputEngine::getProfileCopy() const {
+    EnterCriticalSection(&lock_);
+    Profile copy = profile_;
+    LeaveCriticalSection(&lock_);
+    return copy;
+}
+
+void InputEngine::setAimMode(bool enabled) {
+    bool wasEnabled = (aimMode_ != 0);
+    if (wasEnabled == enabled) return;
+
+    double nowMs = getTimeMs();
+    EnterCriticalSection(&lock_);
+    releaseMouseTouchesLocked();
+    InterlockedExchange(&aimMode_, enabled ? 1 : 0);
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
+    if (enabled) {
+        viewStack_.onFocusGain(nowMs);
+    } else {
+        viewStack_.onFocusLose(nowMs);
+    }
+    EnterCriticalSection(&inputLock_);
+    accumRawDx_ = 0.0;
+    accumRawDy_ = 0.0;
+    pendingCursor_.clear();
+    LeaveCriticalSection(&inputLock_);
+    smoothDx_ = 0.0;
+    smoothDy_ = 0.0;
+    scopeSensActive_ = false;
+    LeaveCriticalSection(&lock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+void InputEngine::onRawMouseDelta(int dx, int dy) {
+    if (!aimMode_) return;
+    EnterCriticalSection(&inputLock_);
+    accumRawDx_ += static_cast<double>(dx);
+    accumRawDy_ += static_cast<double>(dy);
+    LeaveCriticalSection(&inputLock_);
+}
+
+void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float normY) {
+    if (aimMode_) return;
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        processDirectCursorLocked(action, normX, normY);
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+    EnterCriticalSection(&inputLock_);
+    if (action == TOUCH_MOVE && !pendingCursor_.empty() && pendingCursor_.back().action == TOUCH_MOVE) {
+        pendingCursor_.back().normX = normX;
+        pendingCursor_.back().normY = normY;
+    } else {
+        QueuedCursorTouch q = { action, normX, normY };
+        pendingCursor_.push_back(q);
+    }
+    LeaveCriticalSection(&inputLock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+void InputEngine::processDirectCursorLocked(TouchAction action, float normX, float normY) {
+    if (action == TOUCH_DOWN) {
+        directCursorDown_ = true;
+        bridge_->sendTouchNorm(TOUCH_DOWN, PointerId::CURSOR, normX, normY);
+        ++packetsThisSec_;
+    } else if (action == TOUCH_MOVE) {
+        if (directCursorDown_) {
+            bridge_->sendTouchNorm(TOUCH_MOVE, PointerId::CURSOR, normX, normY);
+            ++packetsThisSec_;
+        }
+    } else if (action == TOUCH_UP) {
+        if (directCursorDown_) {
+            directCursorDown_ = false;
+            bridge_->sendTouchNorm(TOUCH_UP, PointerId::CURSOR, normX, normY);
+            ++packetsThisSec_;
+        }
+    }
+}
+
+bool InputEngine::classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim) {
+    outRequestToggleAim = false;
+    bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
+    bool mouseBtn = KeyCodes::isMouseKey(vk);
+
+    if (!isWheel && vk >= 0 && vk < 512) {
+        hookHeldKeys_[vk] = down;
+    }
+
+    if (!isAim && mouseBtn) {
+        if (down) {
+            for (size_t i = 0; i < routeButtons_.size(); ++i) {
+                if (routeButtons_[i].action == NODE_CURSOR_TOGGLE &&
+                    routeButtons_[i].comboVk == 0 && KeyCodes::matches(vk, routeButtons_[i].vk)) {
+                    outRequestToggleAim = true;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool hasCustomBtn = false;
+    bool hasToggleBtn = false;
+    for (size_t i = 0; i < routeButtons_.size(); ++i) {
+        const KeyRouteEntry& e = routeButtons_[i];
+        bool comboActive = (e.comboVk != 0 && KeyCodes::matches(vk, e.vk) && e.comboVk < 512 && hookHeldKeys_[e.comboVk]);
+        bool singleMatch = (e.comboVk == 0 && KeyCodes::matches(vk, e.vk));
+        bool prefixRelease = (!down && e.comboVk != 0 && KeyCodes::matches(vk, e.comboVk));
+        if (comboActive || singleMatch || prefixRelease) {
+            if (!isAim && e.action == NODE_HOLD_VIEW) continue;
+            hasCustomBtn = true;
+            if (down && e.action == NODE_CURSOR_TOGGLE && (comboActive || singleMatch)) {
+                hasToggleBtn = true;
+            }
+        }
+    }
+
+    if (hasToggleBtn) {
+        outRequestToggleAim = true;
+        return true;
+    }
+    if (KeyCodes::matches(vk, routeVkUp_) || KeyCodes::matches(vk, routeVkDown_) ||
+        KeyCodes::matches(vk, routeVkLeft_) || KeyCodes::matches(vk, routeVkRight_)) {
+        return true;
+    }
+    if (!hasCustomBtn && (KeyCodes::matches(vk, routeVkSprint_) ||
+                          (routeVkWalk_ != 0 && KeyCodes::matches(vk, routeVkWalk_)))) {
+        return true;
+    }
+    if ((isAim || !KeyCodes::isMouseKey(routeFireVk_)) && KeyCodes::matches(vk, routeFireVk_)) {
+        return true;
+    }
+    return hasCustomBtn;
+}
+
+bool InputEngine::isKeyMapped(int vk, bool aimModeActive) const {
+    EnterCriticalSection(&inputLock_);
+    bool mouseBtn = KeyCodes::isMouseKey(vk);
+    if (!aimModeActive && mouseBtn) {
+        for (size_t i = 0; i < routeButtons_.size(); ++i) {
+            if (routeButtons_[i].action == NODE_CURSOR_TOGGLE &&
+                routeButtons_[i].comboVk == 0 && KeyCodes::matches(vk, routeButtons_[i].vk)) {
+                LeaveCriticalSection(&inputLock_);
+                return true;
+            }
+        }
+        LeaveCriticalSection(&inputLock_);
+        return false;
+    }
+    if (KeyCodes::matches(vk, routeVkUp_) || KeyCodes::matches(vk, routeVkDown_) ||
+        KeyCodes::matches(vk, routeVkLeft_) || KeyCodes::matches(vk, routeVkRight_) ||
+        KeyCodes::matches(vk, routeVkSprint_) || (routeVkWalk_ != 0 && KeyCodes::matches(vk, routeVkWalk_))) {
+        LeaveCriticalSection(&inputLock_);
+        return true;
+    }
+    if ((aimModeActive || !KeyCodes::isMouseKey(routeFireVk_)) && KeyCodes::matches(vk, routeFireVk_)) {
+        LeaveCriticalSection(&inputLock_);
+        return true;
+    }
+    for (size_t i = 0; i < routeButtons_.size(); ++i) {
+        if (KeyCodes::matches(vk, routeButtons_[i].vk)) {
+            if (!aimModeActive && routeButtons_[i].action == NODE_HOLD_VIEW) continue;
+            LeaveCriticalSection(&inputLock_);
+            return true;
+        }
+    }
+    LeaveCriticalSection(&inputLock_);
+    return false;
+}
+
+bool InputEngine::onKeyEvent(int vk, bool down, bool& outRequestToggleAim) {
+    outRequestToggleAim = false;
+    double nowMs = getTimeMs();
+    bool isAim = (aimMode_ != 0);
+
+    EnterCriticalSection(&inputLock_);
+    bool consumed = classifyKeyInputLocked(vk, down, isAim, outRequestToggleAim);
+    bool shouldQueue = consumed || !down;
+    if (shouldQueue && thread_ != NULL) {
+        QueuedKeyEvent ev = { vk, down, nowMs };
+        pendingKeys_.push_back(ev);
+    }
+    LeaveCriticalSection(&inputLock_);
+
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        processKeyEventLocked(vk, down, nowMs);
+        LeaveCriticalSection(&lock_);
+    } else if (shouldQueue && wakeEvent_) {
+        SetEvent(wakeEvent_);
+    }
+    return consumed;
+}
+
+void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
+    bool isAim = (aimMode_ != 0);
+    bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
+    bool mouseBtn = KeyCodes::isMouseKey(vk);
+
+    if (!isWheel && vk >= 0 && vk < 512) {
+        heldKeys_[vk] = down;
+    }
+
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+
+    // Cursor Mode: mouse buttons only trigger NODE_CURSOR_TOGGLE; all keyboard keys remain active!
+    if (!isAim && mouseBtn) {
+        if (down) {
+            ActionEffects eff;
+            actions_.dispatchKey(vk, true, false, profile_, heldKeys_, w, h, nowMs,
+                                 scopeSensActive_, eff, packetsThisSec_);
+        }
+        return;
+    }
+
+    // 1. Check if an explicit button owns vk (so BAG=LSHIFT / CROUCH=LCTRL wins over Sprint/Walk)
+    bool hasCustomButtonOnVk = false;
+    for (size_t i = 0; i < profile_.buttons.size(); ++i) {
+        if (profile_.buttons[i].comboVk == 0 && KeyCodes::matches(vk, profile_.buttons[i].vk)) {
+            if (!isAim && profile_.buttons[i].action == NODE_HOLD_VIEW) continue;
+            hasCustomButtonOnVk = true;
+            break;
+        }
+    }
+
+    // 2. WASD Virtual Joystick (active in BOTH Aim Mode and Cursor Mode)
+    if (joystick_.handleKey(vk, down, !hasCustomButtonOnVk, profile_, w, h, nowMs, packetsThisSec_)) {
+        return;
+    }
+
+    // 3. Fire Button (DRAG-FIRE, CLAW-LEFT, DUAL-DRAG)
+    if ((isAim || !KeyCodes::isMouseKey(profile_.fireVk)) && KeyCodes::matches(vk, profile_.fireVk)) {
+        if (isWheel) {
+            if (down) {
+                pressFireLocked(nowMs);
+                quickTapFireReleaseAtMs_ = nowMs + 40.0;
+            }
+            return;
+        }
+        if (fireHeld_ != down) {
+            fireHeld_ = down;
+            if (profile_.fireMode == FIRE_MODE_DRAG_RIGHT) {
+                if (down) {
+                    quickTapFireReleaseAtMs_ = 0.0;
+                    if (viewStack_.mainView().isFingerPlaced()) {
+                        viewStack_.resetMainView(nowMs);
+                        pendingFireDown_ = true;
+                        pendingFireAtMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs > 0 ? profile_.touchDownDelayMs : 12);
+                    } else {
+                        pendingFireDown_ = false;
+                        pressFireLocked(nowMs);
+                    }
+                } else {
+                    if (pendingFireDown_) {
+                        quickTapFireReleaseAtMs_ = pendingFireAtMs_ + 25.0;
+                    } else {
+                        liftFireFingerLocked();
+                        aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+                    }
+                }
+            } else {
+                // CLAW-LEFT & DUAL-DRAG
+                if (down) {
+                    if (isAim && !viewStack_.isOverlayActive()) {
+                        viewStack_.ensureMainFingerDown(nowMs, packetsThisSec_);
+                    }
+                    pressFireLocked(nowMs);
+                } else {
+                    liftFireFingerLocked();
+                }
+            }
+        }
+        return;
+    }
+
+    // 4. Action Buttons (2-level combo lookup + 10 KeyActionType behaviors)
+    ActionEffects eff;
+    actions_.dispatchKey(vk, down, isAim, profile_, heldKeys_, w, h, nowMs,
+                         scopeSensActive_, eff, packetsThisSec_);
+
+    if (eff.pushHoldView && eff.holdViewIdx >= 0 &&
+        eff.holdViewIdx < static_cast<int>(profile_.buttons.size())) {
+        const KeyNode& b = profile_.buttons[eff.holdViewIdx];
+        FpsViewConfig ovCfg;
+        ovCfg.screenW = static_cast<double>(w);
+        ovCfg.screenH = static_cast<double>(h);
+        ovCfg.centerX = static_cast<double>(b.x) * ovCfg.screenW;
+        ovCfg.centerY = static_cast<double>(b.y) * ovCfg.screenH;
+        ovCfg.rectLeft = 4.0;
+        ovCfg.rectTop = 4.0;
+        ovCfg.rectRight = ovCfg.screenW - 5.0;
+        ovCfg.rectBottom = ovCfg.screenH - 5.0;
+        ovCfg.sensX = static_cast<double>(profile_.sensX);
+        ovCfg.sensY = static_cast<double>(profile_.sensY);
+        ovCfg.ffCounterAccel = 0.0;
+        ovCfg.invertY = profile_.invertY;
+        ovCfg.unbounded = profile_.unboundedAim;
+        ovCfg.clampInsteadOfRelease = !profile_.unboundedAim;
+        ovCfg.edgeReleaseOnly = true;
+        ovCfg.touchDownRandomRangePx = 0;
+        viewStack_.pushOverlay(eff.holdViewIdx, ovCfg, nowMs, packetsThisSec_);
+    }
+    if (eff.popHoldView) {
+        if (viewStack_.isOverlayActive() && viewStack_.overlayOwnerId() == eff.popHoldViewIdx) {
+            viewStack_.popOverlay(eff.popHoldViewIdx, nowMs, packetsThisSec_);
+            aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+        }
+    }
+    if (eff.resetMainView) {
+        viewStack_.resetMainView(nowMs);
+        aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+    }
+    if (eff.reactivateJoystick) {
+        joystick_.reactivate(profile_, w, h, nowMs, packetsThisSec_);
+    }
+}
+
+void InputEngine::pressFireLocked(double /*nowMs*/) {
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    double dw = static_cast<double>(w);
+    double dh = static_cast<double>(h);
+
+    if (profile_.fireMode == FIRE_MODE_CLAW_LEFT) {
+        fireCurX_ = static_cast<double>(profile_.leftFireX) * dw;
+        fireCurY_ = static_cast<double>(profile_.leftFireY) * dh;
+    } else {
+        fireCurX_ = static_cast<double>(profile_.fireX) * dw;
+        fireCurY_ = static_cast<double>(profile_.fireY) * dh;
+    }
+
+    int32_t px = static_cast<int32_t>(std::floor(fireCurX_ + 0.5));
+    int32_t py = static_cast<int32_t>(std::floor(fireCurY_ + 0.5));
+    bridge_->sendTouchPixels(TOUCH_DOWN, PointerId::FIRE, px, py, true);
+    fireDown_ = true;
+    fireStartX_ = px;
+    fireStartY_ = py;
+    fireLastSentX_ = px;
+    fireLastSentY_ = py;
+    ++packetsThisSec_;
+}
+
+void InputEngine::liftFireFingerLocked() {
+    if (fireDown_) {
+        int32_t dx = fireLastSentX_ - fireStartX_;
+        int32_t dy = fireLastSentY_ - fireStartY_;
+        bool unclamped = (profile_.fireMode != FIRE_MODE_CLAW_LEFT && profile_.unboundedAim);
+        bridge_->sendTouchPixels(TOUCH_UP, PointerId::FIRE, fireLastSentX_, fireLastSentY_, !unclamped);
+        fireDown_ = false;
+        fireLastSentX_ = -1;
+        fireLastSentY_ = -1;
+        ++packetsThisSec_;
+        const char* mname = (profile_.fireMode == FIRE_MODE_DRAG_RIGHT) ? "DRAG-FIRE"
+                          : (profile_.fireMode == FIRE_MODE_CLAW_LEFT)  ? "CLAW-LEFT"
+                                                                        : "DUAL-DRAG";
+        std::printf("[Fire] %s release | start=(%d,%d) drag=(%+d, %+d px)\n",
+                    mname, fireStartX_, fireStartY_, dx, dy);
+    }
+    pendingFireDown_ = false;
+    quickTapFireReleaseAtMs_ = 0.0;
+}
+
+void InputEngine::releaseMouseTouchesLocked() {
+    double nowMs = getTimeMs();
+    viewStack_.onFocusLose(nowMs);
+    liftFireFingerLocked();
+    fireHeld_ = false;
+    scopeSensActive_ = false;
+    pendingFireDown_ = false;
+    quickTapFireReleaseAtMs_ = 0.0;
+    aimCooldownUntilMs_ = 0.0;
+
+    actions_.releaseButtons(profile_, true, packetsThisSec_);
+
+    if (directCursorDown_) {
+        bridge_->sendTouchNorm(TOUCH_UP, PointerId::CURSOR, 0.5f, 0.5f);
+        directCursorDown_ = false;
+    }
+}
+
+void InputEngine::releaseAllLocked() {
+    releaseMouseTouchesLocked();
+    joystick_.release(packetsThisSec_);
+    std::memset(heldKeys_, 0, sizeof(heldKeys_));
+    actions_.releaseButtons(profile_, false, packetsThisSec_);
+}
+
+void InputEngine::releaseAllTouches() {
+    EnterCriticalSection(&lock_);
+    releaseAllLocked();
+    EnterCriticalSection(&inputLock_);
+    pendingKeys_.clear();
+    pendingCursor_.clear();
+    accumRawDx_ = 0.0;
+    accumRawDy_ = 0.0;
+    std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
+    LeaveCriticalSection(&inputLock_);
+    LeaveCriticalSection(&lock_);
+}
+
+void InputEngine::resetAimView() {
+    EnterCriticalSection(&lock_);
+    double nowMs = getTimeMs();
+    viewStack_.resetMainView(nowMs);
+    scopeSensActive_ = false;
+    aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+    LeaveCriticalSection(&lock_);
+}
+
+void InputEngine::processTick(double nowMs) {
+    std::vector<QueuedKeyEvent> localKeys;
+    std::vector<QueuedCursorTouch> localCursor;
+    EnterCriticalSection(&inputLock_);
+    if (!pendingKeys_.empty()) localKeys.swap(pendingKeys_);
+    if (!pendingCursor_.empty()) localCursor.swap(pendingCursor_);
+    LeaveCriticalSection(&inputLock_);
+
+    EnterCriticalSection(&lock_);
+
+    if (nowMs - lastStatMs_ >= 1000.0) {
+        lastPacketsPerSec_ = packetsThisSec_;
+        packetsThisSec_ = 0;
+        lastStatMs_ = nowMs;
+    }
+
+    for (size_t i = 0; i < localKeys.size(); ++i) {
+        processKeyEventLocked(localKeys[i].vk, localKeys[i].down, nowMs);
+    }
+    for (size_t i = 0; i < localCursor.size(); ++i) {
+        if (!aimMode_) {
+            processDirectCursorLocked(localCursor[i].action, localCursor[i].normX, localCursor[i].normY);
+        }
+    }
+
+    actions_.tick(profile_, nowMs, packetsThisSec_);
+    joystick_.tick(nowMs, packetsThisSec_);
+
+    if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {
+        pendingFireDown_ = false;
+        pressFireLocked(nowMs);
+    }
+    if (fireDown_ && quickTapFireReleaseAtMs_ > 0.0 && nowMs >= quickTapFireReleaseAtMs_) {
+        liftFireFingerLocked();
+        aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+    }
+
+    if (!aimMode_ || pendingFireDown_) {
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+
+    double rawDx = 0.0, rawDy = 0.0;
+    EnterCriticalSection(&inputLock_);
+    rawDx = accumRawDx_;
+    rawDy = accumRawDy_;
+    accumRawDx_ = 0.0;
+    accumRawDy_ = 0.0;
+    LeaveCriticalSection(&inputLock_);
+
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    if (w != lastConfiguredW_ || h != lastConfiguredH_) {
+        syncFpsViewConfigLocked(w, h);
+    }
+    double dw = static_cast<double>(w);
+    double dh = static_cast<double>(h);
+
+    bool firingActive = fireHeld_ || fireDown_;
+    double speed = std::sqrt(rawDx * rawDx + rawDy * rawDy);
+    double accelGain = 1.0;
+    if (profile_.accelPower > 1.001f && speed > static_cast<double>(profile_.accelRefSpeed)) {
+        double ratio = speed / static_cast<double>(profile_.accelRefSpeed);
+        accelGain = std::pow(ratio, static_cast<double>(profile_.accelPower) - 1.0);
+        if (accelGain > static_cast<double>(profile_.accelCap)) {
+            accelGain = static_cast<double>(profile_.accelCap);
+        }
+    }
+
+    double multX = accelGain;
+    double multY = accelGain;
+    if (scopeSensActive_) {
+        multX *= static_cast<double>(profile_.scopeSensX);
+        multY *= static_cast<double>(profile_.scopeSensY);
+    }
+    if (firingActive) {
+        multX *= static_cast<double>(profile_.fireSensX);
+        multY *= static_cast<double>(profile_.fireSensY);
+    }
+
+    double feedDx = rawDx;
+    double feedDy = rawDy;
+    if (profile_.smoothing > 0.001f) {
+        double alpha = clampd(static_cast<double>(profile_.smoothing), 0.0, 0.85);
+        smoothDx_ = smoothDx_ * alpha + rawDx * (1.0 - alpha);
+        smoothDy_ = smoothDy_ * alpha + rawDy * (1.0 - alpha);
+        if (std::fabs(smoothDx_) < 0.02) smoothDx_ = 0.0;
+        if (std::fabs(smoothDy_) < 0.02) smoothDy_ = 0.0;
+        feedDx = smoothDx_;
+        feedDy = smoothDy_;
+    }
+
+    bool hasFeed = (std::fabs(feedDx) > 0.0001 || std::fabs(feedDy) > 0.0001);
+
+    if (viewStack_.isOverlayActive()) {
+        if (hasFeed) {
+            viewStack_.onMouseDelta(feedDx, feedDy, 1.0, 1.0, nowMs, packetsThisSec_);
+        }
+        viewStack_.tick(nowMs, true, packetsThisSec_);
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+
+    auto moveFireFinger = [&]() {
+        if (!hasFeed || !fireDown_) return;
+        double dx = feedDx * static_cast<double>(profile_.sensX) * multX;
+        double dy = feedDy * static_cast<double>(profile_.sensY) * multY;
+        if (profile_.invertY) dy = -dy;
+        if (profile_.ffCounterAccel > 0.01f && dw > 1.0) {
+            double r = std::fabs(fireCurX_ - static_cast<double>(fireStartX_)) / dw;
+            double k = static_cast<double>(profile_.ffCounterAccel);
+            dx *= ((0.98 / (k * r * r + 1.0)) + 0.02);
+        }
+
+        if (profile_.unboundedAim) {
+            fireCurX_ += clampd(dx, -160.0, 160.0);
+            fireCurY_ += clampd(dy, -160.0, 160.0);
+        } else {
+            double anchorX = static_cast<double>(profile_.fireX) * dw;
+            double anchorY = static_cast<double>(profile_.fireY) * dh;
+            double minX = clampd(anchorX - static_cast<double>(profile_.fireBoxHalfW) * dw, dw * 0.20, dw - 4.0);
+            double maxX = clampd(anchorX + static_cast<double>(profile_.fireBoxHalfW) * dw, dw * 0.20, dw - 4.0);
+            double minY = clampd(anchorY - static_cast<double>(profile_.fireBoxHalfH) * dh, dh * 0.02, dh - 4.0);
+            double maxY = clampd(anchorY + static_cast<double>(profile_.fireBoxHalfH) * dh, dh * 0.02, dh * 0.98);
+            fireCurX_ = clampd(fireCurX_ + clampd(dx, -160.0, 160.0), minX, maxX);
+            fireCurY_ = clampd(fireCurY_ + clampd(dy, -160.0, 160.0), minY, maxY);
+        }
+
+        int32_t px = static_cast<int32_t>(std::floor(fireCurX_ + 0.5));
+        int32_t py = static_cast<int32_t>(std::floor(fireCurY_ + 0.5));
+        if (px != fireLastSentX_ || py != fireLastSentY_) {
+            bridge_->sendTouchPixels(TOUCH_MOVE, PointerId::FIRE, px, py, !profile_.unboundedAim);
+            fireLastSentX_ = px;
+            fireLastSentY_ = py;
+            ++packetsThisSec_;
+        }
+    };
+
+    auto moveMainCamera = [&]() {
+        if (nowMs < aimCooldownUntilMs_) return;
+        if (hasFeed) {
+            viewStack_.onMouseDelta(feedDx, feedDy, multX, multY, nowMs, packetsThisSec_);
+        }
+        viewStack_.tick(nowMs, firingActive, packetsThisSec_);
+    };
+
+    if (profile_.fireMode == FIRE_MODE_DRAG_RIGHT && fireDown_) {
+        moveFireFinger();
+    } else if (profile_.fireMode == FIRE_MODE_DUAL_DRAG && fireDown_) {
+        moveMainCamera();
+        moveFireFinger();
+    } else {
+        moveMainCamera();
+    }
+
+    LeaveCriticalSection(&lock_);
+}
+
+DWORD WINAPI InputEngine::tickThreadProc(LPVOID param) {
+    static_cast<InputEngine*>(param)->runLoop();
+    return 0;
+}
+
+void InputEngine::runLoop() {
+    timeBeginPeriod(1);
+    double nextTickMs = getTimeMs();
+
+    while (!stopFlag_) {
+        int hz = 250;
+        EnterCriticalSection(&lock_);
+        hz = profile_.pollHz;
+        LeaveCriticalSection(&lock_);
+        if (hz <= 0) hz = 1000;
+        if (hz < 60) hz = 60;
+        if (hz > 1000) hz = 1000;
+        double periodMs = 1000.0 / static_cast<double>(hz);
+
+        double nowMs = getTimeMs();
+        if (nowMs >= nextTickMs) {
+            processTick(nowMs);
+            nextTickMs += periodMs;
+            if (nextTickMs < nowMs - periodMs * 2.0) {
+                nextTickMs = nowMs + periodMs;
+            }
+        } else {
+            double waitMs = nextTickMs - nowMs;
+            if (waitMs > 1.5) {
+                Sleep(1);
+            } else {
+                Sleep(0);
+            }
+        }
+    }
+
+    timeEndPeriod(1);
+}
+
+EngineTelemetry InputEngine::getTelemetry() const {
+    EngineTelemetry t;
+    EnterCriticalSection(&lock_);
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    t.screenW = w;
+    t.screenH = h;
+    t.aimMode = (aimMode_ != 0);
+    t.scopeActive = scopeSensActive_;
+    t.holdViewActive = viewStack_.isOverlayActive();
+    bool mainDown = viewStack_.mainView().isFingerPlaced();
+    bool ovDown = viewStack_.isOverlayActive() && viewStack_.overlayView().isFingerPlaced();
+    t.aimFingerDown = mainDown || ovDown || (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_);
+    t.fireHeld = fireHeld_;
+    t.joyDown = joystick_.isDown();
+    if (ovDown) {
+        t.aimFingerNormX = static_cast<float>(clampd(viewStack_.overlayView().curX() / static_cast<double>(w), 0.0, 1.0));
+        t.aimFingerNormY = static_cast<float>(clampd(viewStack_.overlayView().curY() / static_cast<double>(h), 0.0, 1.0));
+    } else if (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_) {
+        t.aimFingerNormX = static_cast<float>(clampd(fireCurX_ / static_cast<double>(w), 0.0, 1.0));
+        t.aimFingerNormY = static_cast<float>(clampd(fireCurY_ / static_cast<double>(h), 0.0, 1.0));
+    } else if (mainDown) {
+        t.aimFingerNormX = static_cast<float>(clampd(viewStack_.mainView().curX() / static_cast<double>(w), 0.0, 1.0));
+        t.aimFingerNormY = static_cast<float>(clampd(viewStack_.mainView().curY() / static_cast<double>(h), 0.0, 1.0));
+    } else {
+        t.aimFingerNormX = profile_.aimX;
+        t.aimFingerNormY = profile_.aimY;
+    }
+    if (joystick_.isDown()) {
+        t.joyFingerNormX = static_cast<float>(joystick_.lastX()) / static_cast<float>(w);
+        t.joyFingerNormY = static_cast<float>(joystick_.lastY()) / static_cast<float>(h);
+    } else {
+        t.joyFingerNormX = profile_.joyX;
+        t.joyFingerNormY = profile_.joyY;
+    }
+    t.touchRateHz = lastPacketsPerSec_;
+    LeaveCriticalSection(&lock_);
+    return t;
+}
