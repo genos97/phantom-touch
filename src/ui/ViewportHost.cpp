@@ -17,6 +17,7 @@ struct EnumFindCtx {
 
 BOOL CALLBACK enumFindMirrorProc(HWND hwnd, LPARAM lParam) {
     EnumFindCtx* ctx = reinterpret_cast<EnumFindCtx*>(lParam);
+    if (!IsWindowVisible(hwnd)) return TRUE;
     DWORD wpid = 0;
     GetWindowThreadProcessId(hwnd, &wpid);
     if (ctx->pid != 0 && wpid != ctx->pid) return TRUE;

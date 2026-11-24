@@ -191,7 +191,8 @@ static void testProfileRoundTrip() {
     assert(builtArgs.find("--max-fps=120") != std::string::npos);
     assert(builtArgs.find("--video-bit-rate=24M") != std::string::npos);
     assert(builtArgs.find("--max-size=1600") != std::string::npos);
-    assert(builtArgs.find("--turn-screen-off") != std::string::npos);
+    assert(builtArgs.find("--stay-awake") == std::string::npos);
+    assert(builtArgs.find("--turn-screen-off") == std::string::npos);
     assert(builtArgs.find("--no-audio") == std::string::npos);
     std::remove(tmpSetPath.c_str());
 

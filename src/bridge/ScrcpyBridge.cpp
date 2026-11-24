@@ -404,7 +404,7 @@ std::string ScrcpyBridge::activeSerial() const {
 }
 
 bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
-                                  const std::string& deviceSerial) {
+                                  const std::string& deviceSerial, bool stayAwake) {
     if (!wsaInit_) {
         outError = "Winsock initialization failed.";
         return false;
@@ -496,7 +496,8 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
                          " send_codec_meta=true"
                          " send_frame_meta=true"
                          " clipboard_autosync=false"
-                         " power_on=false"
+                         " power_on=true"
+                         " stay_awake=" + std::string(stayAwake ? "true" : "false") +
                          " cleanup=false";
     if (controlMaxSize > 0) {
         char szBuf[32];
@@ -780,6 +781,18 @@ void ScrcpyBridge::sendAndroidNav(uint32_t androidKeycode) {
     if (!connected_) return;
     sendKeycode(0 /* ACTION_DOWN */, androidKeycode);
     sendKeycode(1 /* ACTION_UP */, androidKeycode);
+}
+
+bool ScrcpyBridge::setDisplayPower(bool on) {
+    if (!connected_) return false;
+    // SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER (type=10, 2 bytes: [10, on ? 1 : 0])
+    uint8_t msg[2];
+    msg[0] = 10;
+    msg[1] = on ? 1u : 0u;
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
 }
 
 bool ScrcpyBridge::captureScreenshot(const std::string& savePath, std::string& outError) {

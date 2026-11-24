@@ -32,6 +32,8 @@ int clampInt(int v, int lo, int hi) {
 } // namespace
 
 std::string AppSettings::buildScrcpyArgs() const {
+    // Only video/audio flags valid with scrcpy --no-control!
+    // (stay_awake and turn_screen_off are handled via our control=true server bridge!)
     char buf[160];
     std::snprintf(buf, sizeof(buf), "--max-fps=%d --video-bit-rate=%dM",
                   clampInt(mirrorFps, 30, 144),
@@ -44,12 +46,6 @@ std::string AppSettings::buildScrcpyArgs() const {
     }
     if (!mirrorAudio) {
         args += " --no-audio";
-    }
-    if (turnScreenOff) {
-        args += " --turn-screen-off";
-    }
-    if (stayAwake) {
-        args += " --stay-awake";
     }
     return args;
 }

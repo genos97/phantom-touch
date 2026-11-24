@@ -48,7 +48,7 @@ public:
     void stopMirrorWindow();
 
     bool connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
-                        const std::string& deviceSerial = "");
+                        const std::string& deviceSerial = "", bool stayAwake = true);
     void disconnect();
 
     bool isConnected() const { return connected_ != 0; }
@@ -64,6 +64,7 @@ public:
     bool sendTouchNorm(TouchAction action, uint64_t pointerId, float nx, float ny);
     bool sendKeycode(uint8_t action, uint32_t androidKeycode);
     void sendAndroidNav(uint32_t androidKeycode);
+    bool setDisplayPower(bool on);
 
     // Captures a native device PNG screenshot via adb exec-out screencap -p
     bool captureScreenshot(const std::string& savePath, std::string& outError);

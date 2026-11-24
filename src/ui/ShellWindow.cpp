@@ -399,12 +399,18 @@ void ShellWindow::refreshAdbDevices() {
 DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
     ShellWindow* self = static_cast<ShellWindow*>(param);
     std::string err;
-    bool ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err, self->pendingSerial_);
-    if (ok && !self->noMirror_) {
-        std::string mErr;
-        std::string args = self->settings_.buildScrcpyArgs();
-        if (!self->bridge_->launchMirrorWindow(self->tools_, args, self->mirrorTitle_, mErr, true, self->bridge_->activeSerial())) {
-            self->bridge_->appendLog("[Mirror] " + mErr);
+    bool ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
+                                            self->pendingSerial_, self->settings_.stayAwake);
+    if (ok) {
+        if (self->settings_.turnScreenOff) {
+            self->bridge_->setDisplayPower(false);
+        }
+        if (!self->noMirror_) {
+            std::string mErr;
+            std::string args = self->settings_.buildScrcpyArgs();
+            if (!self->bridge_->launchMirrorWindow(self->tools_, args, self->mirrorTitle_, mErr, true, self->bridge_->activeSerial())) {
+                self->bridge_->appendLog("[Mirror] " + mErr);
+            }
         }
     }
     self->asyncResultOk_ = ok;
@@ -682,6 +688,10 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
     if (res.settingsModified) {
         saveSettings();
+        // Apply Turn Phone Screen Off immediately via control socket without restarting video!
+        if (bridge_->isConnected()) {
+            bridge_->setDisplayPower(!settings_.turnScreenOff);
+        }
     }
     if (res.requestSave) {
         saveCurrentProfile(false);
