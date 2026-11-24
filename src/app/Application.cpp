@@ -93,6 +93,7 @@ int Application::run(int argc, char** argv) {
         std::printf("[Profile] Creating default profile at %s\n", profilePath.c_str());
         ProfileStore::save(profilePath, profile);
     }
+    ProfileStore::saveLastActive(profilesDir, profilePath);
 
     const std::string mirrorTitle = "ScrcpyKeymapper-Display";
     ScrcpyBridge bridge;

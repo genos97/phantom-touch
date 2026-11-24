@@ -56,6 +56,7 @@ OverlayWindow::OverlayWindow(ScrcpyBridge* bridge, InputEngine* engine,
 }
 
 OverlayWindow::~OverlayWindow() {
+    flushProfileOnExit();
     setAimMode(false);
     removeHooks();
     if (cacheDC_) {
@@ -180,18 +181,38 @@ void OverlayWindow::showToast(const std::string& msg, DWORD durationMs) {
     if (hwnd_) InvalidateRect(hwnd_, NULL, FALSE);
 }
 
-void OverlayWindow::applyProfileToEngine() {
+void OverlayWindow::applyProfileToEngine(bool autoSaveNow) {
     engine_->setProfile(profile_);
     applyHudOpacity();
+    profileDirty_ = true;
+    if (autoSaveNow) {
+        saveCurrentProfile(true);
+    }
 }
 
-void OverlayWindow::saveCurrentProfile() {
+bool OverlayWindow::saveCurrentProfile(bool silent) {
+    if (profilePath_.empty()) return false;
     if (ProfileStore::save(profilePath_, profile_)) {
         ProfileStore::saveLastActive(profilesDir_, profilePath_);
-        studioPanel_.refreshProfileList();
-        showToast("Saved config -> " + profilePath_, 2200);
-    } else {
+        profileDirty_ = false;
+        if (!silent) {
+            studioPanel_.refreshProfileList();
+            showToast("Saved config -> " + profilePath_, 2200);
+        }
+        return true;
+    }
+    if (!silent) {
         showToast("ERROR: Could not write " + profilePath_, 3000);
+    }
+    return false;
+}
+
+void OverlayWindow::flushProfileOnExit() {
+    if (profilePath_.empty()) return;
+    if (profileDirty_) {
+        saveCurrentProfile(true);
+    } else {
+        ProfileStore::saveLastActive(profilesDir_, profilePath_);
     }
 }
 
@@ -288,10 +309,18 @@ void OverlayWindow::setEditMode(bool enabled) {
     }
 
     if (editMode_) {
-        showToast("KEYMAP STUDIO: Drag panel or keys anywhere | Dbl-Click=Replace | Ctrl+S=Save | F2=Done", 4200);
+        showToast("KEYMAP STUDIO: Drag keys/panel | Dbl-Click=Replace | Auto-saves on every change | F2=Done", 4200);
     } else {
-        applyProfileToEngine();
-        showToast("Keymap Studio closed", 1200);
+        bool hadDirty = profileDirty_;
+        engine_->setProfile(profile_);
+        applyHudOpacity();
+        if (hadDirty) {
+            saveCurrentProfile(true);
+            showToast("Saved & closed Keymap Studio", 1400);
+        } else {
+            ProfileStore::saveLastActive(profilesDir_, profilePath_);
+            showToast("Keymap Studio closed", 1200);
+        }
     }
     if (hwnd_) InvalidateRect(hwnd_, NULL, FALSE);
 }
@@ -309,6 +338,7 @@ void OverlayWindow::toggleFireMode() {
 
 void OverlayWindow::toggleHud() {
     profile_.showHudInPlay = !profile_.showHudInPlay;
+    applyProfileToEngine(true);
     showToast(profile_.showHudInPlay ? "HUD Badges: VISIBLE" : "HUD Badges: HIDDEN", 1400);
 }
 
@@ -390,6 +420,7 @@ void OverlayWindow::syncToMirrorWindow() {
         if (!mirrorHwnd_) {
             if (aimMode_) setAimMode(false);
             if (sawMirrorWindow_ && !bridge_->isMirrorRunning()) {
+                flushProfileOnExit();
                 PostQuitMessage(0);
             }
             return;
@@ -542,10 +573,13 @@ LRESULT OverlayWindow::handleLowLevelMouse(int nCode, WPARAM wParam, LPARAM lPar
             return 1;
         } else if (wParam == WM_LBUTTONUP && floatBallHookPressed_) {
             bool wasClick = !floatBallHookMoved_;
+            bool wasMoved = floatBallHookMoved_;
             floatBallHookPressed_ = false;
             floatBallHookMoved_ = false;
             if (wasClick) {
                 PostMessageA(hwnd_, WM_APP + 3, 0, 0);
+            } else if (wasMoved) {
+                PostMessageA(hwnd_, WM_APP + 8, 0, 0);
             }
             return 1;
         }
@@ -714,20 +748,27 @@ void OverlayWindow::handleStudioResult(const StudioUIResult& res) {
         rebindTarget_ = REBIND_NONE;
     }
     if (res.profileModified) {
-        applyProfileToEngine();
+        // Defer disk write until mouse-up while continuously dragging sliders/panel
+        applyProfileToEngine(!studioPanel_.isDragging());
     }
     if (res.requestSave) {
-        saveCurrentProfile();
+        saveCurrentProfile(false);
     }
     if (res.requestSwitchProfile && !res.switchProfilePath.empty()) {
+        // Persist any unsaved changes on the current config before switching away
+        if (profileDirty_ && lstrcmpiA(profilePath_.c_str(), res.switchProfilePath.c_str()) != 0) {
+            saveCurrentProfile(true);
+        }
         Profile loaded;
         if (ProfileStore::load(res.switchProfilePath, loaded)) {
             profilePath_ = res.switchProfilePath;
             profile_ = loaded;
+            profileDirty_ = false;
             selectedBtnIndex_ = -1;
             rebindTarget_ = REBIND_NONE;
             ProfileStore::saveLastActive(profilesDir_, profilePath_);
-            applyProfileToEngine();
+            engine_->setProfile(profile_);
+            applyHudOpacity();
             studioPanel_.setProfilesDir(profilesDir_, profilePath_);
             showToast("Loaded config: " + profile_.name, 2200);
         } else {
@@ -802,6 +843,7 @@ LRESULT OverlayWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_APP + 5: toggleHud(); return 0;
         case WM_APP + 6: triggerQuickReset(); return 0;
         case WM_APP + 7: setAimMode(true); return 0;
+        case WM_APP + 8: saveCurrentProfile(true); return 0;
 
         case WM_APP + 10:
             profile_.sensX = clampRange(profile_.sensX - 0.05f, 0.10f, 10.0f);
@@ -953,6 +995,7 @@ LRESULT OverlayWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_DESTROY:
+            flushProfileOnExit();
             setAimMode(false);
             KillTimer(hwnd, TIMER_SYNC_REPAINT);
             PostQuitMessage(0);
@@ -1210,14 +1253,16 @@ void OverlayWindow::onEditMouseMove(int x, int y) {
             break;
         default: break;
     }
+    profileDirty_ = true;
     InvalidateRect(hwnd_, NULL, FALSE);
 }
 
 void OverlayWindow::onEditMouseUp() {
-    studioPanel_.onMouseUp();
-    if (dragging_ != DRAG_NONE) {
-        dragging_ = DRAG_NONE;
-        applyProfileToEngine();
+    bool panelDragEnded = studioPanel_.onMouseUp();
+    bool nodeDragEnded = (dragging_ != DRAG_NONE);
+    dragging_ = DRAG_NONE;
+    if (nodeDragEnded || panelDragEnded) {
+        applyProfileToEngine(true);
     }
 }
 

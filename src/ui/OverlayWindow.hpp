@@ -59,7 +59,8 @@ private:
     void toggleFireMode();
     void toggleHud();
     void triggerQuickReset();
-    void saveCurrentProfile();
+    bool saveCurrentProfile(bool silent = false);
+    void flushProfileOnExit();
     void handleStudioResult(const StudioUIResult& res);
 
     bool isMirrorOrOverlayForeground() const;
@@ -76,7 +77,7 @@ private:
     bool onEditKeyDown(int vk);
 
     DragTargetType hitTestNode(int px, int py, int& outBtnIndex) const;
-    void applyProfileToEngine();
+    void applyProfileToEngine(bool autoSaveNow = true);
     void showToast(const std::string& msg, DWORD durationMs = 2000);
 
     ScrcpyBridge* bridge_;
@@ -96,6 +97,7 @@ private:
     HHOOK keyHook_ = NULL;
 
     Profile profile_;
+    bool profileDirty_ = false;
     StudioPanel studioPanel_;
 
     bool aimMode_ = false;

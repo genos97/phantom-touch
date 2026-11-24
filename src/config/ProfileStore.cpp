@@ -95,9 +95,21 @@ std::string ProfileStore::loadLastActive(const std::string& profilesDir) {
 }
 
 void ProfileStore::saveLastActive(const std::string& profilesDir, const std::string& fullPath) {
-    std::ofstream out((profilesDir + "\\.active_profile").c_str());
-    if (out.is_open()) {
+    std::string targetPath = profilesDir + "\\.active_profile";
+    std::string tmpPath = targetPath + ".tmp";
+    {
+        std::ofstream out(tmpPath.c_str(), std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) return;
         out << fullPath << "\n";
+        out.flush();
+        if (!out.good()) return;
+    }
+    if (!MoveFileExA(tmpPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::ofstream fallback(targetPath.c_str(), std::ios::binary | std::ios::trunc);
+        if (fallback.is_open()) {
+            fallback << fullPath << "\n";
+        }
+        DeleteFileA(tmpPath.c_str());
     }
 }
 
@@ -182,6 +194,12 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "joy_right") { int vk = KeyCodes::fromName(val); if (vk) p.vkRight = vk; }
         else if (key == "joy_sprint") { int vk = KeyCodes::fromName(val); if (vk) p.vkSprint = vk; }
         else if (key == "joy_walk") { p.vkWalk = KeyCodes::fromName(val); }
+        else if (key == "buttons_explicit") {
+            if (val == "1" || toUpper(val) == "TRUE") {
+                p.buttons.clear();
+                sawAnyButton = true;
+            }
+        }
 
         else if (key == "button") {
             if (!sawAnyButton) {
@@ -232,7 +250,19 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
 }
 
 bool ProfileStore::save(const std::string& path, const Profile& p) {
-    std::ofstream out(path.c_str());
+    std::string tmpPath = path + ".tmp";
+    bool wroteTmp = false;
+    {
+        std::ofstream out(tmpPath.c_str(), std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            // Fallback directly to target path if .tmp cannot be opened
+            tmpPath = path;
+        } else {
+            wroteTmp = true;
+        }
+    }
+
+    std::ofstream out(tmpPath.c_str(), std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return false;
 
     char buf[384];
@@ -294,8 +324,9 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "joy_sprint = " << KeyCodes::toName(p.vkSprint) << "\n";
     out << "joy_walk = " << KeyCodes::toName(p.vkWalk) << "\n\n";
 
-    out << "# --- Action Nodes: LABEL, KEY[or K1+K2], X, Y, ACTION, SCOPE_SENS(0/1), DUR_MS[, X2, Y2] ---\n";
+    out << "# --- Action Nodes: LABEL, KEY[or K1+K2], X, Y, ACTION, FLAGS, DUR_MS[, X2, Y2] ---\n";
     out << "# Actions: PRESS, CLICK, DOWN_UP, UP_TRIGGER, HOLD_VIEW, SWIPE, CURSOR_TOGGLE, RESET_VIEW, SWITCH_SENS, REACTIVATE_JOY\n";
+    out << "buttons_explicit = 1\n";
     for (size_t i = 0; i < p.buttons.size(); ++i) {
         const KeyNode& b = p.buttons[i];
         std::string keySpec = KeyCodes::comboToName(b.comboVk, b.vk);
@@ -322,5 +353,21 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
         out << buf;
     }
 
-    return out.good();
+    out.flush();
+    bool ok = out.good();
+    out.close();
+    if (!ok) {
+        if (wroteTmp) DeleteFileA(tmpPath.c_str());
+        return false;
+    }
+
+    if (wroteTmp) {
+        if (!MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            // Fallback copy if atomic replace is blocked by AV/file lock
+            bool copied = (CopyFileA(tmpPath.c_str(), path.c_str(), FALSE) != 0);
+            DeleteFileA(tmpPath.c_str());
+            return copied;
+        }
+    }
+    return true;
 }

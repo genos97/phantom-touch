@@ -59,7 +59,8 @@ public:
                      Profile& profile, int& selectedBtnIndex, StudioUIResult& out);
     bool onMouseMove(int x, int y, int canvasW, int canvasH,
                      Profile& profile, int selectedBtnIndex, StudioUIResult& out);
-    void onMouseUp();
+    // Returns true if a panel or slider drag just finished (caller should persist profile)
+    bool onMouseUp();
     bool onKeyDown(int vk, Profile& profile, int selectedBtnIndex, StudioUIResult& out);
     bool onMouseBind(int mouseVk, Profile& profile, int selectedBtnIndex, StudioUIResult& out);
     bool onChar(char ch, Profile& profile, int selectedBtnIndex, StudioUIResult& out);

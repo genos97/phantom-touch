@@ -122,11 +122,61 @@ static void testProfileRoundTrip() {
     assert(std::fabs(blank.sensX - 0.95f) < 0.01f);
     assert(std::fabs(blank.sensY - 1.15f) < 0.01f);
 
+    // Blank / cleared (0-button) profile MUST stay 0 buttons after save + reload!
+    const std::string tmpBlankPath = "profiles\\_test_blank_roundtrip.cfg";
+    assert(ProfileStore::save(tmpBlankPath, blank));
+    Profile loadedBlank;
+    assert(ProfileStore::load(tmpBlankPath, loadedBlank));
+    assert(loadedBlank.name == "Custom Test");
+    assert(loadedBlank.buttons.empty());
+    std::remove(tmpBlankPath.c_str());
+
+    // .active_profile atomic persistence round-trip in isolated temp folder
+    const std::string tmpDir = "profiles\\_test_active_dir";
+    CreateDirectoryA(tmpDir.c_str(), NULL);
+    const std::string tmpCustom = tmpDir + "\\my_custom.cfg";
+    assert(ProfileStore::save(tmpCustom, orig));
+    ProfileStore::saveLastActive(tmpDir, tmpCustom);
+    assert(ProfileStore::loadLastActive(tmpDir) == tmpCustom);
+
+    // Creating a new config when my_custom.cfg already exists must auto-suffix instead of overwriting!
+    StudioPanel createUi;
+    createUi.setProfilesDir(tmpDir, tmpCustom);
+    HDC scDC = GetDC(NULL);
+    HDC mDC = CreateCompatibleDC(scDC);
+    HBITMAP bm = CreateCompatibleBitmap(scDC, 1280, 720);
+    HGDIOBJ obm = SelectObject(mDC, bm);
+    HFONT fs = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    HFONT fb = CreateFontA(14, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    HFONT ft = CreateFontA(15, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+    int dummySel = -1;
+    Profile editCopy = orig;
+    createUi.paint(mDC, 1280, 720, editCopy, tmpCustom, dummySel, false, fs, fb, ft);
+    int cpx = static_cast<int>(editCopy.panelX * 1280.0f);
+    int cpy = static_cast<int>(editCopy.panelY * 720.0f);
+    StudioUIResult tabRes;
+    assert(createUi.onMouseDown(cpx + 250, cpy + 52, 1280, 720, editCopy, dummySel, tabRes)); // PROFILES tab
+    createUi.paint(mDC, 1280, 720, editCopy, tmpCustom, dummySel, false, fs, fb, ft);
+    StudioUIResult mkRes;
+    assert(createUi.onMouseDown(cpx + 60, cpy + 140, 1280, 720, editCopy, dummySel, mkRes)); // + CREATE BLANK CONFIG
+    assert(mkRes.requestSwitchProfile && mkRes.switchProfilePath == (tmpDir + "\\my_custom_2.cfg"));
+    // Verify original my_custom.cfg was NOT overwritten and my_custom_2.cfg has 0 buttons!
+    Profile verifyOrig, verifyBlank2;
+    assert(ProfileStore::load(tmpCustom, verifyOrig) && verifyOrig.buttons.size() == orig.buttons.size());
+    assert(ProfileStore::load(mkRes.switchProfilePath, verifyBlank2) && verifyBlank2.buttons.empty());
+    DeleteObject(fs); DeleteObject(fb); DeleteObject(ft);
+    SelectObject(mDC, obm); DeleteObject(bm); DeleteDC(mDC); ReleaseDC(NULL, scDC);
+
+    std::remove((tmpDir + "\\my_custom_2.cfg").c_str());
+    std::remove(tmpCustom.c_str());
+    std::remove((tmpDir + "\\.active_profile").c_str());
+    RemoveDirectoryA(tmpDir.c_str());
+
     std::vector<std::string> files = ProfileStore::listProfiles("profiles");
     assert(!files.empty());
 
     std::remove(tmpPath.c_str());
-    std::printf("[Test] ProfileStore round-trip, KeyCodes & defaults OK (%u nodes, %u profiles)\n",
+    std::printf("[Test] ProfileStore atomic save, blank 0-button reload, .active_profile & safe creation OK (%u nodes, %u profiles)\n",
                 static_cast<unsigned>(loaded.buttons.size()), static_cast<unsigned>(files.size()));
 }
 

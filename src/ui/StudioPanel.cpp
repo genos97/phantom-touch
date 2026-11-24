@@ -790,12 +790,21 @@ bool StudioPanel::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
 
             case PA_CREATE_BLANK:
             case PA_CREATE_CLONE: {
-                std::string fname = ProfileStore::sanitizeFilename(newProfileName_);
+                std::string baseFname = ProfileStore::sanitizeFilename(newProfileName_);
+                std::string fname = baseFname;
                 std::string fullPath = profilesDir_ + "\\" + fname + ".cfg";
+                // Never silently overwrite an existing saved config (auto-suffix _2, _3, ...)
+                int suffix = 2;
+                while (GetFileAttributesA(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES && suffix < 100) {
+                    char sbuf[32];
+                    std::snprintf(sbuf, sizeof(sbuf), "_%d", suffix++);
+                    fname = baseFname + sbuf;
+                    fullPath = profilesDir_ + "\\" + fname + ".cfg";
+                }
                 Profile np = (hs.id == PA_CREATE_BLANK)
-                    ? ProfileDefaults::createBlank(newProfileName_)
+                    ? ProfileDefaults::createBlank(fname)
                     : profile;
-                np.name = newProfileName_.empty() ? fname : newProfileName_;
+                np.name = (fname == baseFname && !newProfileName_.empty()) ? newProfileName_ : fname;
                 if (ProfileStore::save(fullPath, np)) {
                     refreshProfileList();
                     out.requestSwitchProfile = true;
@@ -892,6 +901,7 @@ bool StudioPanel::onMouseMove(int x, int y, int canvasW, int canvasH,
         int ny = y - dragOffY_;
         profile.panelX = clampf(static_cast<float>(nx) / static_cast<float>(canvasW), 0.005f, 0.85f);
         profile.panelY = clampf(static_cast<float>(ny) / static_cast<float>(canvasH), 0.005f, 0.85f);
+        out.profileModified = true;
         return true;
     }
 
@@ -906,9 +916,11 @@ bool StudioPanel::onMouseMove(int x, int y, int canvasW, int canvasH,
     return false;
 }
 
-void StudioPanel::onMouseUp() {
+bool StudioPanel::onMouseUp() {
+    bool wasDragging = draggingPanel_ || (activeSliderId_ != 0);
     draggingPanel_ = false;
     activeSliderId_ = 0;
+    return wasDragging;
 }
 
 bool StudioPanel::onKeyDown(int vk, Profile& profile, int selectedBtnIndex, StudioUIResult& out) {
