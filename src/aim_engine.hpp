@@ -122,12 +122,11 @@ private:
     // Keyboard state table for 2-key combo resolution (worker thread)
     bool heldKeys_[512];
 
-    // Pending raw mouse accumulation (coalesced on demand with zero wait on first motion)
+    // Pending raw mouse accumulation (updated at 1000 Hz, drained at pollHz)
     double accumRawDx_ = 0.0;
     double accumRawDy_ = 0.0;
-    double smoothRemX_ = 0.0;
-    double smoothRemY_ = 0.0;
-    double lastAimMoveSendMs_ = 0.0;
+    double smoothDx_ = 0.0;
+    double smoothDy_ = 0.0;
 
     // Main Aim virtual finger state (alternates between PTR_AIM_A=2 and PTR_AIM_B=4)
     bool aimDown_ = false;

@@ -275,10 +275,10 @@ static void testAimEngineLShiftCursorToggle() {
 
 static void testLowLatencyAimDefaultsAnd360Consistency() {
     Profile def = createDefaultFreeFireProfile();
-    assert(def.pollHz == 240);
-    assert(std::fabs(def.ffCounterAccel) < 0.001f);
-    assert(std::fabs(def.smoothing) < 0.001f);
-    assert(def.scrcpyArgs.find("--max-fps=120") != std::string::npos);
+    assert(def.pollHz == 250);
+    assert(std::fabs(def.ffCounterAccel - 7.0f) < 0.01f);
+    assert(std::fabs(def.smoothing - 0.10f) < 0.001f);
+    assert(def.scrcpyArgs.find("--max-fps=90") != std::string::npos);
 
     // Verify AimEngine event-driven thread handles concurrent keyboard + mouse + wheel cleanly,
     // AND keeps WASD & keyboard active when mouse is unlocked (Cursor Mode)!

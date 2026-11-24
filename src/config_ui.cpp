@@ -353,7 +353,7 @@ void ConfigPanelUI::paintTabSensitivity(HDC hdc, int x, int y, int w,
     cy += step;
 
     std::snprintf(buf, sizeof(buf), "%.1f", p.ffCounterAccel);
-    drawSlider(hdc, x, cy, w, "Horiz Flick Damp", p.ffCounterAccel, 0.0f, 10.0f, buf, RGB(0, 235, 195), SL_FF_CA, fS, fB);
+    drawSlider(hdc, x, cy, w, "FF Counter-Accel", p.ffCounterAccel, 0.0f, 15.0f, buf, RGB(0, 235, 195), SL_FF_CA, fS, fB);
     cy += step;
 
     std::snprintf(buf, sizeof(buf), "%.2f", p.smoothing);
@@ -512,20 +512,17 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
 
     drawSeg2("Aim Bounds:", "UNBOUNDED (FF)", "BOXED (15ms)", p.unboundedAim, PA_BOUNDS_UNBOUNDED, PA_BOUNDS_BOXED);
 
-    // Polling rate 4-way selector (aligned with 60/120Hz Android displays; capped <=500Hz to avoid ADB queue lag!)
+    // Polling rate 4-way selector
     SelectObject(hdc, fS);
-    drawLeftText(hdc, "Touch Rate:", x, cy + 13, RGB(200, 215, 235));
-    const char* pLbls[4] = { "120Hz", "240Hz", "360Hz", "500Hz" };
+    drawLeftText(hdc, "Mouse Polling:", x, cy + 13, RGB(200, 215, 235));
+    const char* pLbls[4] = { "125Hz", "250Hz", "500Hz", "MAX" };
     const int pActs[4]   = { PA_POLL_125, PA_POLL_250, PA_POLL_500, PA_POLL_MAX };
-    const int pVals[4]   = { 120, 240, 360, 500 };
+    const int pVals[4]   = { 125, 250, 500, 0 };
     int bx = x + 124;
     int bw4 = (w - 124) / 4;
     for (int i = 0; i < 4; ++i) {
         RECT r = { bx + i * bw4, cy, bx + (i + 1) * bw4 - 3, cy + 26 };
-        bool on = (p.pollHz == pVals[i]) ||
-                  (i == 0 && p.pollHz == 125) ||
-                  (i == 1 && p.pollHz == 250) ||
-                  (i == 2 && p.pollHz == 0);
+        bool on = (p.pollHz == pVals[i]);
         drawBox(hdc, r, 5, on ? RGB(78, 52, 140) : RGB(30, 38, 54),
                 on ? RGB(180, 145, 255) : RGB(62, 76, 100), on ? 2 : 1);
         SelectObject(hdc, fB);
@@ -535,7 +532,7 @@ void ConfigPanelUI::paintTabAdvanced(HDC hdc, int x, int y, int w,
     }
     cy += 34;
 
-    drawSeg2("WASD Joystick:", "Fast 8ms Glide", "Instant Jump", p.joySteppedGlide, PA_JOY_GLIDE, PA_JOY_INSTANT);
+    drawSeg2("WASD Joystick:", "FF 3-Step Glide", "Instant Jump", p.joySteppedGlide, PA_JOY_GLIDE, PA_JOY_INSTANT);
 
     // Invert Y toggle
     SelectObject(hdc, fS);
@@ -868,11 +865,11 @@ bool ConfigPanelUI::onMouseDown(int x, int y, int /*canvasW*/, int /*canvasH*/,
 
             case PA_BOUNDS_UNBOUNDED: profile.unboundedAim = true;  out.profileModified = true; out.toastMessage = "Aim: UNBOUNDED (Free Fire)"; return true;
             case PA_BOUNDS_BOXED:     profile.unboundedAim = false; out.profileModified = true; out.toastMessage = "Aim: BOXED (15ms Edge Reset)"; return true;
-            case PA_POLL_125:         profile.pollHz = 120; out.profileModified = true; out.toastMessage = "Touch Rate: 120 Hz (Ultra-stable)"; return true;
-            case PA_POLL_250:         profile.pollHz = 240; out.profileModified = true; out.toastMessage = "Touch Rate: 240 Hz (120Hz Screen Sweet Spot)"; return true;
-            case PA_POLL_500:         profile.pollHz = 360; out.profileModified = true; out.toastMessage = "Touch Rate: 360 Hz"; return true;
-            case PA_POLL_MAX:         profile.pollHz = 500; out.profileModified = true; out.toastMessage = "Touch Rate: 500 Hz (Max USB Safe)"; return true;
-            case PA_JOY_GLIDE:        profile.joySteppedGlide = true;  out.profileModified = true; out.toastMessage = "Joystick: Fast 8ms Start + 0ms Strafe"; return true;
+            case PA_POLL_125:         profile.pollHz = 125; out.profileModified = true; out.toastMessage = "Polling: 125 Hz"; return true;
+            case PA_POLL_250:         profile.pollHz = 250; out.profileModified = true; out.toastMessage = "Polling: 250 Hz"; return true;
+            case PA_POLL_500:         profile.pollHz = 500; out.profileModified = true; out.toastMessage = "Polling: 500 Hz"; return true;
+            case PA_POLL_MAX:         profile.pollHz = 0;   out.profileModified = true; out.toastMessage = "Polling: MAX (1000 Hz)"; return true;
+            case PA_JOY_GLIDE:        profile.joySteppedGlide = true;  out.profileModified = true; out.toastMessage = "Joystick: FF 3-Stage Glide"; return true;
             case PA_JOY_INSTANT:      profile.joySteppedGlide = false; out.profileModified = true; out.toastMessage = "Joystick: Instant Jump"; return true;
             case PA_TOGGLE_INVERT_Y:  profile.invertY = !profile.invertY; out.profileModified = true; return true;
             case PA_REBIND_TOGGLE_AIM:  rebindingToggleAim_ = true;  out.toastMessage = "Press ANY keyboard key or Mouse button (e.g. MMB, LShift) for Aim Lock..."; return true;

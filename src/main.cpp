@@ -45,9 +45,6 @@ void printUsage() {
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    // Keep raw mouse hooks & touch injection responsive even under heavy 120FPS video decode
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-
     // Critical on laptops with 125%/150% Windows scaling so overlay & clicks align 1:1
     typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
     HMODULE hUser32 = GetModuleHandleA("user32.dll");

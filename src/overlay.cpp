@@ -168,7 +168,7 @@ bool OverlayApp::create(HINSTANCE hInst) {
 
     registerRawInput();
     installHooks();
-    SetTimer(hwnd_, TIMER_SYNC_REPAINT, 33, NULL);
+    SetTimer(hwnd_, TIMER_SYNC_REPAINT, 16, NULL);
 
     if (demoMode_) {
         showToast("Demo Mode: Click the floating 'CFG' ball (or F2) to open Keymap Studio!", 5000);
@@ -1577,9 +1577,8 @@ void OverlayApp::paintPlayStatusBar(HDC hdc, int w) {
                          : (tel.aimMode && tel.scopeActive) ? "AIM+ADS"
                          : tel.aimMode ? "AIM ON" : "CURSOR";
     char hzBuf[16];
-    int effHz = (profile_.pollHz <= 0) ? 360 : profile_.pollHz;
-    if (effHz > 500) effHz = 500;
-    std::snprintf(hzBuf, sizeof(hzBuf), "%dHz", effHz);
+    if (profile_.pollHz <= 0) std::snprintf(hzBuf, sizeof(hzBuf), "MAX");
+    else std::snprintf(hzBuf, sizeof(hzBuf), "%dHz", profile_.pollHz);
 
     std::string aimKeyName = vkToName(profile_.toggleAimVk);
     char text[300];

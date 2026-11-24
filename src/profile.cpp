@@ -196,9 +196,9 @@ KeyActionType nameToActionType(const std::string& raw) {
 Profile createDefaultFreeFireProfile() {
     Profile p;
     p.name = "Free Fire MAX (S21 FE)";
-    p.scrcpyArgs = "--max-fps=120 --video-bit-rate=8M --max-size=1600 --no-mipmaps --video-buffer=0";
+    p.scrcpyArgs = "--max-fps=90 --video-bit-rate=16M";
     p.controlMaxSize = 0;
-    p.pollHz = 240;
+    p.pollHz = 250;
 
     p.toggleAimVk = 0xC0; // ~
     p.holdUnlockVk = 0;
@@ -212,7 +212,7 @@ Profile createDefaultFreeFireProfile() {
 
     p.unboundedAim = true;
     p.invertY = false;
-    p.ffCounterAccel = 0.0f;
+    p.ffCounterAccel = 7.0f;
     p.sensX = 0.95f;
     p.sensY = 1.15f;
     p.fireSensX = 0.80f;
@@ -222,7 +222,7 @@ Profile createDefaultFreeFireProfile() {
     p.accelPower = 1.00f;
     p.accelRefSpeed = 14.0f;
     p.accelCap = 2.00f;
-    p.smoothing = 0.00f;
+    p.smoothing = 0.10f;
     p.idleResetMs = 700;
     p.touchDownDelayMs = 15;
     p.touchUpDelayMs = 0;

@@ -145,9 +145,8 @@ void AimEngine::setAimMode(bool enabled) {
     accumRawDy_ = 0.0;
     pendingCursor_.clear();
     LeaveCriticalSection(&inputLock_);
-    smoothRemX_ = 0.0;
-    smoothRemY_ = 0.0;
-    lastAimMoveSendMs_ = 0.0;
+    smoothDx_ = 0.0;
+    smoothDy_ = 0.0;
     scopeSensActive_ = false;
     LeaveCriticalSection(&lock_);
     if (wakeEvent_) SetEvent(wakeEvent_);
@@ -159,7 +158,6 @@ void AimEngine::onRawMouseDelta(int dx, int dy) {
     accumRawDx_ += static_cast<double>(dx);
     accumRawDy_ += static_cast<double>(dy);
     LeaveCriticalSection(&inputLock_);
-    if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
 void AimEngine::onDirectCursorTouch(TouchAction action, float normX, float normY) {
@@ -730,19 +728,17 @@ void AimEngine::updateJoystickLocked(double nowMs) {
         ++packetsThisSec_;
     }
 
-    if (profile_.joySteppedGlide && firstDown) {
-        // Fast 2-step initial ramp (4ms -> 55%, 8ms -> 100%) locks Free Fire's floating joystick
-        // cleanly without the 53ms startup mud!
+    if (profile_.joySteppedGlide) {
+        // Free Fire smooth 3-stage stepped glide:
+        // Stage 0 (+8ms): center settle, Stage 1 (+15ms): 20%, Stage 2 (+15ms): 50%, Stage 3 (+15ms): 100%
         joyGlideActive_ = true;
-        joyGlideStartX_ = cx;
-        joyGlideStartY_ = cy;
+        joyGlideStartX_ = joyCurX_;
+        joyGlideStartY_ = joyCurY_;
         joyGlideTargetX_ = targetX;
         joyGlideTargetY_ = targetY;
-        joyGlideStage_ = 0;
-        joyGlideNextMs_ = nowMs + 4.0;
-        if (wakeEvent_) SetEvent(wakeEvent_);
+        joyGlideStage_ = firstDown ? 0 : 1;
+        joyGlideNextMs_ = nowMs + (firstDown ? 8.0 : 10.0);
     } else {
-        // Already moving (e.g. A<->D strafe, W->WD diagonal, Sprint): snap directly with 0ms lag!
         joyGlideActive_ = false;
         joyCurX_ = targetX;
         joyCurY_ = targetY;
@@ -761,8 +757,8 @@ void AimEngine::stepJoystickGlideLocked(double nowMs) {
     if (!joyGlideActive_ || !joyDown_) return;
     if (nowMs < joyGlideNextMs_) return;
 
-    // Fast 2-step initial ramp: 55% at +4ms (breaks deadzone immediately), 100% at +8ms
-    static const double kRatios[2] = { 0.55, 1.00 };
+    // Cumulative progress ratios: 0% (settle), 20%, 50%, 100%
+    static const double kRatios[4] = { 0.0, 0.20, 0.50, 1.00 };
     double r = kRatios[joyGlideStage_];
     joyCurX_ = joyGlideStartX_ + (joyGlideTargetX_ - joyGlideStartX_) * r;
     joyCurY_ = joyGlideStartY_ + (joyGlideTargetY_ - joyGlideStartY_) * r;
@@ -775,10 +771,10 @@ void AimEngine::stepJoystickGlideLocked(double nowMs) {
     ++packetsThisSec_;
 
     ++joyGlideStage_;
-    if (joyGlideStage_ >= 2) {
+    if (joyGlideStage_ >= 4) {
         joyGlideActive_ = false;
     } else {
-        joyGlideNextMs_ = nowMs + 4.0;
+        joyGlideNextMs_ = nowMs + 15.0;
     }
 }
 
@@ -1032,50 +1028,22 @@ void AimEngine::processTick(double nowMs) {
         return;
     }
 
-    // 3. Zero-wait event-driven coalescing for Raw Mouse Look:
-    //    - First motion from rest dispatches IMMEDIATELY (<0.2ms latency)
-    //    - Continuous high-rate USB mouse reports coalesce cleanly at pollHz (default 240Hz, max 500Hz)
-    int hz = profile_.pollHz;
-    if (hz <= 0) hz = 360;
-    if (hz < 60) hz = 60;
-    if (hz > 500) hz = 500;
-    double minIntervalMs = 1000.0 / static_cast<double>(hz);
-
-    double elapsedSinceSendMs = (lastAimMoveSendMs_ > 0.0) ? (nowMs - lastAimMoveSendMs_) : minIntervalMs;
-
+    // 3. Drain accumulated raw mouse deltas (original smooth fixed-cadence pollHz drain!)
     double rawDx = 0.0, rawDy = 0.0;
-    bool hasPendingRaw = false;
-    bool hasPendingRem = (std::fabs(smoothRemX_) > 0.0001 || std::fabs(smoothRemY_) > 0.0001);
     EnterCriticalSection(&inputLock_);
-    hasPendingRaw = (std::fabs(accumRawDx_) > 0.0001 || std::fabs(accumRawDy_) > 0.0001);
-    if ((hasPendingRaw || hasPendingRem) && elapsedSinceSendMs >= minIntervalMs) {
-        rawDx = accumRawDx_;
-        rawDy = accumRawDy_;
-        accumRawDx_ = 0.0;
-        accumRawDy_ = 0.0;
-    }
+    rawDx = accumRawDx_;
+    rawDy = accumRawDy_;
+    accumRawDx_ = 0.0;
+    accumRawDy_ = 0.0;
     LeaveCriticalSection(&inputLock_);
-
-    if ((hasPendingRaw || hasPendingRem) && elapsedSinceSendMs < minIntervalMs) {
-        LeaveCriticalSection(&lock_);
-        return;
-    }
 
     if (profile_.invertY) {
         rawDy = -rawDy;
     }
 
     bool hasRawInput = (std::fabs(rawDx) > 0.0001 || std::fabs(rawDy) > 0.0001);
-    double dtMs = clampd(elapsedSinceSendMs, 1.0, 32.0);
-    if (hasRawInput || hasPendingRem) {
-        if (hasRawInput) {
-            lastMouseMoveMs_ = nowMs;
-        }
-        if (lastAimMoveSendMs_ <= 0.0 || (nowMs - lastAimMoveSendMs_) > minIntervalMs * 2.0) {
-            lastAimMoveSendMs_ = nowMs;
-        } else {
-            lastAimMoveSendMs_ += minIntervalMs;
-        }
+    if (hasRawInput) {
+        lastMouseMoveMs_ = nowMs;
     }
 
     // 4. Compute velocity curve + independent X/Y + Fire + Scope multipliers
@@ -1104,22 +1072,16 @@ void AimEngine::processTick(double nowMs) {
     double targetDx = rawDx * sx * accelGain;
     double targetDy = rawDy * sy * accelGain;
 
-    // Lossless residual-preserving smoothing (at default smoothing=0.0 -> pure 1:1 raw!)
     double stepX = targetDx;
     double stepY = targetDy;
     if (profile_.smoothing > 0.001f) {
-        smoothRemX_ += targetDx;
-        smoothRemY_ += targetDy;
-        double blend = 1.0 - clampd(static_cast<double>(profile_.smoothing), 0.0, 0.85);
-        stepX = smoothRemX_ * blend;
-        stepY = smoothRemY_ * blend;
-        if (std::fabs(smoothRemX_) < 0.15) stepX = smoothRemX_;
-        if (std::fabs(smoothRemY_) < 0.15) stepY = smoothRemY_;
-        smoothRemX_ -= stepX;
-        smoothRemY_ -= stepY;
-    } else {
-        smoothRemX_ = 0.0;
-        smoothRemY_ = 0.0;
+        double alpha = clampd(static_cast<double>(profile_.smoothing), 0.0, 0.85);
+        smoothDx_ = smoothDx_ * alpha + targetDx * (1.0 - alpha);
+        smoothDy_ = smoothDy_ * alpha + targetDy * (1.0 - alpha);
+        if (std::fabs(smoothDx_) < 0.02) smoothDx_ = 0.0;
+        if (std::fabs(smoothDy_) < 0.02) smoothDy_ = 0.0;
+        stepX = smoothDx_;
+        stepY = smoothDy_;
     }
 
     bool hasStep = (std::fabs(stepX) > 0.0001 || std::fabs(stepY) > 0.0001);
@@ -1151,24 +1113,22 @@ void AimEngine::processTick(double nowMs) {
         return;
     }
 
-    // Velocity-based bounded horizontal damping (position-independent — NEVER collapses to 5% on 360 turns!)
-    auto applyFreeFireCounterAccel = [&](double inDx) -> double {
-        if (profile_.ffCounterAccel <= 0.01f) return inDx;
-        double velPxPerMs = std::fabs(inDx) / dtMs;
-        double k = static_cast<double>(profile_.ffCounterAccel) * 0.025;
-        double scale = 1.0 / (1.0 + k * velPxPerMs);
-        if (scale < 0.45) scale = 0.45;
-        return inDx * scale;
+    // Restored original Free Fire horizontal counter-acceleration curve
+    auto applyFreeFireCounterAccel = [&](double curX, double originX, double inDx) -> double {
+        if (profile_.ffCounterAccel <= 0.01f || dw <= 1.0) return inDx;
+        double r = std::fabs(curX - originX) / dw;
+        double k = static_cast<double>(profile_.ffCounterAccel);
+        return inDx * ((0.98 / (k * r * r + 1.0)) + 0.02);
     };
 
     auto moveFireFinger = [&]() {
         if (!hasStep || !fireDown_) return;
-        double dx = applyFreeFireCounterAccel(stepX);
+        double dx = applyFreeFireCounterAccel(fireCurX_, static_cast<double>(fireStartX_), stepX);
         double dy = stepY;
 
         if (profile_.unboundedAim) {
-            fireCurX_ += clampd(dx, -200.0, 200.0);
-            fireCurY_ += clampd(dy, -200.0, 200.0);
+            fireCurX_ += clampd(dx, -160.0, 160.0);
+            fireCurY_ += clampd(dy, -160.0, 160.0);
         } else {
             double anchorX = static_cast<double>(profile_.fireX) * dw;
             double anchorY = static_cast<double>(profile_.fireY) * dh;
@@ -1176,8 +1136,8 @@ void AimEngine::processTick(double nowMs) {
             double maxX = clampd(anchorX + static_cast<double>(profile_.fireBoxHalfW) * dw, dw * 0.20, dw - 4.0);
             double minY = clampd(anchorY - static_cast<double>(profile_.fireBoxHalfH) * dh, dh * 0.02, dh - 4.0);
             double maxY = clampd(anchorY + static_cast<double>(profile_.fireBoxHalfH) * dh, dh * 0.02, dh * 0.98);
-            fireCurX_ = clampd(fireCurX_ + clampd(dx, -200.0, 200.0), minX, maxX);
-            fireCurY_ = clampd(fireCurY_ + clampd(dy, -200.0, 200.0), minY, maxY);
+            fireCurX_ = clampd(fireCurX_ + clampd(dx, -160.0, 160.0), minX, maxX);
+            fireCurY_ = clampd(fireCurY_ + clampd(dy, -160.0, 160.0), minY, maxY);
         }
 
         int32_t px = static_cast<int32_t>(std::floor(fireCurX_ + 0.5));
@@ -1198,16 +1158,21 @@ void AimEngine::processTick(double nowMs) {
 
         if (hasStep) {
             if (!aimDown_) {
-                // Plant virtual finger AND immediately apply first movement in the same wakeup (0 extra tick stall!)
+                // Clean first-event-place: send TOUCH_DOWN first, carry delta to next tick
                 ensureAimDownLocked(anchorX, anchorY);
+                EnterCriticalSection(&inputLock_);
+                accumRawDx_ += rawDx;
+                accumRawDy_ += rawDy;
+                LeaveCriticalSection(&inputLock_);
+                return;
             }
             pendingAimFirstMove_ = false;
 
-            double dx = applyFreeFireCounterAccel(stepX);
+            double dx = applyFreeFireCounterAccel(aimCurX_, aimOriginX_, stepX);
             double dy = stepY;
 
-            double nextX = aimCurX_ + clampd(dx, -200.0, 200.0);
-            double nextY = aimCurY_ + clampd(dy, -200.0, 200.0);
+            double nextX = aimCurX_ + clampd(dx, -160.0, 160.0);
+            double nextY = aimCurY_ + clampd(dy, -160.0, 160.0);
 
             if (!profile_.unboundedAim) {
                 double minX = clampd(anchorX - static_cast<double>(profile_.aimHalfW) * dw, dw * 0.30, dw - 5.0);
@@ -1221,8 +1186,8 @@ void AimEngine::processTick(double nowMs) {
                     aimCurY_ = anchorY;
                     int delay = (profile_.touchDownDelayMs >= 15) ? profile_.touchDownDelayMs : 15;
                     aimCooldownUntilMs_ = nowMs + static_cast<double>(delay);
-                    smoothRemX_ = 0.0;
-                    smoothRemY_ = 0.0;
+                    smoothDx_ = 0.0;
+                    smoothDy_ = 0.0;
                     return;
                 }
             }
@@ -1238,15 +1203,11 @@ void AimEngine::processTick(double nowMs) {
                 ++packetsThisSec_;
             }
         } else if (aimDown_ && !firingActive && profile_.idleResetMs > 0) {
-            // Keep finger planted while holding an angle (zero touch-slop deadzone!).
-            // Only quietly re-center if the virtual finger drifted far away AND user is idle.
+            // Between fights (after idleResetMs of stillness), quietly re-center so counter-accel starts fresh
             if ((nowMs - lastMouseMoveMs_) >= static_cast<double>(profile_.idleResetMs)) {
-                bool driftedFar = (std::fabs(aimCurX_ - aimOriginX_) > dw * 0.40 ||
-                                   std::fabs(aimCurY_ - aimOriginY_) > dh * 0.38);
-                bool boxedDrifted = (!profile_.unboundedAim &&
-                                     (std::fabs(aimCurX_ - aimOriginX_) > dw * static_cast<double>(profile_.aimHalfW) * 0.60 ||
-                                      std::fabs(aimCurY_ - aimOriginY_) > dh * static_cast<double>(profile_.aimHalfH) * 0.60));
-                if (driftedFar || boxedDrifted) {
+                bool displaced = (std::fabs(aimCurX_ - aimOriginX_) > dw * 0.20 ||
+                                  std::fabs(aimCurY_ - aimOriginY_) > dh * 0.20);
+                if (!profile_.unboundedAim || displaced) {
                     liftAimFingerLocked();
                     aimCurX_ = anchorX;
                     aimCurY_ = anchorY;
@@ -1275,15 +1236,32 @@ DWORD WINAPI AimEngine::tickThreadProc(LPVOID param) {
 
 void AimEngine::runLoop() {
     timeBeginPeriod(1);
+    double nextTickMs = getTimeMs();
 
     while (!stopFlag_) {
+        int hz = 250;
+        EnterCriticalSection(&lock_);
+        hz = profile_.pollHz;
+        LeaveCriticalSection(&lock_);
+        if (hz <= 0) hz = 1000;
+        if (hz < 60) hz = 60;
+        if (hz > 1000) hz = 1000;
+        double periodMs = 1000.0 / static_cast<double>(hz);
+
         double nowMs = getTimeMs();
-        processTick(nowMs);
-        if (stopFlag_) break;
-        if (wakeEvent_) {
-            WaitForSingleObject(wakeEvent_, 1);
+        if (nowMs >= nextTickMs) {
+            processTick(nowMs);
+            nextTickMs += periodMs;
+            if (nextTickMs < nowMs - periodMs * 2.0) {
+                nextTickMs = nowMs + periodMs;
+            }
         } else {
-            Sleep(1);
+            double waitMs = nextTickMs - nowMs;
+            if (waitMs > 1.5) {
+                Sleep(1);
+            } else {
+                Sleep(0);
+            }
         }
     }
 
