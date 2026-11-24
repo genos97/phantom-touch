@@ -1,0 +1,17 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.dll
+*.pdb
+*.out
+
+# Downloaded scrcpy runtime (run setup_scrcpy.ps1 to install)
+scrcpy/
+
+# Local runtime state & temporary test files
+profiles/.active_profile
+profiles/_test_*.cfg
+*.log
+*.bmp
+*.png
