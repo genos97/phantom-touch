@@ -38,7 +38,6 @@ phantom-touch/
 │   │   └── InputEngine.hpp / .cpp       # Non-blocking hook queue, QPC polling loop, fire modes, cursor scroll
 │   └── ui/
 │       ├── Theme.hpp                    # Obsidian & electric-cyan emulator theme tokens & layout metrics
-│       ├── GdiDraw.hpp / .cpp           # Lightweight GDI helpers for HudOverlay
 │       ├── GdiPlusDraw.hpp / .cpp       # Anti-aliased GDI+ cards, toggles, sliders, vector icons, aspect-fit
 │       ├── TopBar.hpp / .cpp            # Frameless header, device pill, profile switcher, live telemetry
 │       ├── SideRail.hpp / .cpp          # 54px right emulator action rail + Android Back/Home/Recents/Vol

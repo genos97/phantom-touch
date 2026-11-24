@@ -24,7 +24,6 @@ g++ -std=c++11 -O2 -Wall -Wextra -mwindows ^
     src\engine\JoystickController.cpp ^
     src\engine\ActionDispatcher.cpp ^
     src\engine\InputEngine.cpp ^
-    src\ui\GdiDraw.cpp ^
     src\ui\GdiPlusDraw.cpp ^
     src\ui\HudRenderer.cpp ^
     src\ui\TopBar.cpp ^

@@ -34,9 +34,9 @@ struct IHudOverlayHost {
     virtual void hudOnToast(const std::string& msg, DWORD durationMs) = 0;
 };
 
-// Lightweight owned layered overlay pinned STRICTLY to the embedded phone video rect.
-// Renders ONLY key badges, crosshair dot, toasts, and Edit Mode draggable key nodes
-// (zero overlapping config panels and zero floating CFG ball!).
+// Per-pixel premultiplied-alpha (UpdateLayeredWindow + GDI+ PARGB) owned overlay
+// pinned strictly to the embedded phone video rect.
+// Renders clean frosted-glass emulator keycaps with zero color-key halos or jagged edges.
 class HudOverlay {
 public:
     explicit HudOverlay(IHudOverlayHost* host);
@@ -79,13 +79,17 @@ private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+    bool ensureSurface(int w, int h);
+    void freeSurface();
+    void renderLayered();
+
+    bool hitTestDeleteChip(int px, int py) const;
     DragTarget hitTestNode(int px, int py, int& outBtnIdx) const;
     void onMouseDown(int x, int y, bool rightBtn);
     void onDoubleClick(int x, int y);
     void onMouseMove(int x, int y);
     void onMouseUp();
     void onMouseWheel(int x, int y, int delta);
-    void onPaint(HDC hdc);
 
     IHudOverlayHost* host_;
     HWND hwnd_ = NULL;
@@ -97,16 +101,19 @@ private:
     DragTarget dragging_ = DRAG_NONE;
     int dragBtnIndex_ = -1;
     int selectedBtnIndex_ = -1;
+    int hoveredBtnIndex_ = -1;
+    bool hoverDeleteChip_ = false;
     HudRebindTarget rebindTarget_ = HUD_REBIND_NONE;
 
     std::string toastMsg_;
     DWORD toastExpireTick_ = 0;
     bool toastWasVisible_ = false;
 
-    HDC cacheDC_ = NULL;
-    HBITMAP cacheBmp_ = NULL;
-    HGDIOBJ cacheOldBmp_ = NULL;
-    int cacheW_ = 0;
-    int cacheH_ = 0;
-    HudFonts fonts_;
+    // 32-bit top-down premultiplied ARGB DIBSection backing store for UpdateLayeredWindow
+    HDC dibDC_ = NULL;
+    HBITMAP dibBmp_ = NULL;
+    HGDIOBJ dibOldBmp_ = NULL;
+    void* dibBits_ = NULL;
+    int dibW_ = 0;
+    int dibH_ = 0;
 };
