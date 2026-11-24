@@ -49,6 +49,7 @@ OverlayWindow::OverlayWindow(ScrcpyBridge* bridge, InputEngine* engine,
       profilePath_(profilePath), mirrorTitle_(mirrorTitle), demoMode_(demoMode) {
     ZeroMemory(&mirrorClientScreenRect_, sizeof(mirrorClientScreenRect_));
     ZeroMemory(&floatBallPressPt_, sizeof(floatBallPressPt_));
+    ZeroMemory(&lastUnlockedCursorPt_, sizeof(lastUnlockedCursorPt_));
     std::memset(hookKeyDown_, 0, sizeof(hookKeyDown_));
     profile_ = engine_->getProfileCopy();
     studioPanel_.setProfilesDir(profilesDir_, profilePath_);
@@ -206,6 +207,14 @@ void OverlayWindow::setAimMode(bool enabled) {
     floatBallHookPressed_ = false;
 
     if (aimMode_) {
+        POINT curPt;
+        if (GetCursorPos(&curPt)) {
+            float tmpX = 0.0f, tmpY = 0.0f;
+            if (isPointInMirror(curPt, tmpX, tmpY)) {
+                lastUnlockedCursorPt_ = curPt;
+                hasLastUnlockedCursorPt_ = true;
+            }
+        }
         if (!demoMode_ && hwnd_) {
             LONG ex = GetWindowLongA(hwnd_, GWL_EXSTYLE);
             ex &= ~WS_EX_TRANSPARENT;
@@ -221,6 +230,12 @@ void OverlayWindow::setAimMode(bool enabled) {
         showToast("AIM MODE ON  (Press " + KeyCodes::toName(profile_.toggleAimVk) + " or F1 to release mouse)", 1400);
     } else {
         ClipCursor(NULL);
+        if (profile_.rememberCursorPos && hasLastUnlockedCursorPt_) {
+            float tmpX = 0.0f, tmpY = 0.0f;
+            if (isPointInMirror(lastUnlockedCursorPt_, tmpX, tmpY)) {
+                SetCursorPos(lastUnlockedCursorPt_.x, lastUnlockedCursorPt_.y);
+            }
+        }
         if (cursorHidden_) {
             ShowCursor(TRUE);
             cursorHidden_ = false;
@@ -551,6 +566,17 @@ LRESULT OverlayWindow::handleLowLevelMouse(int nCode, WPARAM wParam, LPARAM lPar
             } else if (wParam == WM_LBUTTONUP && cursorDirectDragging_) {
                 cursorDirectDragging_ = false;
                 engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
+            } else if (wParam == WM_MOUSEWHEEL && inMirror && isMirrorOrOverlayForeground()) {
+                HWND under = WindowFromPoint(ms->pt);
+                if (under == mirrorHwnd_ || under == hwnd_) {
+                    short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
+                    int notches = rawDelta / WHEEL_DELTA;
+                    if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
+                    if (notches != 0) {
+                        engine_->onDirectCursorScroll(nx, ny, notches);
+                        return 1;
+                    }
+                }
             }
         }
     }

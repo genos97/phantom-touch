@@ -16,7 +16,8 @@ phantom-touch/
 │   │   ├── main.cpp                       # Entry point
 │   │   └── Application.hpp / .cpp         # CLI bootstrap, DPI setup, lifecycle orchestration
 │   ├── bridge/
-│   │   ├── TouchTypes.hpp                 # TouchAction enum, PointerId slots, TouchEmitFn sink
+│   │   ├── TouchTypes.hpp                 # TouchAction enum, logical PointerId channels, TouchEmitFn sink
+│   │   ├── TouchFingerPool.hpp / .cpp     # Bounded Android 0..9 virtual finger allocator & FIFO slot rotator
 │   │   ├── SpsParser.hpp / .cpp           # H.264 Annex-B SPS RBSP resolution parser (auto-rotation)
 │   │   └── ScrcpyBridge.hpp / .cpp        # Official scrcpy v2-v5 ADB/TCP bridge & display launcher
 │   ├── config/
@@ -48,7 +49,8 @@ phantom-touch/
 
 - **Standalone 360° Virtual-Finger FPS Controller (`FpsViewController`):** Lazy touch-down, exact `double` sub-pixel accumulation, Free Fire unbounded mode (`ff_counter_accel`) + boxed 360° edge-release (`>=15 ms` non-blocking re-plant with alternating pointer IDs & `±50 px` jitter), idle auto-recenter, and a 2-level `FpsViewStack` for Free Look Eye (`NODE_HOLD_VIEW`).
 - **Non-Blocking Keyboard + Mouse Concurrency (`InputEngine`):** `WH_KEYBOARD_LL` and `WH_MOUSE_LL` enqueue into a microsecond lock without ever blocking on TCP `send()`. Keyboard & `WASD` remain fully usable even when the mouse cursor is unlocked.
-- **Full Mouse & Scroll Wheel Support:** Bind `LMB`, `RMB`, `MMB`, `X1`, `X2`, `SCROLL UP`, `SCROLL DOWN`, keyboard keys, or 2-key combos (`LALT+1`) to any of 10 action types (`PRESS`, `CLICK`, `DOWN_UP`, `UP_TRIGGER`, `HOLD_VIEW`, `SWIPE`, `CURSOR_TOGGLE`, `RESET_VIEW`, `SWITCH_SENS`, `REACTIVATE_JOY`).
+- **Bounded Virtual Finger Pool (`TouchFingerPool`):** Dynamically allocates Android multi-touch slots `0..9` with FIFO round-robin rotation on camera re-plants, overflow protection, duplicate-DOWN/orphan-UP guards, and complete stuck-finger drain on focus loss.
+- **Full Mouse & Scroll Wheel Support:** Bind `LMB`, `RMB`, `MMB`, `X1`, `X2`, `SCROLL UP`, `SCROLL DOWN`, keyboard keys, or 2-key combos (`LALT+1`) to any of 10 action types (`PRESS`, `CLICK`, `DOWN_UP`, `UP_TRIGGER`, `HOLD_VIEW`, `SWIPE`, `CURSOR_TOGGLE`, `RESET_VIEW`, `SWITCH_SENS`, `REACTIVATE_JOY`). In unlocked Cursor Mode, scrolling over the mirror smoothly touch-drags lists/backpacks (`80 ms` auto-release) even inside Unity/Unreal games.
 - **Visual Keymap Studio (`F2` or Floating `CFG` Ball):** Drag keys anywhere, double-click any key to replace it, tune X/Y/Fire/Scope sensitivity sliders live, and create/clone/switch saved `.cfg` profiles.
 
 ---

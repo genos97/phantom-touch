@@ -1,4 +1,5 @@
 #include "bridge/SpsParser.hpp"
+#include "bridge/TouchFingerPool.hpp"
 #include "bridge/ScrcpyBridge.hpp"
 #include "config/KeyCodes.hpp"
 #include "config/Profile.hpp"
@@ -81,7 +82,11 @@ static void testProfileRoundTrip() {
     swipeNode.x2 = 0.60f;
     swipeNode.y2 = 0.25f;
     swipeNode.durationMs = 140;
+    swipeNode.resetView = true;
+    swipeNode.reactivateJoy = true;
     orig.buttons.push_back(swipeNode);
+    orig.rememberCursorPos = true;
+    orig.cursorScrollStepPx = 110;
 
     const std::string tmpPath = "profiles\\_test_v3_roundtrip.cfg";
     assert(ProfileStore::save(tmpPath, orig));
@@ -102,6 +107,8 @@ static void testProfileRoundTrip() {
     assert(last.action == NODE_SWIPE);
     assert(std::fabs(last.x2 - 0.60f) < 0.01f);
     assert(last.durationMs == 140);
+    assert(last.resetView == true && last.reactivateJoy == true);
+    assert(loaded.rememberCursorPos == true && loaded.cursorScrollStepPx == 110);
 
     int cVk = 0, pVk = 0;
     KeyCodes::parseCombo("LALT+1", cVk, pVk);
@@ -189,25 +196,89 @@ static void testStudioPanelMouseAndScrollRebind() {
     std::printf("[Test] StudioPanel LShift, MMB & Scroll Up/Down UI interactions OK!\n");
 }
 
+static void testTouchFingerPool() {
+    std::vector<RecordedTouch> log;
+    TouchFingerPool pool;
+    pool.setDownstreamSink(recordTouchCb, &log);
+
+    // 1. Allocate 10 distinct logical IDs (including high button IDs >= 20) -> strict 0..9 slots
+    for (int i = 0; i < 10; ++i) {
+        bool ok = pool.emit(TOUCH_DOWN, PointerId::BTN_BASE + i, 100 + i * 10, 200, true);
+        assert(ok);
+        assert(log.back().ptrId < 10);
+    }
+    assert(pool.activeCount() == 10);
+
+    // 2. 11th simultaneous finger is cleanly dropped instead of overflowing Android's 10-slot limit
+    assert(!pool.emit(TOUCH_DOWN, PointerId::BTN_BASE + 99, 500, 500, true));
+    assert(pool.activeCount() == 10);
+
+    // 3. Redundant MOVE to exact same coordinate is suppressed; new coordinate emits MOVE
+    size_t beforeMove = log.size();
+    assert(!pool.emit(TOUCH_MOVE, PointerId::BTN_BASE + 0, 100, 200, true));
+    assert(log.size() == beforeMove);
+    assert(pool.emit(TOUCH_MOVE, PointerId::BTN_BASE + 0, 120, 210, true));
+    assert(log.size() == beforeMove + 1 && log.back().action == TOUCH_MOVE);
+
+    // 4. Orphan UP / MOVE on inactive channel ignored
+    assert(!pool.emit(TOUCH_UP, 9999, 0, 0, true));
+    assert(!pool.emit(TOUCH_MOVE, 9999, 10, 10, true));
+
+    // 5. releaseAll() drains every active finger back to 0 cleanly
+    int lifted = pool.releaseAll();
+    assert(lifted == 10 && pool.activeCount() == 0);
+
+    // 6. FIFO round-robin rotation: releasing & immediately re-planting rotates to a fresh slot
+    assert(pool.emit(TOUCH_DOWN, PointerId::AIM_A, 1200, 600, true));
+    uint64_t firstSlot = log.back().ptrId;
+    assert(pool.emit(TOUCH_UP, PointerId::AIM_A, 1250, 600, true));
+    assert(pool.emit(TOUCH_DOWN, PointerId::AIM_A, 1200, 600, true));
+    uint64_t secondSlot = log.back().ptrId;
+    assert(firstSlot != secondSlot && secondSlot < 10);
+    assert(pool.releaseAll() == 1 && pool.activeCount() == 0);
+
+    std::printf("[Test] TouchFingerPool (0..9 bounds, FIFO rotation, overflow/orphan/drain guards) OK!\n");
+}
+
 static void testJoystickAndActionModules() {
     std::vector<RecordedTouch> log;
     uint32_t pkts = 0;
     Profile p = ProfileDefaults::createFreeFire();
 
-    // 1. Standalone JoystickController 3-stage stepped glide
+    // 1. Standalone JoystickController Free Fire 4-stage stepped glide
     JoystickController joy;
     joy.setTouchSink(recordTouchCb, &log);
     assert(joy.handleKey('W', true, true, p, 2000, 1000, 100.0, pkts));
     assert(joy.isDown() && log.size() == 1 && log[0].action == TOUCH_DOWN);
-    joy.tick(109.0, pkts); // stage 0
-    joy.tick(125.0, pkts); // stage 1 (20%)
-    joy.tick(141.0, pkts); // stage 2 (50%)
-    joy.tick(157.0, pkts); // stage 3 (100%)
+    joy.tick(p, 2000, 1000, 109.0, pkts); // stage 0
+    joy.tick(p, 2000, 1000, 125.0, pkts); // stage 1 (20%)
+    joy.tick(p, 2000, 1000, 141.0, pkts); // stage 2 (50%)
+    joy.tick(p, 2000, 1000, 157.0, pkts); // stage 3 (100%)
     assert(log.back().action == TOUCH_MOVE && log.back().py < log[0].py);
-    assert(joy.handleKey('W', false, true, p, 2000, 1000, 170.0, pkts));
+
+    // Non-blocking >=15ms reactivate() gap (no 0ms UP+DOWN fusion!)
+    joy.reactivate(p, 2000, 1000, 160.0, pkts);
+    assert(!joy.isDown() && log.back().action == TOUCH_UP);
+    joy.tick(p, 2000, 1000, 168.0, pkts); // +8ms < 15ms: still lifted
+    assert(!joy.isDown());
+    joy.tick(p, 2000, 1000, 176.0, pkts); // +16ms >= 15ms: cleanly re-planted
+    assert(joy.isDown() && log.back().action == TOUCH_DOWN);
+    assert(joy.handleKey('W', false, true, p, 2000, 1000, 190.0, pkts));
     assert(!joy.isDown() && log.back().action == TOUCH_UP);
 
-    // 2. Standalone ActionDispatcher: combo + multi-notch wheel press
+    // Non-FF fast 3-step 24ms glide (no 0ms teleport!)
+    log.clear();
+    p.joySteppedGlide = false;
+    assert(joy.handleKey('D', true, true, p, 2000, 1000, 200.0, pkts));
+    assert(log.size() == 1 && log[0].action == TOUCH_DOWN);
+    joy.tick(p, 2000, 1000, 209.0, pkts);
+    joy.tick(p, 2000, 1000, 218.0, pkts);
+    joy.tick(p, 2000, 1000, 227.0, pkts);
+    assert(log.size() == 4 && log.back().action == TOUCH_MOVE && log.back().px > log[0].px);
+    joy.release(pkts);
+    p.joySteppedGlide = true;
+
+    // 2. Standalone ActionDispatcher: modifier-normalized 2-key combo, toggleOnly isolation, add-on flags, multi-notch wheel
     log.clear();
     ActionDispatcher disp;
     disp.setTouchSink(recordTouchCb, &log);
@@ -217,11 +288,36 @@ static void testJoystickAndActionModules() {
     whl.action = NODE_PRESS;
     whl.x = 0.8f; whl.y = 0.2f;
     p.buttons.push_back(whl);
+
+    KeyNode comboNode;
+    comboNode.label = "CMB";
+    comboNode.comboVk = VK_SHIFT; // Generic VK_SHIFT must match held VK_LSHIFT!
+    comboNode.vk = '1';
+    comboNode.action = NODE_CLICK;
+    comboNode.resetView = true;
+    comboNode.reactivateJoy = true;
+    comboNode.x = 0.5f; comboNode.y = 0.5f;
+    p.buttons.push_back(comboNode);
+
     disp.resetForProfile(p.buttons.size());
 
     bool held[512] = {false};
     bool scopeSens = false;
     ActionEffects eff;
+
+    // Cursor Mode mouse isolation: toggleOnly=true must NOT trigger RMB SCOPE (NODE_PRESS)
+    disp.dispatchKey(VK_RBUTTON, true, false, p, held, 2000, 1000, 195.0, scopeSens, eff, pkts, true);
+    assert(log.empty());
+
+    // Modifier-normalized 2-key combo: hold VK_LSHIFT, press '1' -> fires combo + resetView + reactivateJoy
+    held[VK_LSHIFT] = true;
+    disp.dispatchKey('1', true, true, p, held, 2000, 1000, 198.0, scopeSens, eff, pkts);
+    assert(log.size() == 1 && log[0].action == TOUCH_DOWN);
+    assert(eff.resetMainView && eff.reactivateJoystick);
+    held[VK_LSHIFT] = false;
+    disp.tick(p, 240.0, pkts);
+    log.clear();
+
     disp.dispatchKey(VK_CUSTOM_MWHEEL_UP, true, true, p, held, 2000, 1000, 200.0, scopeSens, eff, pkts);
     assert(log.size() == 1 && log[0].action == TOUCH_DOWN);
     // Second fast scroll notch lifts & re-taps cleanly
@@ -353,14 +449,19 @@ static void testInputEngineIntegration() {
     assert(engine.onKeyEvent(VK_LSHIFT, true, reqToggle) && reqToggle);
     engine.onKeyEvent(VK_LSHIFT, false, reqToggle);
 
-    // Live worker thread: unlocked WASD/KB + concurrent mouse/KB/scroll
+    // Live worker thread: unlocked WASD/KB, cursor scroll-drag, bounded 0..9 pool & concurrent mouse/KB/scroll
+    std::vector<RecordedTouch> engineLog;
+    engine.setTouchSinkForTest(recordTouchCb, &engineLog);
     engine.start();
     engine.setAimMode(false);
     assert(engine.onKeyEvent('W', true, reqToggle) && !reqToggle);
     assert(engine.onKeyEvent(VK_SPACE, true, reqToggle) && !reqToggle);
     assert(!engine.onKeyEvent(VK_LBUTTON, true, reqToggle));
+    // Unlocked cursor scroll-wheel drag (downward scroll drags finger upward & auto-releases after 80ms)
+    engine.onDirectCursorScroll(0.50f, 0.50f, -1);
     Sleep(15);
     assert(engine.getTelemetry().joyDown == true);
+    Sleep(95); // allow 80ms cursor scroll auto-release to fire
 
     engine.setAimMode(true);
     for (int i = 0; i < 20; ++i) {
@@ -379,11 +480,23 @@ static void testInputEngineIntegration() {
     engine.onKeyEvent('W', false, reqToggle);
     engine.onKeyEvent(VK_SPACE, false, reqToggle);
     engine.stop();
-    std::printf("[Test] InputEngine integration (LShift toggle, unlocked KB/WASD, concurrent KB+mouse+scroll) OK!\n");
+
+    // Every emitted touch packet across joystick, scroll-drag, buttons, and FPS aim MUST stay strictly in 0..9!
+    assert(!engineLog.empty());
+    bool sawScrollDragMove = false;
+    for (size_t i = 0; i < engineLog.size(); ++i) {
+        assert(engineLog[i].ptrId < 10);
+        if (engineLog[i].action == TOUCH_MOVE && engineLog[i].px == 960 && engineLog[i].py < 540) {
+            sawScrollDragMove = true;
+        }
+    }
+    assert(sawScrollDragMove);
+    std::printf("[Test] InputEngine integration (0..9 pool, cursor scroll-drag, LShift toggle, unlocked KB/WASD) OK!\n");
 }
 
 int main() {
     testSpsParser();
+    testTouchFingerPool();
     testProfileRoundTrip();
     testStudioPanelMouseAndScrollRebind();
     testJoystickAndActionModules();

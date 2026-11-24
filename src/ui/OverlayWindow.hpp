@@ -106,6 +106,8 @@ private:
     bool hadForeground_ = false;
     bool cursorHidden_ = false;
     bool cursorDirectDragging_ = false;
+    POINT lastUnlockedCursorPt_;
+    bool hasLastUnlockedCursorPt_ = false;
 
     bool floatBallHookPressed_ = false;
     bool floatBallHookMoved_ = false;

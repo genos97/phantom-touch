@@ -154,6 +154,21 @@ bool KeyCodes::matches(int eventVk, int targetVk) {
     if (targetVk == VK_SHIFT   && (eventVk == VK_LSHIFT   || eventVk == VK_RSHIFT))   return true;
     if (targetVk == VK_CONTROL && (eventVk == VK_LCONTROL || eventVk == VK_RCONTROL)) return true;
     if (targetVk == VK_MENU    && (eventVk == VK_LMENU    || eventVk == VK_RMENU))    return true;
+    if (eventVk  == VK_SHIFT   && (targetVk == VK_LSHIFT  || targetVk == VK_RSHIFT))  return true;
+    if (eventVk  == VK_CONTROL && (targetVk == VK_LCONTROL|| targetVk == VK_RCONTROL))return true;
+    if (eventVk  == VK_MENU    && (targetVk == VK_LMENU   || targetVk == VK_RMENU))   return true;
+    return false;
+}
+
+bool KeyCodes::isKeyHeld(const bool heldKeys[512], int targetVk) {
+    if (targetVk <= 0 || targetVk >= 512) return false;
+    if (heldKeys[targetVk]) return true;
+    if (targetVk == VK_SHIFT)   return heldKeys[VK_LSHIFT]   || heldKeys[VK_RSHIFT];
+    if (targetVk == VK_CONTROL) return heldKeys[VK_LCONTROL] || heldKeys[VK_RCONTROL];
+    if (targetVk == VK_MENU)    return heldKeys[VK_LMENU]    || heldKeys[VK_RMENU];
+    if (targetVk == VK_LSHIFT   || targetVk == VK_RSHIFT)   return heldKeys[VK_SHIFT];
+    if (targetVk == VK_LCONTROL || targetVk == VK_RCONTROL) return heldKeys[VK_CONTROL];
+    if (targetVk == VK_LMENU    || targetVk == VK_RMENU)    return heldKeys[VK_MENU];
     return false;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bridge/ScrcpyBridge.hpp"
+#include "bridge/TouchFingerPool.hpp"
 #include "config/Profile.hpp"
 #include "engine/ActionDispatcher.hpp"
 #include "engine/FpsViewController.hpp"
@@ -49,9 +50,13 @@ public:
     bool onKeyEvent(int vk, bool down, bool& outRequestToggleAim);
     bool isKeyMapped(int vk, bool aimModeActive) const;
     void onDirectCursorTouch(TouchAction action, float normX, float normY);
+    void onDirectCursorScroll(float normX, float normY, int wheelNotches);
 
     void releaseAllTouches();
     void resetAimView();
+
+    // Optional downstream sink override (for unit tests verifying 0..9 finger pool output)
+    void setTouchSinkForTest(TouchEmitFn fn, void* ctx);
 
     EngineTelemetry getTelemetry() const;
 
@@ -68,6 +73,12 @@ private:
         float normY;
     };
 
+    struct QueuedCursorScroll {
+        float normX;
+        float normY;
+        int notches;
+    };
+
     struct KeyRouteEntry {
         int comboVk;
         int vk;
@@ -77,6 +88,8 @@ private:
     static DWORD WINAPI tickThreadProc(LPVOID param);
     static void emitTouchToBridge(void* ctx, TouchAction action, uint64_t pointerId,
                                   int32_t px, int32_t py, bool clampToScreen);
+    static void emitTouchThroughPool(void* ctx, TouchAction action, uint64_t logicalId,
+                                     int32_t px, int32_t py, bool clampToScreen);
 
     void runLoop();
     void processTick(double nowMs);
@@ -85,6 +98,8 @@ private:
     bool classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim);
     void processKeyEventLocked(int vk, bool down, double nowMs);
     void processDirectCursorLocked(TouchAction action, float normX, float normY);
+    void processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs);
+    void releaseCursorScrollLocked();
 
     void pressFireLocked(double nowMs);
     void liftFireFingerLocked();
@@ -105,6 +120,7 @@ private:
     // Non-blocking hook input queues & route cache (protected by inputLock_)
     std::vector<QueuedKeyEvent> pendingKeys_;
     std::vector<QueuedCursorTouch> pendingCursor_;
+    std::vector<QueuedCursorScroll> pendingScroll_;
     bool hookHeldKeys_[512];
     int routeVkUp_ = 'W', routeVkDown_ = 'S', routeVkLeft_ = 'A', routeVkRight_ = 'D';
     int routeVkSprint_ = 0xA0, routeVkWalk_ = 0xA2, routeFireVk_ = 0x01;
@@ -118,8 +134,17 @@ private:
     double smoothDy_ = 0.0;
     bool scopeSensActive_ = false;
     bool directCursorDown_ = false;
+    int32_t directCursorLastX_ = 0;
+    int32_t directCursorLastY_ = 0;
 
-    // Modular sub-controllers
+    // Unlocked cursor scroll-wheel virtual touch drag (auto-releases after 80ms idle)
+    bool cursorScrollDown_ = false;
+    double cursorScrollCurX_ = 0.0;
+    double cursorScrollCurY_ = 0.0;
+    double cursorScrollReleaseAtMs_ = 0.0;
+
+    // Modular sub-controllers & bounded 0..9 Android virtual finger pool
+    TouchFingerPool fingerPool_;
     FpsViewStack viewStack_;
     JoystickController joystick_;
     ActionDispatcher actions_;

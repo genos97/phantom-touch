@@ -143,6 +143,14 @@ void ActionDispatcher::triggerStart(size_t idx, bool isAimMode, const Profile& p
         default:
             break;
     }
+
+    // Optional per-node add-on effects (e.g. Scope + resetView, Vault/Jump + reactivateJoy)
+    if (b.resetView && b.action != NODE_RESET_VIEW) {
+        outEffects.resetMainView = true;
+    }
+    if (b.reactivateJoy && b.action != NODE_REACTIVATE_JOY) {
+        outEffects.reactivateJoystick = true;
+    }
 }
 
 void ActionDispatcher::triggerStop(size_t idx, const Profile& profile,
@@ -174,6 +182,7 @@ void ActionDispatcher::triggerStop(size_t idx, const Profile& profile,
             st.touchDown = true;
             st.autoReleaseAtMs = nowMs + static_cast<double>(b.durationMs > 0 ? b.durationMs : 35);
             if (b.switchScopeSens) ioScopeSensActive = false;
+            if (b.resetView) outEffects.resetMainView = true;
             break;
         }
         case NODE_UP_TRIGGER: {
@@ -184,6 +193,8 @@ void ActionDispatcher::triggerStop(size_t idx, const Profile& profile,
                               screenW, screenH, st.lastPx, st.lastPy, outPacketsSent);
             st.touchDown = true;
             st.autoReleaseAtMs = nowMs + static_cast<double>(b.durationMs > 0 ? b.durationMs : 35);
+            if (b.resetView) outEffects.resetMainView = true;
+            if (b.reactivateJoy) outEffects.reactivateJoystick = true;
             break;
         }
         case NODE_HOLD_VIEW: {
@@ -206,15 +217,16 @@ void ActionDispatcher::dispatchKey(int vk, bool down, bool isAimMode,
                                    const Profile& profile, const bool heldKeys[512],
                                    uint32_t screenW, uint32_t screenH, double nowMs,
                                    bool& ioScopeSensActive, ActionEffects& outEffects,
-                                   uint32_t& outPacketsSent) {
+                                   uint32_t& outPacketsSent, bool toggleOnly) {
     bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
 
     if (down) {
         bool comboMatched = false;
         for (size_t i = 0; i < profile.buttons.size() && i < states_.size(); ++i) {
             const KeyNode& b = profile.buttons[i];
+            if (toggleOnly && b.action != NODE_CURSOR_TOGGLE) continue;
             if (!isAimMode && b.action == NODE_HOLD_VIEW) continue;
-            if (b.comboVk != 0 && KeyCodes::matches(vk, b.vk) && b.comboVk < 512 && heldKeys[b.comboVk]) {
+            if (b.comboVk != 0 && KeyCodes::matches(vk, b.vk) && KeyCodes::isKeyHeld(heldKeys, b.comboVk)) {
                 triggerStart(i, isAimMode, profile, screenW, screenH, nowMs,
                              ioScopeSensActive, outEffects, outPacketsSent);
                 if (isWheel || b.action == NODE_CURSOR_TOGGLE) states_[i].keyHeld = false;
@@ -224,6 +236,7 @@ void ActionDispatcher::dispatchKey(int vk, bool down, bool isAimMode,
         if (!comboMatched) {
             for (size_t i = 0; i < profile.buttons.size() && i < states_.size(); ++i) {
                 const KeyNode& b = profile.buttons[i];
+                if (toggleOnly && b.action != NODE_CURSOR_TOGGLE) continue;
                 if (!isAimMode && b.action == NODE_HOLD_VIEW) continue;
                 if (b.comboVk == 0 && KeyCodes::matches(vk, b.vk)) {
                     triggerStart(i, isAimMode, profile, screenW, screenH, nowMs,

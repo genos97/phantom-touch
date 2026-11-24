@@ -497,7 +497,7 @@ void StudioPanel::paintTabAdvanced(HDC hdc, int x, int y, int w,
     }
     cy += 34;
 
-    drawSeg2("WASD Joystick:", "FF 3-Step Glide", "Instant Jump", p.joySteppedGlide, PA_JOY_GLIDE, PA_JOY_INSTANT);
+    drawSeg2("WASD Joystick:", "FF 3-Step Glide", "Fast 3-Step (24ms)", p.joySteppedGlide, PA_JOY_GLIDE, PA_JOY_INSTANT);
 
     // Invert Y toggle
     SelectObject(hdc, fS);

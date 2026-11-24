@@ -35,6 +35,20 @@ void InputEngine::emitTouchToBridge(void* ctx, TouchAction action, uint64_t poin
     }
 }
 
+void InputEngine::emitTouchThroughPool(void* ctx, TouchAction action, uint64_t logicalId,
+                                       int32_t px, int32_t py, bool clampToScreen) {
+    InputEngine* self = reinterpret_cast<InputEngine*>(ctx);
+    if (self) {
+        self->fingerPool_.emit(action, logicalId, px, py, clampToScreen);
+    }
+}
+
+void InputEngine::setTouchSinkForTest(TouchEmitFn fn, void* ctx) {
+    EnterCriticalSection(&lock_);
+    fingerPool_.setDownstreamSink(fn ? fn : emitTouchToBridge, fn ? ctx : bridge_);
+    LeaveCriticalSection(&lock_);
+}
+
 InputEngine::InputEngine(ScrcpyBridge* bridge)
     : bridge_(bridge),
       viewStack_(PointerId::AIM_A, PointerId::AIM_B, PointerId::HOLD_VIEW) {
@@ -46,9 +60,10 @@ InputEngine::InputEngine(ScrcpyBridge* bridge)
 
     profile_ = ProfileDefaults::createFreeFire();
 
-    viewStack_.setTouchSink(emitTouchToBridge, bridge_);
-    joystick_.setTouchSink(emitTouchToBridge, bridge_);
-    actions_.setTouchSink(emitTouchToBridge, bridge_);
+    fingerPool_.setDownstreamSink(emitTouchToBridge, bridge_);
+    viewStack_.setTouchSink(emitTouchThroughPool, this);
+    joystick_.setTouchSink(emitTouchThroughPool, this);
+    actions_.setTouchSink(emitTouchThroughPool, this);
     actions_.resetForProfile(profile_.buttons.size());
 
     uint32_t w = 1920, h = 1080;
@@ -167,6 +182,7 @@ void InputEngine::setProfile(const Profile& profile) {
     EnterCriticalSection(&inputLock_);
     pendingKeys_.clear();
     pendingCursor_.clear();
+    pendingScroll_.clear();
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
     rebuildKeyRouteCacheLocked();
     LeaveCriticalSection(&inputLock_);
@@ -200,6 +216,7 @@ void InputEngine::setAimMode(bool enabled) {
     accumRawDx_ = 0.0;
     accumRawDy_ = 0.0;
     pendingCursor_.clear();
+    pendingScroll_.clear();
     LeaveCriticalSection(&inputLock_);
     smoothDx_ = 0.0;
     smoothDy_ = 0.0;
@@ -236,22 +253,108 @@ void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float nor
     if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
+void InputEngine::onDirectCursorScroll(float normX, float normY, int wheelNotches) {
+    if (aimMode_ || wheelNotches == 0) return;
+    double nowMs = getTimeMs();
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        processDirectCursorScrollLocked(normX, normY, wheelNotches, nowMs);
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+    EnterCriticalSection(&inputLock_);
+    if (!pendingScroll_.empty()) {
+        pendingScroll_.back().normX = normX;
+        pendingScroll_.back().normY = normY;
+        pendingScroll_.back().notches += wheelNotches;
+    } else {
+        QueuedCursorScroll q = { normX, normY, wheelNotches };
+        pendingScroll_.push_back(q);
+    }
+    LeaveCriticalSection(&inputLock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
 void InputEngine::processDirectCursorLocked(TouchAction action, float normX, float normY) {
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    int32_t px = static_cast<int32_t>(normX * static_cast<float>(w) + 0.5f);
+    int32_t py = static_cast<int32_t>(normY * static_cast<float>(h) + 0.5f);
+
     if (action == TOUCH_DOWN) {
         directCursorDown_ = true;
-        bridge_->sendTouchNorm(TOUCH_DOWN, PointerId::CURSOR, normX, normY);
+        directCursorLastX_ = px;
+        directCursorLastY_ = py;
+        fingerPool_.emit(TOUCH_DOWN, PointerId::CURSOR, px, py, true);
         ++packetsThisSec_;
     } else if (action == TOUCH_MOVE) {
         if (directCursorDown_) {
-            bridge_->sendTouchNorm(TOUCH_MOVE, PointerId::CURSOR, normX, normY);
-            ++packetsThisSec_;
+            directCursorLastX_ = px;
+            directCursorLastY_ = py;
+            if (fingerPool_.emit(TOUCH_MOVE, PointerId::CURSOR, px, py, true)) {
+                ++packetsThisSec_;
+            }
         }
     } else if (action == TOUCH_UP) {
         if (directCursorDown_) {
             directCursorDown_ = false;
-            bridge_->sendTouchNorm(TOUCH_UP, PointerId::CURSOR, normX, normY);
+            directCursorLastX_ = px;
+            directCursorLastY_ = py;
+            fingerPool_.emit(TOUCH_UP, PointerId::CURSOR, px, py, true);
             ++packetsThisSec_;
         }
+    }
+}
+
+void InputEngine::processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs) {
+    if (wheelNotches == 0) return;
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    double dw = static_cast<double>(w > 0 ? w : 1920);
+    double dh = static_cast<double>(h > 0 ? h : 1080);
+
+    double anchorX = clampd(static_cast<double>(normX) * dw, 10.0, dw - 11.0);
+    double anchorY = clampd(static_cast<double>(normY) * dh, 10.0, dh - 11.0);
+    double stepPx = static_cast<double>(profile_.cursorScrollStepPx > 0 ? profile_.cursorScrollStepPx : 95);
+    double dy = static_cast<double>(wheelNotches) * stepPx;
+
+    if (cursorScrollDown_) {
+        // Re-anchor smoothly if cursor jumped far away or drag hit top/bottom screen edge
+        double targetY = cursorScrollCurY_ + dy;
+        bool hitEdge = (targetY <= 8.0 && dy < 0.0) || (targetY >= dh - 9.0 && dy > 0.0);
+        bool movedFar = (std::fabs(anchorX - cursorScrollCurX_) > dw * 0.15);
+        if (hitEdge || movedFar) {
+            releaseCursorScrollLocked();
+        }
+    }
+
+    if (!cursorScrollDown_) {
+        cursorScrollCurX_ = anchorX;
+        cursorScrollCurY_ = anchorY;
+        int32_t sx = static_cast<int32_t>(std::floor(cursorScrollCurX_ + 0.5));
+        int32_t sy = static_cast<int32_t>(std::floor(cursorScrollCurY_ + 0.5));
+        fingerPool_.emit(TOUCH_DOWN, PointerId::SCROLL, sx, sy, true);
+        cursorScrollDown_ = true;
+        ++packetsThisSec_;
+    }
+
+    cursorScrollCurY_ = clampd(cursorScrollCurY_ + dy, 8.0, dh - 9.0);
+    int32_t mx = static_cast<int32_t>(std::floor(cursorScrollCurX_ + 0.5));
+    int32_t my = static_cast<int32_t>(std::floor(cursorScrollCurY_ + 0.5));
+    if (fingerPool_.emit(TOUCH_MOVE, PointerId::SCROLL, mx, my, true)) {
+        ++packetsThisSec_;
+    }
+    cursorScrollReleaseAtMs_ = nowMs + 80.0;
+}
+
+void InputEngine::releaseCursorScrollLocked() {
+    if (cursorScrollDown_) {
+        int32_t ux = static_cast<int32_t>(std::floor(cursorScrollCurX_ + 0.5));
+        int32_t uy = static_cast<int32_t>(std::floor(cursorScrollCurY_ + 0.5));
+        fingerPool_.emit(TOUCH_UP, PointerId::SCROLL, ux, uy, true);
+        cursorScrollDown_ = false;
+        cursorScrollReleaseAtMs_ = 0.0;
+        ++packetsThisSec_;
     }
 }
 
@@ -281,7 +384,7 @@ bool InputEngine::classifyKeyInputLocked(int vk, bool down, bool isAim, bool& ou
     bool hasToggleBtn = false;
     for (size_t i = 0; i < routeButtons_.size(); ++i) {
         const KeyRouteEntry& e = routeButtons_[i];
-        bool comboActive = (e.comboVk != 0 && KeyCodes::matches(vk, e.vk) && e.comboVk < 512 && hookHeldKeys_[e.comboVk]);
+        bool comboActive = (e.comboVk != 0 && KeyCodes::matches(vk, e.vk) && KeyCodes::isKeyHeld(hookHeldKeys_, e.comboVk));
         bool singleMatch = (e.comboVk == 0 && KeyCodes::matches(vk, e.vk));
         bool prefixRelease = (!down && e.comboVk != 0 && KeyCodes::matches(vk, e.comboVk));
         if (comboActive || singleMatch || prefixRelease) {
@@ -382,21 +485,24 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
 
-    // Cursor Mode: mouse buttons only trigger NODE_CURSOR_TOGGLE; all keyboard keys remain active!
+    // Cursor Mode: mouse buttons ONLY trigger NODE_CURSOR_TOGGLE; all keyboard keys remain active!
     if (!isAim && mouseBtn) {
         if (down) {
             ActionEffects eff;
             actions_.dispatchKey(vk, true, false, profile_, heldKeys_, w, h, nowMs,
-                                 scopeSensActive_, eff, packetsThisSec_);
+                                 scopeSensActive_, eff, packetsThisSec_, true);
         }
         return;
     }
 
-    // 1. Check if an explicit button owns vk (so BAG=LSHIFT / CROUCH=LCTRL wins over Sprint/Walk)
+    // 1. Check if an explicit button or active 2-key combo owns vk (so BAG=LSHIFT / CROUCH=LCTRL wins over Sprint/Walk)
     bool hasCustomButtonOnVk = false;
     for (size_t i = 0; i < profile_.buttons.size(); ++i) {
-        if (profile_.buttons[i].comboVk == 0 && KeyCodes::matches(vk, profile_.buttons[i].vk)) {
-            if (!isAim && profile_.buttons[i].action == NODE_HOLD_VIEW) continue;
+        const KeyNode& b = profile_.buttons[i];
+        bool keyMatches = KeyCodes::matches(vk, b.vk) &&
+                          (b.comboVk == 0 || KeyCodes::isKeyHeld(heldKeys_, b.comboVk));
+        if (keyMatches) {
+            if (!isAim && b.action == NODE_HOLD_VIEW) continue;
             hasCustomButtonOnVk = true;
             break;
         }
@@ -510,7 +616,7 @@ void InputEngine::pressFireLocked(double /*nowMs*/) {
 
     int32_t px = static_cast<int32_t>(std::floor(fireCurX_ + 0.5));
     int32_t py = static_cast<int32_t>(std::floor(fireCurY_ + 0.5));
-    bridge_->sendTouchPixels(TOUCH_DOWN, PointerId::FIRE, px, py, true);
+    fingerPool_.emit(TOUCH_DOWN, PointerId::FIRE, px, py, true);
     fireDown_ = true;
     fireStartX_ = px;
     fireStartY_ = py;
@@ -524,7 +630,7 @@ void InputEngine::liftFireFingerLocked() {
         int32_t dx = fireLastSentX_ - fireStartX_;
         int32_t dy = fireLastSentY_ - fireStartY_;
         bool unclamped = (profile_.fireMode != FIRE_MODE_CLAW_LEFT && profile_.unboundedAim);
-        bridge_->sendTouchPixels(TOUCH_UP, PointerId::FIRE, fireLastSentX_, fireLastSentY_, !unclamped);
+        fingerPool_.emit(TOUCH_UP, PointerId::FIRE, fireLastSentX_, fireLastSentY_, !unclamped);
         fireDown_ = false;
         fireLastSentX_ = -1;
         fireLastSentY_ = -1;
@@ -552,9 +658,10 @@ void InputEngine::releaseMouseTouchesLocked() {
     actions_.releaseButtons(profile_, true, packetsThisSec_);
 
     if (directCursorDown_) {
-        bridge_->sendTouchNorm(TOUCH_UP, PointerId::CURSOR, 0.5f, 0.5f);
+        fingerPool_.emit(TOUCH_UP, PointerId::CURSOR, directCursorLastX_, directCursorLastY_, true);
         directCursorDown_ = false;
     }
+    releaseCursorScrollLocked();
 }
 
 void InputEngine::releaseAllLocked() {
@@ -562,6 +669,8 @@ void InputEngine::releaseAllLocked() {
     joystick_.release(packetsThisSec_);
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     actions_.releaseButtons(profile_, false, packetsThisSec_);
+    // Final bounded-pool safety sweep: guarantees 0 active touches left on the phone
+    fingerPool_.releaseAll();
 }
 
 void InputEngine::releaseAllTouches() {
@@ -570,6 +679,7 @@ void InputEngine::releaseAllTouches() {
     EnterCriticalSection(&inputLock_);
     pendingKeys_.clear();
     pendingCursor_.clear();
+    pendingScroll_.clear();
     accumRawDx_ = 0.0;
     accumRawDy_ = 0.0;
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
@@ -589,9 +699,11 @@ void InputEngine::resetAimView() {
 void InputEngine::processTick(double nowMs) {
     std::vector<QueuedKeyEvent> localKeys;
     std::vector<QueuedCursorTouch> localCursor;
+    std::vector<QueuedCursorScroll> localScroll;
     EnterCriticalSection(&inputLock_);
     if (!pendingKeys_.empty()) localKeys.swap(pendingKeys_);
     if (!pendingCursor_.empty()) localCursor.swap(pendingCursor_);
+    if (!pendingScroll_.empty()) localScroll.swap(pendingScroll_);
     LeaveCriticalSection(&inputLock_);
 
     EnterCriticalSection(&lock_);
@@ -602,6 +714,9 @@ void InputEngine::processTick(double nowMs) {
         lastStatMs_ = nowMs;
     }
 
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+
     for (size_t i = 0; i < localKeys.size(); ++i) {
         processKeyEventLocked(localKeys[i].vk, localKeys[i].down, nowMs);
     }
@@ -610,9 +725,19 @@ void InputEngine::processTick(double nowMs) {
             processDirectCursorLocked(localCursor[i].action, localCursor[i].normX, localCursor[i].normY);
         }
     }
+    for (size_t i = 0; i < localScroll.size(); ++i) {
+        if (!aimMode_) {
+            processDirectCursorScrollLocked(localScroll[i].normX, localScroll[i].normY,
+                                            localScroll[i].notches, nowMs);
+        }
+    }
 
     actions_.tick(profile_, nowMs, packetsThisSec_);
-    joystick_.tick(nowMs, packetsThisSec_);
+    joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
+
+    if (cursorScrollDown_ && (aimMode_ || nowMs >= cursorScrollReleaseAtMs_)) {
+        releaseCursorScrollLocked();
+    }
 
     if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {
         pendingFireDown_ = false;
@@ -636,8 +761,6 @@ void InputEngine::processTick(double nowMs) {
     accumRawDy_ = 0.0;
     LeaveCriticalSection(&inputLock_);
 
-    uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
     if (w != lastConfiguredW_ || h != lastConfiguredH_) {
         syncFpsViewConfigLocked(w, h);
     }
@@ -717,7 +840,7 @@ void InputEngine::processTick(double nowMs) {
         int32_t px = static_cast<int32_t>(std::floor(fireCurX_ + 0.5));
         int32_t py = static_cast<int32_t>(std::floor(fireCurY_ + 0.5));
         if (px != fireLastSentX_ || py != fireLastSentY_) {
-            bridge_->sendTouchPixels(TOUCH_MOVE, PointerId::FIRE, px, py, !profile_.unboundedAim);
+            fingerPool_.emit(TOUCH_MOVE, PointerId::FIRE, px, py, !profile_.unboundedAim);
             fireLastSentX_ = px;
             fireLastSentY_ = py;
             ++packetsThisSec_;

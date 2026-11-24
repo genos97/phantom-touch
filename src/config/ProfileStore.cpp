@@ -134,6 +134,8 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "float_btn_y") p.floatBtnY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
         else if (key == "panel_x") p.panelX = clampf(static_cast<float>(std::atof(val.c_str())), 0.01f, 0.85f);
         else if (key == "panel_y") p.panelY = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.80f);
+        else if (key == "cursor_remember_pos") p.rememberCursorPos = (val == "1" || toUpper(val) == "TRUE");
+        else if (key == "cursor_scroll_step_px") p.cursorScrollStepPx = clampi(std::atoi(val.c_str()), 20, 400);
 
         else if (key == "aim_x") p.aimX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
         else if (key == "aim_y") p.aimY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
@@ -206,8 +208,10 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
                 }
                 if (parts.size() >= 6) {
                     std::string sf = toUpper(parts[5]);
-                    n.switchScopeSens = (sf == "1" || sf == "TRUE" || sf == "SCOPE");
-                    n.toggleMode = (sf == "TOGGLE");
+                    n.switchScopeSens = (sf == "1" || sf == "TRUE" || sf.find("SCOPE") != std::string::npos);
+                    n.toggleMode      = (sf.find("TOGGLE") != std::string::npos);
+                    n.resetView       = (sf.find("RSTVIEW") != std::string::npos);
+                    n.reactivateJoy   = (sf.find("REJOY") != std::string::npos);
                 }
                 if (parts.size() >= 7) {
                     n.durationMs = clampi(std::atoi(parts[6].c_str()), 10, 2000);
@@ -244,9 +248,11 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "hold_unlock_key = " << KeyCodes::toName(p.holdUnlockVk) << "\n";
     out << "reset_touch_key = " << KeyCodes::toName(p.resetTouchVk) << "\n";
     out << "show_hud_in_play = " << (p.showHudInPlay ? 1 : 0) << "\n";
-    std::snprintf(buf, sizeof(buf), "hud_opacity = %.2f\nfloat_btn_x = %.4f\nfloat_btn_y = %.4f\npanel_x = %.4f\npanel_y = %.4f\n\n",
+    std::snprintf(buf, sizeof(buf), "hud_opacity = %.2f\nfloat_btn_x = %.4f\nfloat_btn_y = %.4f\npanel_x = %.4f\npanel_y = %.4f\n",
                   p.hudOpacity, p.floatBtnX, p.floatBtnY, p.panelX, p.panelY);
     out << buf;
+    out << "cursor_remember_pos = " << (p.rememberCursorPos ? 1 : 0) << "\n";
+    out << "cursor_scroll_step_px = " << p.cursorScrollStepPx << "\n\n";
 
     out << "# --- Aim, View Stack & Free Fire Counter-Acceleration Physics ---\n";
     std::snprintf(buf, sizeof(buf), "aim_x = %.4f\naim_y = %.4f\naim_half_w = %.4f\naim_half_h = %.4f\n",
@@ -293,16 +299,25 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     for (size_t i = 0; i < p.buttons.size(); ++i) {
         const KeyNode& b = p.buttons[i];
         std::string keySpec = KeyCodes::comboToName(b.comboVk, b.vk);
-        if (b.action == NODE_SWIPE) {
-            std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %d, %d, %.4f, %.4f\n",
-                          b.label.c_str(), keySpec.c_str(), b.x, b.y,
-                          ProfileDefaults::actionTypeToName(b.action).c_str(),
-                          b.switchScopeSens ? 1 : 0, b.durationMs, b.x2, b.y2);
+        std::string flagsStr;
+        if (b.toggleMode || b.resetView || b.reactivateJoy) {
+            if (b.switchScopeSens) flagsStr += (flagsStr.empty() ? "" : "|") + std::string("SCOPE");
+            if (b.toggleMode)      flagsStr += (flagsStr.empty() ? "" : "|") + std::string("TOGGLE");
+            if (b.resetView)       flagsStr += (flagsStr.empty() ? "" : "|") + std::string("RSTVIEW");
+            if (b.reactivateJoy)   flagsStr += (flagsStr.empty() ? "" : "|") + std::string("REJOY");
         } else {
-            std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %d, %d\n",
+            flagsStr = b.switchScopeSens ? "1" : "0";
+        }
+        if (b.action == NODE_SWIPE) {
+            std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d, %.4f, %.4f\n",
                           b.label.c_str(), keySpec.c_str(), b.x, b.y,
                           ProfileDefaults::actionTypeToName(b.action).c_str(),
-                          b.switchScopeSens ? 1 : 0, b.durationMs);
+                          flagsStr.c_str(), b.durationMs, b.x2, b.y2);
+        } else {
+            std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d\n",
+                          b.label.c_str(), keySpec.c_str(), b.x, b.y,
+                          ProfileDefaults::actionTypeToName(b.action).c_str(),
+                          flagsStr.c_str(), b.durationMs);
         }
         out << buf;
     }

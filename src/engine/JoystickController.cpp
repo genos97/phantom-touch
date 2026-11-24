@@ -61,12 +61,18 @@ void JoystickController::updateTarget(const Profile& profile, uint32_t screenW, 
 
     if (ix == 0 && iy == 0) {
         glideActive_ = false;
+        pendingReactivate_ = false;
         if (joyDown_) {
             emitTouch(TOUCH_UP, joyLastX_, joyLastY_, outPacketsSent);
             joyDown_ = false;
             joyLastX_ = -1;
             joyLastY_ = -1;
         }
+        return;
+    }
+
+    if (pendingReactivate_) {
+        // Wait for the clean >=15ms lift gap before re-planting
         return;
     }
 
@@ -104,9 +110,10 @@ void JoystickController::updateTarget(const Profile& profile, uint32_t screenW, 
     }
 
     if (profile.joySteppedGlide) {
-        // Free Fire smooth 3-stage stepped glide:
+        // Free Fire smooth 4-stage stepped glide:
         // Stage 0 (+8ms): center settle, Stage 1 (+15ms): 20%, Stage 2 (+15ms): 50%, Stage 3 (+15ms): 100%
         glideActive_ = true;
+        glideIsFreeFire_ = true;
         glideStartX_ = joyCurX_;
         glideStartY_ = joyCurY_;
         glideTargetX_ = targetX;
@@ -114,56 +121,99 @@ void JoystickController::updateTarget(const Profile& profile, uint32_t screenW, 
         glideStage_ = firstDown ? 0 : 1;
         glideNextMs_ = nowMs + (firstDown ? 8.0 : 10.0);
     } else {
-        glideActive_ = false;
-        joyCurX_ = targetX;
-        joyCurY_ = targetY;
-        int32_t tx = static_cast<int32_t>(std::floor(targetX + 0.5));
-        int32_t ty = static_cast<int32_t>(std::floor(targetY + 0.5));
-        if (tx != joyLastX_ || ty != joyLastY_) {
-            emitTouch(TOUCH_MOVE, tx, ty, outPacketsSent);
-            joyLastX_ = tx;
-            joyLastY_ = ty;
-        }
+        // Fast 3-step 8ms glide (24ms total) so non-FF games never drop zero-ms thumb teleports
+        glideActive_ = true;
+        glideIsFreeFire_ = false;
+        glideStartX_ = joyCurX_;
+        glideStartY_ = joyCurY_;
+        glideTargetX_ = targetX;
+        glideTargetY_ = targetY;
+        glideStage_ = 0;
+        glideNextMs_ = nowMs + 8.0;
     }
 }
 
-void JoystickController::tick(double nowMs, uint32_t& outPacketsSent) {
+void JoystickController::tick(const Profile& profile, uint32_t screenW, uint32_t screenH,
+                              double nowMs, uint32_t& outPacketsSent) {
+    if (pendingReactivate_) {
+        if (nowMs >= reactivateAtMs_) {
+            pendingReactivate_ = false;
+            updateTarget(profile, screenW, screenH, nowMs, outPacketsSent);
+        }
+        return;
+    }
+
     if (!glideActive_ || !joyDown_) return;
     if (nowMs < glideNextMs_) return;
 
-    static const double kRatios[4] = { 0.0, 0.20, 0.50, 1.00 };
-    double r = kRatios[glideStage_];
-    joyCurX_ = glideStartX_ + (glideTargetX_ - glideStartX_) * r;
-    joyCurY_ = glideStartY_ + (glideTargetY_ - glideStartY_) * r;
+    if (glideIsFreeFire_) {
+        static const double kFfRatios[4] = { 0.0, 0.20, 0.50, 1.00 };
+        double r = kFfRatios[glideStage_];
+        joyCurX_ = glideStartX_ + (glideTargetX_ - glideStartX_) * r;
+        joyCurY_ = glideStartY_ + (glideTargetY_ - glideStartY_) * r;
 
-    int32_t px = static_cast<int32_t>(std::floor(joyCurX_ + 0.5));
-    int32_t py = static_cast<int32_t>(std::floor(joyCurY_ + 0.5));
-    emitTouch(TOUCH_MOVE, px, py, outPacketsSent);
-    joyLastX_ = px;
-    joyLastY_ = py;
+        int32_t px = static_cast<int32_t>(std::floor(joyCurX_ + 0.5));
+        int32_t py = static_cast<int32_t>(std::floor(joyCurY_ + 0.5));
+        emitTouch(TOUCH_MOVE, px, py, outPacketsSent);
+        joyLastX_ = px;
+        joyLastY_ = py;
 
-    ++glideStage_;
-    if (glideStage_ >= 4) {
-        glideActive_ = false;
+        ++glideStage_;
+        if (glideStage_ >= 4) {
+            glideActive_ = false;
+        } else {
+            glideNextMs_ = nowMs + 15.0;
+        }
     } else {
-        glideNextMs_ = nowMs + 15.0;
+        static const double kFastRatios[3] = { 0.3333, 0.6667, 1.00 };
+        double r = kFastRatios[glideStage_];
+        joyCurX_ = glideStartX_ + (glideTargetX_ - glideStartX_) * r;
+        joyCurY_ = glideStartY_ + (glideTargetY_ - glideStartY_) * r;
+
+        int32_t px = static_cast<int32_t>(std::floor(joyCurX_ + 0.5));
+        int32_t py = static_cast<int32_t>(std::floor(joyCurY_ + 0.5));
+        emitTouch(TOUCH_MOVE, px, py, outPacketsSent);
+        joyLastX_ = px;
+        joyLastY_ = py;
+
+        ++glideStage_;
+        if (glideStage_ >= 3) {
+            glideActive_ = false;
+        } else {
+            glideNextMs_ = nowMs + 8.0;
+        }
     }
 }
 
 void JoystickController::reactivate(const Profile& profile, uint32_t screenW, uint32_t screenH,
                                     double nowMs, uint32_t& outPacketsSent) {
     glideActive_ = false;
+    bool wasDown = joyDown_;
     if (joyDown_) {
         emitTouch(TOUCH_UP, joyLastX_, joyLastY_, outPacketsSent);
         joyDown_ = false;
         joyLastX_ = -1;
         joyLastY_ = -1;
     }
-    updateTarget(profile, screenW, screenH, nowMs, outPacketsSent);
+    bool hasDir = (keyUp_ != keyDown_) || (keyLeft_ != keyRight_);
+    if (!hasDir) {
+        pendingReactivate_ = false;
+        return;
+    }
+    if (wasDown) {
+        // Non-blocking >=15ms lift gap so the game registers thumb lift -> clean re-engage
+        double gapMs = static_cast<double>(profile.touchDownDelayMs >= 15 ? profile.touchDownDelayMs : 15);
+        pendingReactivate_ = true;
+        reactivateAtMs_ = nowMs + gapMs;
+    } else {
+        pendingReactivate_ = false;
+        updateTarget(profile, screenW, screenH, nowMs, outPacketsSent);
+    }
 }
 
 void JoystickController::release(uint32_t& outPacketsSent) {
     glideActive_ = false;
+    pendingReactivate_ = false;
     if (joyDown_) {
         emitTouch(TOUCH_UP, joyLastX_, joyLastY_, outPacketsSent);
         joyDown_ = false;

@@ -18,10 +18,11 @@ public:
                    const Profile& profile, uint32_t screenW, uint32_t screenH,
                    double nowMs, uint32_t& outPacketsSent);
 
-    // Steps the 3-stage smooth glide ramp when active
-    void tick(double nowMs, uint32_t& outPacketsSent);
+    // Steps smooth glide interpolation & delayed anti-stuck reactivation
+    void tick(const Profile& profile, uint32_t screenW, uint32_t screenH,
+              double nowMs, uint32_t& outPacketsSent);
 
-    // Releases and cleanly re-engages the virtual joystick finger (anti-stuck)
+    // Lifts and schedules clean non-blocking re-engagement (>=15ms gap)
     void reactivate(const Profile& profile, uint32_t screenW, uint32_t screenH,
                     double nowMs, uint32_t& outPacketsSent);
 
@@ -54,10 +55,14 @@ private:
     int32_t joyLastY_ = -1;
 
     bool glideActive_ = false;
+    bool glideIsFreeFire_ = true;
     int glideStage_ = 0;
     double glideStartX_ = 0.0;
     double glideStartY_ = 0.0;
     double glideTargetX_ = 0.0;
     double glideTargetY_ = 0.0;
     double glideNextMs_ = 0.0;
+
+    bool pendingReactivate_ = false;
+    double reactivateAtMs_ = 0.0;
 };

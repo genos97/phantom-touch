@@ -27,11 +27,12 @@ public:
     void resetForProfile(size_t buttonCount);
 
     // Executes a key/mouse/wheel press or release across profile.buttons
+    // When toggleOnly is true (unlocked mouse buttons), only NODE_CURSOR_TOGGLE fires.
     void dispatchKey(int vk, bool down, bool isAimMode,
                      const Profile& profile, const bool heldKeys[512],
                      uint32_t screenW, uint32_t screenH, double nowMs,
                      bool& ioScopeSensActive, ActionEffects& outEffects,
-                     uint32_t& outPacketsSent);
+                     uint32_t& outPacketsSent, bool toggleOnly = false);
 
     // Steps scheduled auto-release taps and smooth directional swipes
     void tick(const Profile& profile, double nowMs, uint32_t& outPacketsSent);

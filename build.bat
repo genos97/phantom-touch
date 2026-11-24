@@ -8,6 +8,7 @@ g++ -std=c++11 -O2 -Wall -Wextra ^
     src\app\main.cpp ^
     src\app\Application.cpp ^
     src\bridge\SpsParser.cpp ^
+    src\bridge\TouchFingerPool.cpp ^
     src\bridge\ScrcpyBridge.cpp ^
     src\config\KeyCodes.cpp ^
     src\config\Profile.cpp ^

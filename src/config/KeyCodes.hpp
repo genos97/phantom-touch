@@ -17,6 +17,9 @@ public:
     // Matches generic Shift/Ctrl/Alt (0x10/0x11/0x12) against left/right side VKs (0xA0..0xA5)
     static bool matches(int eventVk, int targetVk);
 
+    // Checks whether targetVk (or its matching generic/side modifier) is held in heldKeys[512]
+    static bool isKeyHeld(const bool heldKeys[512], int targetVk);
+
     // Normalizes WM_KEYDOWN generic Shift/Ctrl/Alt to the exact physical side VK_L*/VK_R*
     static int normalizeModifier(int vk);
 

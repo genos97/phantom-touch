@@ -37,6 +37,8 @@ struct KeyNode {
     float radius = 0.030f;           // Visual badge radius
     bool switchScopeSens = false;    // Also toggles/activates scopeSensX/Y
     bool toggleMode = false;         // For NODE_SWITCH_SENS: false = hold, true = toggle
+    bool resetView = false;          // Optional add-on: also cleanly resets main camera finger
+    bool reactivateJoy = false;      // Optional add-on: cleanly lifts & re-engages WASD joystick
 };
 
 struct Profile {
@@ -54,6 +56,8 @@ struct Profile {
     float floatBtnY = 0.280f;
     float panelX = 0.260f;
     float panelY = 0.100f;
+    bool rememberCursorPos = false;  // false = spawn cursor at center on unlock; true = restore last position
+    int cursorScrollStepPx = 95;     // Vertical touch-drag distance per wheel notch in Cursor Mode
 
     // Aim view & Free Fire counter-acceleration physics
     float aimX = 0.620f;
