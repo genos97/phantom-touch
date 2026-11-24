@@ -198,6 +198,10 @@ static void testProfileRoundTrip() {
 
     std::vector<std::string> files = ProfileStore::listProfiles("profiles");
     assert(!files.empty());
+    for (size_t i = 0; i < files.size(); ++i) {
+        assert(files[i].find("\\.") == std::string::npos);
+        assert(files[i].find("\\_") == std::string::npos);
+    }
 
     std::remove(tmpPath.c_str());
     std::printf("[Test] ProfileStore + AppSettings atomic save, blank reload & safe creation OK (%u nodes, %u profiles)\n",

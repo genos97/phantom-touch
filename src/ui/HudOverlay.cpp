@@ -5,7 +5,9 @@
 
 namespace {
 
-static const COLORREF kTransparentKey = RGB(255, 0, 255);
+// Near-black color key prevents purple/magenta fringing around crisp HUD badges in Play Mode
+static const COLORREF kTransparentKey = RGB(1, 2, 3);
+static const COLORREF kEditWashColor  = RGB(10, 14, 22);
 
 float clamp01(float v) {
     if (v < 0.01f) return 0.01f;
@@ -65,13 +67,13 @@ bool HudOverlay::create(HWND ownerShellHwnd, HINSTANCE hInst) {
 
     fonts_.smallFont = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+                                   ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     fonts_.boldFont  = CreateFontA(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+                                   ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     fonts_.titleFont = CreateFontA(15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+                                   ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
 
     // Owned by ShellWindow (NO WS_EX_TOPMOST!): stays strictly above embedded scrcpy,
     // yet respects Alt-Tab cleanly when switching to other apps!
@@ -125,6 +127,8 @@ void HudOverlay::setInteractiveEdit(bool editMode, float hudOpacity) {
         ex |= (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
     }
     SetWindowLongA(hwnd_, GWL_EXSTYLE, ex);
+    SetWindowPos(hwnd_, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     applyOpacity(editMode, hudOpacity);
     invalidate();
 }
@@ -132,8 +136,9 @@ void HudOverlay::setInteractiveEdit(bool editMode, float hudOpacity) {
 void HudOverlay::applyOpacity(bool editMode, float hudOpacity) {
     if (!hwnd_) return;
     if (editMode) {
-        // Semi-translucent dark wash ONLY in Edit Mode so nodes pop cleanly over live video
-        SetLayeredWindowAttributes(hwnd_, kTransparentKey, 238, LWA_COLORKEY | LWA_ALPHA);
+        // Pure LWA_ALPHA (NO LWA_COLORKEY!) in Edit Mode so 100% of the phone canvas
+        // captures clicks, drags, double-clicks, and right-clicks with zero holes!
+        SetLayeredWindowAttributes(hwnd_, 0, 165, LWA_ALPHA);
     } else {
         BYTE alpha = static_cast<BYTE>(clampRange(hudOpacity, 0.15f, 1.00f) * 255.0f);
         SetLayeredWindowAttributes(hwnd_, kTransparentKey, alpha, LWA_COLORKEY | LWA_ALPHA);
@@ -624,15 +629,15 @@ void HudOverlay::onPaint(HDC hdc) {
     }
     HDC memDC = cacheDC_;
 
-    HBRUSH bgBrush = CreateSolidBrush(kTransparentKey);
-    FillRect(memDC, &rc, bgBrush);
-    DeleteObject(bgBrush);
-
     const Profile& p = host_->hudProfile();
     EngineTelemetry tel = host_->hudTelemetry();
     bool editMode = host_->hudIsEditMode();
     bool demoMode = host_->hudIsDemoMode();
     bool aimMode  = host_->hudIsAimMode();
+
+    HBRUSH bgBrush = CreateSolidBrush(editMode ? kEditWashColor : kTransparentKey);
+    FillRect(memDC, &rc, bgBrush);
+    DeleteObject(bgBrush);
 
     if (editMode) {
         // Subtle cyan outline around phone viewport during Keymap Edit Mode (live game stays 100% clear!)

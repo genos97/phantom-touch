@@ -551,8 +551,9 @@ void ShellWindow::setDrawerState(bool open, int tab) {
         drawerPanel_.clearFocus();
     }
 
-    // Tab 0 (KEYS) engages interactive node drag/rebind on HudOverlay; other tabs let you keep playing!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && (bridge_->isConnected() || demoMode_));
+    // Enable interactive keymap editing on the phone canvas whenever Studio Drawer is open
+    // on KEYS (0), SENS (1), or PROFILES (2); only DEVICE (3) keeps phone directly clickable!
+    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() != 3 && (bridge_->isConnected() || demoMode_));
     setEditMode(wantEdit);
     layoutChildren();
 }
@@ -649,7 +650,10 @@ std::string ShellWindow::hudSpecialRebindLabel() const {
 }
 
 void ShellWindow::hudOnSelectionChanged(int newSelectedIdx) {
-    (void)newSelectedIdx;
+    // Clicking a key node while on PROFILES tab immediately opens its Inspector in KEYS tab!
+    if (newSelectedIdx >= 0 && drawerOpen_ && drawerPanel_.activeTab() == 2) {
+        drawerPanel_.setActiveTab(0);
+    }
     invalidateShell();
 }
 
@@ -762,7 +766,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
 
     // Keep Edit Mode synced when switching drawer tabs inside the drawer!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && (bridge_->isConnected() || demoMode_));
+    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() != 3 && (bridge_->isConnected() || demoMode_));
     if (wantEdit != editMode_) {
         setEditMode(wantEdit);
     }

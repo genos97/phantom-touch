@@ -55,7 +55,7 @@ std::vector<std::string> ProfileStore::listProfiles(const std::string& profilesD
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                 std::string fname = fd.cFileName;
-                if (!fname.empty() && fname[0] != '_') {
+                if (!fname.empty() && fname[0] != '_' && fname[0] != '.') {
                     result.push_back(profilesDir + "\\" + fname);
                 }
             }
