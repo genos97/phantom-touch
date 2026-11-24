@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -153,6 +155,148 @@ bool ScrcpyBridge::runCommandCapture(const std::string& cmdLine, std::string& ou
     return true;
 }
 
+bool ScrcpyBridge::runCommandCaptureBinary(const std::string& cmdLine, std::vector<uint8_t>& outBytes, DWORD& outExitCode) {
+    outBytes.clear();
+    outExitCode = 1;
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    HANDLE readPipe = NULL, writePipe = NULL;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError  = NULL;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::vector<char> mutableCmd(cmdLine.begin(), cmdLine.end());
+    mutableCmd.push_back('\0');
+
+    BOOL ok = CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(writePipe);
+    if (!ok) {
+        CloseHandle(readPipe);
+        return false;
+    }
+
+    uint8_t buf[4096];
+    DWORD bytesRead = 0;
+    while (ReadFile(readPipe, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
+        outBytes.insert(outBytes.end(), buf, buf + bytesRead);
+    }
+
+    WaitForSingleObject(pi.hProcess, 15000);
+    GetExitCodeProcess(pi.hProcess, &outExitCode);
+
+    CloseHandle(readPipe);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+void ScrcpyBridge::appendLog(const std::string& line) {
+    if (line.empty()) return;
+    std::printf("%s\n", line.c_str());
+    EnterCriticalSection(&metaLock_);
+    logs_.push_back(line);
+    if (logs_.size() > 80) {
+        logs_.erase(logs_.begin(), logs_.begin() + (logs_.size() - 80));
+    }
+    LeaveCriticalSection(&metaLock_);
+}
+
+std::vector<std::string> ScrcpyBridge::getRecentLogs() const {
+    EnterCriticalSection(&metaLock_);
+    std::vector<std::string> copy = logs_;
+    LeaveCriticalSection(&metaLock_);
+    return copy;
+}
+
+std::string ScrcpyBridge::adbPrefix() const {
+    if (activeSerial_.empty()) {
+        return "\"" + adbExe_ + "\"";
+    }
+    return "\"" + adbExe_ + "\" -s \"" + activeSerial_ + "\"";
+}
+
+std::vector<AdbDeviceInfo> ScrcpyBridge::parseAdbDevicesOutput(const std::string& raw) {
+    std::vector<AdbDeviceInfo> result;
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty()) continue;
+        if (line.find("List of devices") == 0 || line[0] == '*') continue;
+
+        std::istringstream ls(line);
+        std::string serial, state;
+        if (!(ls >> serial >> state)) continue;
+
+        AdbDeviceInfo info;
+        info.serial = serial;
+        info.state = state;
+        info.wireless = (serial.find(':') != std::string::npos);
+
+        std::string tok;
+        while (ls >> tok) {
+            if (tok.find("model:") == 0) {
+                info.model = tok.substr(6);
+                for (size_t i = 0; i < info.model.size(); ++i) {
+                    if (info.model[i] == '_') info.model[i] = ' ';
+                }
+            }
+        }
+        if (info.model.empty()) {
+            info.model = info.serial;
+        }
+        result.push_back(info);
+    }
+    return result;
+}
+
+bool ScrcpyBridge::listDevices(const ToolPaths& tools, std::vector<AdbDeviceInfo>& outDevices) {
+    outDevices.clear();
+    if (tools.adbExe.empty()) return false;
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture("\"" + tools.adbExe + "\" devices -l", raw, ec) || ec != 0) {
+        return false;
+    }
+    outDevices = parseAdbDevicesOutput(raw);
+    return true;
+}
+
+bool ScrcpyBridge::connectWireless(const ToolPaths& tools, const std::string& ipPort, std::string& outMsg) {
+    outMsg.clear();
+    if (tools.adbExe.empty() || ipPort.empty()) {
+        outMsg = "Enter an IP:Port (e.g. 192.168.1.50:5555)";
+        return false;
+    }
+    DWORD ec = 0;
+    std::string raw;
+    if (!runCommandCapture("\"" + tools.adbExe + "\" connect \"" + ipPort + "\"", raw, ec)) {
+        outMsg = "Failed to execute adb connect.";
+        return false;
+    }
+    while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n')) raw.pop_back();
+    outMsg = raw.empty() ? "adb connect completed" : raw;
+    appendLog("[ADB] " + outMsg);
+    return (raw.find("connected to") != std::string::npos || raw.find("already connected") != std::string::npos);
+}
+
 bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
     std::string exeDir = getExeDir();
     std::vector<std::string> dirs;
@@ -194,12 +338,20 @@ bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
 }
 
 bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
-                                      const std::string& windowTitle, std::string& outError) {
+                                      const std::string& windowTitle, std::string& outError,
+                                      bool borderless, const std::string& deviceSerial) {
     if (mirrorProc_ != NULL) {
         return true;
     }
 
     std::string cmd = "\"" + tools.scrcpyExe + "\" --no-control --window-title=\"" + windowTitle + "\"";
+    if (!deviceSerial.empty()) {
+        cmd += " -s \"" + deviceSerial + "\"";
+    }
+    if (borderless) {
+        // Start borderless and offscreen until ViewportHost embeds it via SetParent (zero stray window flash!)
+        cmd += " --window-borderless --window-x=-32000 --window-y=-32000";
+    }
     if (!extraArgs.empty()) {
         cmd += " " + extraArgs;
     }
@@ -208,7 +360,7 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOW;
+    si.wShowWindow = borderless ? SW_SHOWNOACTIVATE : SW_SHOW;
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
@@ -217,14 +369,26 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     mutableCmd.push_back('\0');
 
     if (!CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, FALSE,
-                        0, NULL, NULL, &si, &pi)) {
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         outError = "Failed to launch scrcpy mirror window.";
         return false;
     }
 
     mirrorProc_ = pi.hProcess;
+    mirrorPid_ = pi.dwProcessId;
     CloseHandle(pi.hThread);
+    appendLog("[Mirror] Launched scrcpy (" + (borderless ? std::string("embedded") : std::string("windowed")) + ")");
     return true;
+}
+
+void ScrcpyBridge::stopMirrorWindow() {
+    if (mirrorProc_) {
+        TerminateProcess(mirrorProc_, 0);
+        WaitForSingleObject(mirrorProc_, 500);
+        CloseHandle(mirrorProc_);
+        mirrorProc_ = NULL;
+        mirrorPid_ = 0;
+    }
 }
 
 bool ScrcpyBridge::isMirrorRunning() const {
@@ -232,33 +396,62 @@ bool ScrcpyBridge::isMirrorRunning() const {
     return WaitForSingleObject(mirrorProc_, 0) == WAIT_TIMEOUT;
 }
 
-bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError) {
+std::string ScrcpyBridge::activeSerial() const {
+    EnterCriticalSection(&metaLock_);
+    std::string copy = activeSerial_;
+    LeaveCriticalSection(&metaLock_);
+    return copy;
+}
+
+bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
+                                  const std::string& deviceSerial) {
     if (!wsaInit_) {
         outError = "Winsock initialization failed.";
         return false;
     }
 
     adbExe_ = tools.adbExe;
+    EnterCriticalSection(&metaLock_);
+    activeSerial_ = deviceSerial;
+    LeaveCriticalSection(&metaLock_);
 
     // 1. Verify an authorized Android device is connected
-    std::string devOut;
-    DWORD exitCode = 0;
-    if (!runCommandCapture("\"" + adbExe_ + "\" devices", devOut, exitCode) || exitCode != 0) {
+    std::vector<AdbDeviceInfo> devs;
+    if (!listDevices(tools, devs)) {
         outError = "Failed to execute adb devices.";
         return false;
     }
-    if (devOut.find("\tdevice") == std::string::npos) {
-        if (devOut.find("unauthorized") != std::string::npos) {
+    std::string chosenSerial = deviceSerial;
+    bool foundReady = false;
+    bool foundUnauth = false;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (devs[i].state == "unauthorized") foundUnauth = true;
+        if (devs[i].state == "device") {
+            if (chosenSerial.empty() || chosenSerial == devs[i].serial) {
+                chosenSerial = devs[i].serial;
+                foundReady = true;
+                break;
+            }
+        }
+    }
+    if (!foundReady) {
+        if (foundUnauth) {
             outError = "Phone is unauthorized! Tap 'Allow USB debugging' on your phone screen.";
         } else {
-            outError = "No Android device detected via USB.\nEnable Developer Options -> USB Debugging and plug in your phone.";
+            outError = "No authorized Android device detected. Plug in USB or connect Wireless ADB.";
         }
         return false;
     }
+    EnterCriticalSection(&metaLock_);
+    activeSerial_ = chosenSerial;
+    LeaveCriticalSection(&metaLock_);
+
+    std::string adb = adbPrefix();
 
     // 2. Push scrcpy-server binary to a unique path so cleanup=true never races with scrcpy.exe!
     std::string pushOut;
-    if (!runCommandCapture("\"" + adbExe_ + "\" push \"" + tools.scrcpyServer +
+    DWORD exitCode = 0;
+    if (!runCommandCapture(adb + " push \"" + tools.scrcpyServer +
                            "\" /data/local/tmp/km-scrcpy-server.jar", pushOut, exitCode) || exitCode != 0) {
         outError = "Failed to push scrcpy-server to device:\n" + pushOut;
         return false;
@@ -280,14 +473,14 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
     std::snprintf(portBuf, sizeof(portBuf), "%d", forwardPort_);
 
     std::string fwdOut;
-    std::string fwdCmd = "\"" + adbExe_ + "\" forward tcp:" + portBuf + " localabstract:scrcpy_" + scid_;
+    std::string fwdCmd = adb + " forward tcp:" + portBuf + " localabstract:scrcpy_" + scid_;
     if (!runCommandCapture(fwdCmd, fwdOut, exitCode) || exitCode != 0) {
         outError = "Failed to set up adb forward tunnel:\n" + fwdOut;
         return false;
     }
 
     // 4. Launch scrcpy-server in low-FPS metadata + full multi-touch control mode
-    std::string srvCmd = "\"" + adbExe_ + "\" shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
+    std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
                          " log_level=info"
@@ -429,8 +622,10 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
     videoThread_ = CreateThread(NULL, 0, videoReaderProc, this, 0, NULL);
     controlThread_ = CreateThread(NULL, 0, controlReaderProc, this, 0, NULL);
 
-    std::printf("[Bridge] Connected to '%s' (%ux%u native touch coordinates)\n",
-                deviceName_.c_str(), initW, initH);
+    char logBuf[160];
+    std::snprintf(logBuf, sizeof(logBuf), "[Bridge] Connected to '%s' (%ux%u native touch)",
+                  deviceName_.c_str(), initW, initH);
+    appendLog(logBuf);
     return true;
 }
 
@@ -465,19 +660,16 @@ void ScrcpyBridge::disconnect() {
         CloseHandle(serverProc_);
         serverProc_ = NULL;
     }
-    if (mirrorProc_) {
-        TerminateProcess(mirrorProc_, 0);
-        CloseHandle(mirrorProc_);
-        mirrorProc_ = NULL;
-    }
+    stopMirrorWindow();
 
     if (!adbExe_.empty() && !scid_.empty()) {
+        std::string adb = adbPrefix();
         char portBuf[16];
         std::snprintf(portBuf, sizeof(portBuf), "%d", forwardPort_);
         std::string dummyOut;
         DWORD ec = 0;
-        runCommandCapture("\"" + adbExe_ + "\" forward --remove tcp:" + portBuf, dummyOut, ec);
-        runCommandCapture("\"" + adbExe_ + "\" shell rm -f /data/local/tmp/km-scrcpy-server.jar", dummyOut, ec);
+        runCommandCapture(adb + " forward --remove tcp:" + portBuf, dummyOut, ec);
+        runCommandCapture(adb + " shell rm -f /data/local/tmp/km-scrcpy-server.jar", dummyOut, ec);
         scid_.clear();
     }
 }
@@ -582,6 +774,39 @@ bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode) {
     bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
     LeaveCriticalSection(&sendLock_);
     return ok;
+}
+
+void ScrcpyBridge::sendAndroidNav(uint32_t androidKeycode) {
+    if (!connected_) return;
+    sendKeycode(0 /* ACTION_DOWN */, androidKeycode);
+    sendKeycode(1 /* ACTION_UP */, androidKeycode);
+}
+
+bool ScrcpyBridge::captureScreenshot(const std::string& savePath, std::string& outError) {
+    if (adbExe_.empty()) {
+        outError = "ADB not initialized.";
+        return false;
+    }
+    std::vector<uint8_t> pngBytes;
+    DWORD ec = 0;
+    if (!runCommandCaptureBinary(adbPrefix() + " exec-out screencap -p", pngBytes, ec) ||
+        ec != 0 || pngBytes.size() < 32) {
+        outError = "Screenshot capture failed.";
+        return false;
+    }
+    std::ofstream out(savePath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        outError = "Could not write " + savePath;
+        return false;
+    }
+    out.write(reinterpret_cast<const char*>(pngBytes.data()), static_cast<std::streamsize>(pngBytes.size()));
+    out.flush();
+    if (!out.good()) {
+        outError = "Write error saving screenshot.";
+        return false;
+    }
+    appendLog("[Screenshot] Saved -> " + savePath);
+    return true;
 }
 
 DWORD WINAPI ScrcpyBridge::videoReaderProc(LPVOID param) {

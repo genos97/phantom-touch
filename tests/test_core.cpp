@@ -1,6 +1,7 @@
 #include "bridge/SpsParser.hpp"
 #include "bridge/TouchFingerPool.hpp"
 #include "bridge/ScrcpyBridge.hpp"
+#include "config/AppSettings.hpp"
 #include "config/KeyCodes.hpp"
 #include "config/Profile.hpp"
 #include "config/ProfileStore.hpp"
@@ -8,7 +9,8 @@
 #include "engine/FpsViewController.hpp"
 #include "engine/InputEngine.hpp"
 #include "engine/JoystickController.hpp"
-#include "ui/StudioPanel.hpp"
+#include "ui/DrawerPanel.hpp"
+#include "ui/GdiPlusDraw.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -140,31 +142,30 @@ static void testProfileRoundTrip() {
     assert(ProfileStore::loadLastActive(tmpDir) == tmpCustom);
 
     // Creating a new config when my_custom.cfg already exists must auto-suffix instead of overwriting!
-    StudioPanel createUi;
+    DrawerPanel createUi;
     createUi.setProfilesDir(tmpDir, tmpCustom);
+    createUi.setActiveTab(2); // PROFILES tab
     HDC scDC = GetDC(NULL);
     HDC mDC = CreateCompatibleDC(scDC);
-    HBITMAP bm = CreateCompatibleBitmap(scDC, 1280, 720);
+    HBITMAP bm = CreateCompatibleBitmap(scDC, 400, 700);
     HGDIOBJ obm = SelectObject(mDC, bm);
-    HFONT fs = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT fb = CreateFontA(14, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT ft = CreateFontA(15, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     int dummySel = -1;
     Profile editCopy = orig;
-    createUi.paint(mDC, 1280, 720, editCopy, tmpCustom, dummySel, false, fs, fb, ft);
-    int cpx = static_cast<int>(editCopy.panelX * 1280.0f);
-    int cpy = static_cast<int>(editCopy.panelY * 720.0f);
-    StudioUIResult tabRes;
-    assert(createUi.onMouseDown(cpx + 250, cpy + 52, 1280, 720, editCopy, dummySel, tabRes)); // PROFILES tab
-    createUi.paint(mDC, 1280, 720, editCopy, tmpCustom, dummySel, false, fs, fb, ft);
-    StudioUIResult mkRes;
-    assert(createUi.onMouseDown(cpx + 60, cpy + 140, 1280, 720, editCopy, dummySel, mkRes)); // + CREATE BLANK CONFIG
+    AppSettings dummySet;
+    std::vector<std::string> noLogs;
+    RECT drawerRc = { 0, 0, 356, 700 };
+    {
+        Gdiplus::Graphics g(mDC);
+        createUi.paint(g, drawerRc, editCopy, dummySet, tmpCustom, dummySel, false, false, "", noLogs, -1, -1);
+    }
+    DrawerActionResult mkRes;
+    // "+ BLANK CONFIG" button sits at y = 87 + 10 + 20 + 38 = 155 inside drawerRc
+    assert(createUi.onMouseDown(80, 165, editCopy, dummySet, dummySel, mkRes));
     assert(mkRes.requestSwitchProfile && mkRes.switchProfilePath == (tmpDir + "\\my_custom_2.cfg"));
     // Verify original my_custom.cfg was NOT overwritten and my_custom_2.cfg has 0 buttons!
     Profile verifyOrig, verifyBlank2;
     assert(ProfileStore::load(tmpCustom, verifyOrig) && verifyOrig.buttons.size() == orig.buttons.size());
     assert(ProfileStore::load(mkRes.switchProfilePath, verifyBlank2) && verifyBlank2.buttons.empty());
-    DeleteObject(fs); DeleteObject(fb); DeleteObject(ft);
     SelectObject(mDC, obm); DeleteObject(bm); DeleteDC(mDC); ReleaseDC(NULL, scDC);
 
     std::remove((tmpDir + "\\my_custom_2.cfg").c_str());
@@ -172,78 +173,121 @@ static void testProfileRoundTrip() {
     std::remove((tmpDir + "\\.active_profile").c_str());
     RemoveDirectoryA(tmpDir.c_str());
 
+    // AppSettings round-trip & scrcpy args builder
+    AppSettings as;
+    as.winX = 120; as.winY = 80; as.winW = 1440; as.winH = 820;
+    as.maximized = true; as.alwaysOnTop = true;
+    as.mirrorFps = 120; as.mirrorBitrateMbps = 24; as.mirrorMaxSize = 1600;
+    as.mirrorAudio = true; as.turnScreenOff = true; as.stayAwake = true;
+    as.lastWirelessAddr = "192.168.1.77:5555";
+    const std::string tmpSetPath = "profiles\\_test_shell_settings.cfg";
+    assert(AppSettingsStore::save(tmpSetPath, as));
+    AppSettings asLoaded;
+    assert(AppSettingsStore::load(tmpSetPath, asLoaded));
+    assert(asLoaded.winW == 1440 && asLoaded.maximized && asLoaded.alwaysOnTop);
+    assert(asLoaded.mirrorFps == 120 && asLoaded.mirrorBitrateMbps == 24 && asLoaded.mirrorMaxSize == 1600);
+    assert(asLoaded.mirrorAudio && asLoaded.turnScreenOff && asLoaded.lastWirelessAddr == "192.168.1.77:5555");
+    std::string builtArgs = asLoaded.buildScrcpyArgs();
+    assert(builtArgs.find("--max-fps=120") != std::string::npos);
+    assert(builtArgs.find("--video-bit-rate=24M") != std::string::npos);
+    assert(builtArgs.find("--max-size=1600") != std::string::npos);
+    assert(builtArgs.find("--turn-screen-off") != std::string::npos);
+    assert(builtArgs.find("--no-audio") == std::string::npos);
+    std::remove(tmpSetPath.c_str());
+
     std::vector<std::string> files = ProfileStore::listProfiles("profiles");
     assert(!files.empty());
 
     std::remove(tmpPath.c_str());
-    std::printf("[Test] ProfileStore atomic save, blank 0-button reload, .active_profile & safe creation OK (%u nodes, %u profiles)\n",
+    std::printf("[Test] ProfileStore + AppSettings atomic save, blank reload & safe creation OK (%u nodes, %u profiles)\n",
                 static_cast<unsigned>(loaded.buttons.size()), static_cast<unsigned>(files.size()));
 }
 
-static void testStudioPanelMouseAndScrollRebind() {
+static void testEmulatorShellHelpersAndDrawer() {
     assert(KeyCodes::toName(0x10) == "LSHIFT");
     assert(KeyCodes::fromName("0x10") == 0xA0);
     assert(KeyCodes::fromName("MMB") == 0x04 && KeyCodes::toName(0x04) == "MMB");
     assert(KeyCodes::fromName("SCROLLUP") == VK_CUSTOM_MWHEEL_UP);
     assert(KeyCodes::fromName("SCROLLDOWN") == VK_CUSTOM_MWHEEL_DOWN);
 
+    // 1. Aspect-ratio letterboxing math (landscape, portrait, ultrawide)
+    ViewportRect land = GdiPlusDraw::computeAspectFit(1000, 700, 2340, 1080, 0);
+    assert(land.w == 1000 && land.h > 455 && land.h < 470 && land.x == 0 && land.y > 100);
+
+    ViewportRect port = GdiPlusDraw::computeAspectFit(1000, 700, 1080, 2340, 0);
+    assert(port.h == 700 && port.w > 315 && port.w < 330 && port.y == 0 && port.x > 300);
+
+    // 2. ADB Device Hub parser (USB + Wireless + unauthorized)
+    const std::string adbOut =
+        "List of devices attached\n"
+        "RZCW401ABCD            device product:r9qxxx model:SM_G990E device:r9q transport_id:1\n"
+        "192.168.1.42:5555      device product:pixel model:Pixel_8 transport_id:2\n"
+        "ABC123456              unauthorized transport_id:3\n";
+    std::vector<AdbDeviceInfo> devs = ScrcpyBridge::parseAdbDevicesOutput(adbOut);
+    assert(devs.size() == 3);
+    assert(devs[0].serial == "RZCW401ABCD" && devs[0].model == "SM G990E" && devs[0].state == "device" && !devs[0].wireless);
+    assert(devs[1].serial == "192.168.1.42:5555" && devs[1].wireless && devs[1].model == "Pixel 8");
+    assert(devs[2].state == "unauthorized");
+
+    // 3. Docked Outside-Viewport DrawerPanel: Key Inspector (MMB, SCROLL UP, SCROLL DOWN) & SENS tab (LShift + MMB)
     Profile loaded = ProfileDefaults::createFreeFire();
+    AppSettings settings;
+    std::vector<std::string> logs;
 
     HDC screenDC = GetDC(NULL);
     HDC memDC = CreateCompatibleDC(screenDC);
-    HBITMAP bmp = CreateCompatibleBitmap(screenDC, 1280, 720);
+    HBITMAP bmp = CreateCompatibleBitmap(screenDC, 356, 900);
     HGDIOBJ oldBmp = SelectObject(memDC, bmp);
-    HFONT fS = CreateFontA(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT fB = CreateFontA(14, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-    HFONT fT = CreateFontA(15, 0, 0, 0, FW_BOLD,   FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
 
-    StudioPanel ui;
-    ui.setProfilesDir("profiles", "profiles\\freefire.cfg");
+    DrawerPanel drawer;
+    drawer.setProfilesDir("profiles", "profiles\\freefire.cfg");
+    drawer.setActiveTab(0); // KEYS tab (Inspector at top when sel=0)
     int sel = 0;
-    ui.paint(memDC, 1280, 720, loaded, "profiles\\freefire.cfg", sel, true, fS, fB, fT);
+    RECT rc = { 0, 0, 356, 900 };
+    {
+        Gdiplus::Graphics g(memDC);
+        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", logs, -1, -1);
+    }
 
-    int px = static_cast<int>(loaded.panelX * 1280.0f);
-    int py = static_cast<int>(loaded.panelY * 720.0f);
-    StudioUIResult res;
-    assert(ui.onMouseDown(px + 330, py + 48, 1280, 720, loaded, sel, res));
-    assert(res.cancelRebind == true);
+    // Inspector layout inside drawer (body starts at y=87, startY=97):
+    // Card top=97, header+22=129, label+32=161, rebind+34=195, mouse row y=195..217, scroll row y=222..246
+    DrawerActionResult rMmb;
+    assert(drawer.onMouseDown(12 + 10 + 2 * 62 + 25, 206, loaded, settings, sel, rMmb));
+    assert(loaded.buttons[0].vk == VK_MBUTTON && rMmb.profileModified);
 
-    ui.paint(memDC, 1280, 720, loaded, "profiles\\freefire.cfg", sel, false, fS, fB, fT);
-    StudioUIResult res2;
-    assert(ui.onMouseDown(px + 180, py + 292, 1280, 720, loaded, sel, res2));
-    assert(ui.isRebindingToggleAim() == true);
-
-    StudioUIResult resLmb;
-    assert(ui.onMouseBind(VK_LBUTTON, loaded, sel, resLmb));
-    assert(ui.isRebindingToggleAim() == true);
-
-    StudioUIResult resShift;
-    assert(ui.onKeyDown(VK_SHIFT, loaded, sel, resShift));
-    assert(!ui.isRebindingToggleAim() && loaded.toggleAimVk == VK_LSHIFT);
-
-    StudioUIResult resMmbChip;
-    assert(ui.onMouseDown(px + 375, py + 292, 1280, 720, loaded, sel, resMmbChip));
-    assert(loaded.toggleAimVk == VK_MBUTTON);
-
-    // Key Inspector Row 1 (MMB) & Row 2 (SCROLL UP / SCROLL DOWN)
-    StudioUIResult resInspMmb;
-    assert(ui.onMouseDown(px + 440 + 12 + 2 * 48 + 20, py + 109, 1280, 720, loaded, sel, resInspMmb));
-    assert(loaded.buttons[0].vk == VK_MBUTTON && resInspMmb.cancelRebind);
-
-    StudioUIResult resScUp;
-    assert(ui.onMouseDown(px + 440 + 60, py + 137, 1280, 720, loaded, sel, resScUp));
+    DrawerActionResult rScUp;
+    assert(drawer.onMouseDown(80, 234, loaded, settings, sel, rScUp));
     assert(loaded.buttons[0].vk == VK_CUSTOM_MWHEEL_UP);
 
-    StudioUIResult resScDn;
-    assert(ui.onMouseDown(px + 440 + 190, py + 137, 1280, 720, loaded, sel, resScDn));
+    DrawerActionResult rScDn;
+    assert(drawer.onMouseDown(260, 234, loaded, settings, sel, rScDn));
     assert(loaded.buttons[0].vk == VK_CUSTOM_MWHEEL_DOWN);
 
-    DeleteObject(fS); DeleteObject(fB); DeleteObject(fT);
+    // Switch to SENS tab (tab 1) and verify LShift normalization on Lock/Unlock Key rebind
+    drawer.setActiveTab(1);
+    {
+        Gdiplus::Graphics g(memDC);
+        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", logs, -1, -1);
+    }
+    // Trigger Lock/Unlock rebind -> reject LMB -> bind VK_SHIFT -> normalized to VK_LSHIFT
+    // Find by scrolling or direct hit (height 900 fits entire SENS tab!)
+    DrawerActionResult rReb;
+    assert(drawer.onMouseDown(120, 748, loaded, settings, sel, rReb));
+    assert(drawer.isRebindingToggleAim());
+
+    DrawerActionResult rLmb;
+    assert(drawer.onMouseBind(VK_LBUTTON, loaded, rLmb));
+    assert(drawer.isRebindingToggleAim());
+
+    DrawerActionResult rShift;
+    assert(drawer.onKeyDown(VK_SHIFT, loaded, settings, sel, rShift));
+    assert(!drawer.isRebindingToggleAim() && loaded.toggleAimVk == VK_LSHIFT);
+
     SelectObject(memDC, oldBmp);
     DeleteObject(bmp);
     DeleteDC(memDC);
     ReleaseDC(NULL, screenDC);
-    std::printf("[Test] StudioPanel LShift, MMB & Scroll Up/Down UI interactions OK!\n");
+    std::printf("[Test] Emulator Shell (AspectFit, ADB Device Hub parser, DrawerPanel Keys/Scroll/Sens) OK!\n");
 }
 
 static void testTouchFingerPool() {
@@ -545,13 +589,14 @@ static void testInputEngineIntegration() {
 }
 
 int main() {
+    GdiPlusSession gdiplus;
     testSpsParser();
     testTouchFingerPool();
     testProfileRoundTrip();
-    testStudioPanelMouseAndScrollRebind();
+    testEmulatorShellHelpersAndDrawer();
     testJoystickAndActionModules();
     testFpsViewController();
     testInputEngineIntegration();
-    std::printf("ALL MODULAR ARCHITECTURE TESTS PASSED!\n");
+    std::printf("ALL PRODUCTION EMULATOR SHELL & ENGINE TESTS PASSED!\n");
     return 0;
 }
