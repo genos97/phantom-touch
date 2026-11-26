@@ -39,6 +39,8 @@ ViewportHost::ViewportHost() {
 }
 
 ViewportHost::~ViewportHost() {
+    delete cachedQrBmp_;
+    cachedQrBmp_ = nullptr;
     detachMirror();
     d3d_.shutdown();
     if (hwnd_ && IsWindow(hwnd_)) {
@@ -296,21 +298,24 @@ bool ViewportHost::captureNativeScreenshot(const std::string& savePath, std::str
 }
 
 void ViewportHost::setBounds(const RECT& boundsInParent) {
+    int prevW = hostBounds_.right - hostBounds_.left;
+    int prevH = hostBounds_.bottom - hostBounds_.top;
     hostBounds_ = boundsInParent;
     int w = boundsInParent.right - boundsInParent.left;
     int h = boundsInParent.bottom - boundsInParent.top;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
+    bool sizeChanged = (w != prevW || h != prevH);
 
     if (hwnd_) {
         if (fullscreenTarget_ && isNativeVideoActive()) {
             ShowWindow(hwnd_, SW_HIDE);
-            d3d_.resize(w, h);
+            if (sizeChanged) d3d_.resize(w, h);
         } else if (isMirrorEmbedded() || isNativeVideoActive()) {
             ShowWindow(hwnd_, SW_SHOW);
             SetWindowPos(hwnd_, HWND_BOTTOM, boundsInParent.left, boundsInParent.top, w, h,
                          SWP_NOACTIVATE);
-            if (isNativeVideoActive()) {
+            if (isNativeVideoActive() && sizeChanged) {
                 d3d_.resize(w, h);
             }
         } else {
@@ -319,7 +324,8 @@ void ViewportHost::setBounds(const RECT& boundsInParent) {
         }
     }
     updateVideoLayout(lastPhoneW_, lastPhoneH_);
-    if (isNativeVideoActive()) {
+    // S4 + 0.6 rule 3: never present on UI thread for pure moves or while video thread is actively presenting
+    if (isNativeVideoActive() && (sizeChanged || (GetTickCount() - lastPresentTick() >= 45))) {
         renderNativeFrame(true);
     }
 }
@@ -473,14 +479,14 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     }
 
     // Disconnected State: Production Device Hub Card centered inside ViewportHost
-    int cardW = 540;
-    int cardH = 420;
-    int availW = clientRc.right - clientRc.left - 32;
-    int availH = clientRc.bottom - clientRc.top - 32;
+    int cardW = GdiPlusDraw::dp(540);
+    int cardH = GdiPlusDraw::dp(420);
+    int availW = clientRc.right - clientRc.left - GdiPlusDraw::dp(32);
+    int availH = clientRc.bottom - clientRc.top - GdiPlusDraw::dp(32);
     if (cardW > availW) cardW = availW;
     if (cardH > availH) cardH = availH;
-    if (cardW < 340) cardW = 340;
-    if (cardH < 320) cardH = 320;
+    if (cardW < GdiPlusDraw::dp(340)) cardW = GdiPlusDraw::dp(340);
+    if (cardH < GdiPlusDraw::dp(320)) cardH = GdiPlusDraw::dp(320);
 
     int cx = (clientRc.left + clientRc.right) / 2;
     int cy = (clientRc.top + clientRc.bottom) / 2;
@@ -516,8 +522,8 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     y += 50;
 
     if (showingQrPair) {
-        // Render crisp scannable QR code with standard 4-module white quiet zone
-        const int qrBoxSz = 196;
+        // Render crisp cached QR bitmap (S2(c): avoids per-hover module loops)
+        const int qrBoxSz = GdiPlusDraw::dp(196);
         int qx = cx - qrBoxSz / 2;
         int qy = y + 4;
         RECT rQrBg = { qx, qy, qx + qrBoxSz, qy + qrBoxSz };
@@ -528,19 +534,37 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
             const int totalMod = qrMatrix->size + quiet * 2;
             const int cellPx = (qrBoxSz - 12) / totalMod;
             if (cellPx >= 2) {
-                const int drawSz = cellPx * qrMatrix->size;
-                const int ox = qx + (qrBoxSz - drawSz) / 2;
-                const int oy = qy + (qrBoxSz - drawSz) / 2;
-                Gdiplus::SolidBrush darkBr(Gdiplus::Color(255, 10, 14, 22));
+                uint32_t qhash = static_cast<uint32_t>(qrMatrix->size);
                 for (int r = 0; r < qrMatrix->size; ++r) {
                     for (int c = 0; c < qrMatrix->size; ++c) {
-                        if (qrMatrix->at(c, r)) {
-                            g.FillRectangle(&darkBr, static_cast<INT>(ox + c * cellPx),
-                                            static_cast<INT>(oy + r * cellPx),
-                                            static_cast<INT>(cellPx), static_cast<INT>(cellPx));
-                        }
+                        qhash = (qhash * 131u) + (qrMatrix->at(c, r) ? 1u : 0u);
                     }
                 }
+                const int drawSz = cellPx * qrMatrix->size;
+                if (!cachedQrBmp_ || cachedQrSize_ != qrMatrix->size ||
+                    cachedQrCellPx_ != cellPx || cachedQrHash_ != qhash) {
+                    delete cachedQrBmp_;
+                    cachedQrBmp_ = new Gdiplus::Bitmap(drawSz, drawSz, PixelFormat32bppPARGB);
+                    Gdiplus::Graphics qg(cachedQrBmp_);
+                    qg.Clear(Gdiplus::Color(0, 0, 0, 0));
+                    Gdiplus::SolidBrush darkBr(Gdiplus::Color(255, 10, 14, 22));
+                    for (int r = 0; r < qrMatrix->size; ++r) {
+                        for (int c = 0; c < qrMatrix->size; ++c) {
+                            if (qrMatrix->at(c, r)) {
+                                qg.FillRectangle(&darkBr, static_cast<INT>(c * cellPx),
+                                                 static_cast<INT>(r * cellPx),
+                                                 static_cast<INT>(cellPx), static_cast<INT>(cellPx));
+                            }
+                        }
+                    }
+                    cachedQrSize_ = qrMatrix->size;
+                    cachedQrCellPx_ = cellPx;
+                    cachedQrHash_ = qhash;
+                }
+                const int ox = qx + (qrBoxSz - drawSz) / 2;
+                const int oy = qy + (qrBoxSz - drawSz) / 2;
+                g.DrawImage(cachedQrBmp_, static_cast<INT>(ox), static_cast<INT>(oy),
+                            static_cast<INT>(drawSz), static_cast<INT>(drawSz));
             }
         }
 
@@ -663,4 +687,15 @@ HubClickResult ViewportHost::hitTestHub(int x, int y) const {
         }
     }
     return res;
+}
+
+bool ViewportHost::hoverHubAt(int x, int y, int& outId, RECT& outRc) const {
+    for (size_t i = 0; i < hotspots_.size(); ++i) {
+        if (ptIn(hotspots_[i].rc, x, y)) {
+            outId = (static_cast<int>(hotspots_[i].act) << 8) ^ (hotspots_[i].extra & 0xFF);
+            outRc = hotspots_[i].rc;
+            return true;
+        }
+    }
+    return false;
 }

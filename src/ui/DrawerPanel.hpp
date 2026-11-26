@@ -9,6 +9,85 @@
 #include <string>
 #include <vector>
 
+enum DrawerActionId {
+    DA_TAB_0 = 200,
+    DA_TAB_1,
+    DA_TAB_2,
+    DA_TAB_3,
+    DA_CLOSE,
+    DA_SAVE,
+
+    // Keys tab
+    DA_ADD_NODE,        // extra = KeyActionType
+    DA_CLEAR_BUTTONS,
+    DA_INSP_LABEL,
+    DA_INSP_REBIND,
+    DA_INSP_MOUSE_VK,   // extra = VK
+    DA_INSP_ACT_PREV,
+    DA_INSP_ACT_NEXT,
+    DA_INSP_SCOPE,
+    DA_INSP_RSTVIEW,
+    DA_INSP_REJOY,
+    DA_INSP_DELETE,
+
+    // Sens & Physics tab
+    DA_FIRE_CLAW,
+    DA_FIRE_DRAG,
+    DA_FIRE_DUAL,
+    DA_BOUNDS_UNBOUNDED,
+    DA_BOUNDS_BOXED,
+    DA_POLL_125,
+    DA_POLL_250,
+    DA_POLL_500,
+    DA_POLL_MAX,
+    DA_JOY_GLIDE,
+    DA_JOY_FAST,
+    DA_TOGGLE_INVERT_Y,
+    DA_TOGGLE_REMEMBER_CURSOR,
+    DA_REBIND_TOGGLE_AIM,
+    DA_SET_TOGGLE_MMB,
+    DA_REBIND_HOLD_UNLOCK,
+    DA_CLEAR_HOLD_UNLOCK,
+    DA_RESET_SENS,
+
+    // Profiles tab
+    DA_FOCUS_NEW_NAME,
+    DA_CREATE_BLANK,
+    DA_CREATE_CLONE,
+    DA_LOAD_PROFILE,    // extra = idx
+    DA_DELETE_PROFILE,  // extra = idx
+    DA_TOGGLE_KEYMAP_MODE,
+    DA_LINK_CURRENT_APP,
+    DA_UNLINK_APP,
+    DA_TOGGLE_EDGE_ANCHOR,
+    DA_CALIBRATE_ASPECT,
+
+    // Device & Stream tab
+    DA_STREAM_PRESET,   // extra = StreamPresetId
+    DA_STREAM_FPS,      // extra = 0/60/90/120
+    DA_STREAM_BITRATE,  // extra = 8/12/16/24
+    DA_STREAM_MAXSIZE,  // extra = 0/1920/1600/1280
+    DA_CODEC_OPTS,      // extra = 0 (default), 1 (CBR+NoB), 2 (WiFi intra)
+    DA_CYCLE_ENCODER,
+    DA_TOGGLE_NATIVE_VIDEO,
+    DA_TOGGLE_VSYNC,
+    DA_TOGGLE_VIRTUAL_DISPLAY,
+    DA_VD_PRESET,       // extra = 0 (1080p), 1 (720p), 2 (auto)
+    DA_TOGGLE_GAMEPAD,
+    DA_TOGGLE_AUDIO,
+    DA_AUDIO_BUFFER,    // extra = 20 / 25 / 30
+    DA_TOGGLE_AUDIO_RAW,
+    DA_TOGGLE_SCREEN_OFF,
+    DA_TOGGLE_STAY_AWAKE,
+    DA_TOGGLE_AUTO_SWITCH,
+    DA_TOGGLE_RCLICK_BACK,
+    DA_APPLY_RECONNECT,
+    DA_DISCONNECT,
+    DA_RUN_LATENCY_PROBE,
+    DA_FOCUS_WIRELESS,
+    DA_CONNECT_WIRELESS
+};
+
 struct DrawerActionResult {
     bool profileModified = false;
     bool settingsModified = false;
@@ -86,6 +165,8 @@ public:
                int hoverX, int hoverY);
 
     bool containsPoint(int x, int y) const;
+    bool hoverItemAt(int x, int y, int& outId, RECT& outRc) const;
+    bool rectForAction(int actionId, int extra, RECT& outRc) const;
 
     bool onMouseDown(int x, int y, Profile& profile, AppSettings& settings,
                      int& selectedBtnIndex, DrawerActionResult& out);

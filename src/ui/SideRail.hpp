@@ -35,17 +35,25 @@ struct SideRailState {
 
 class SideRail {
 public:
+    void layout(const RECT& bounds, const SideRailState& state);
     void paint(Gdiplus::Graphics& g, const RECT& bounds,
                const SideRailState& state, int hoverX, int hoverY);
 
     SideRailAction hitTest(int x, int y) const;
+    bool hoverItemAt(int x, int y, int& outId, RECT& outRc) const;
     std::string tooltipAt(int x, int y) const;
 
 private:
     struct Item {
         RECT rc;
         SideRailAction action;
+        UiIcon icon;
+        std::string label;
         std::string tip;
+        bool active;
+        uint32_t activeCol;
+        bool enabled;
     };
     std::vector<Item> items_;
+    int sepY_ = 0;
 };

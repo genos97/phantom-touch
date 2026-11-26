@@ -102,6 +102,7 @@ public:
                int hoverX, int hoverY);
 
     HubClickResult hitTestHub(int x, int y) const;
+    bool hoverHubAt(int x, int y, int& outId, RECT& outRc) const;
 
 private:
     static LRESULT CALLBACK hostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -125,4 +126,8 @@ private:
     uint32_t lastPhoneW_ = 1920;
     uint32_t lastPhoneH_ = 1080;
     std::vector<HubHotspot> hotspots_;
+    Gdiplus::Bitmap* cachedQrBmp_ = nullptr;
+    int cachedQrSize_ = 0;
+    int cachedQrCellPx_ = 0;
+    uint32_t cachedQrHash_ = 0;
 };

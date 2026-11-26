@@ -8,6 +8,7 @@
 #include "ui/DrawerPanel.hpp"
 #include "ui/HudOverlay.hpp"
 #include "ui/SideRail.hpp"
+#include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
 #include "ui/ViewportHost.hpp"
 #include "video/H264Decoder.hpp"
@@ -129,6 +130,8 @@ private:
     void toggleFireMode();
     void toggleHud();
     void triggerQuickReset();
+    void showToast(const std::string& msg, DWORD durationMs = 2200);
+    RECT shellToastRect() const;
 
     void applyProfileToEngine(bool autoSaveNow = true);
     bool saveCurrentProfile(bool silent = false);
@@ -343,6 +346,16 @@ private:
 
     bool cursorHidden_ = false;
     bool hadForeground_ = false;
+    Theme::Metrics metrics_;
+    bool dwmRoundedActive_ = false;
+    bool inSizeMove_ = false;
+    DWORD lastResizeTick_ = 0;
+    int lastHoverRegion_ = 0;
+    int lastHoverItemId_ = -1;
+    RECT lastHoverRc_ = { 0, 0, 0, 0 };
+    std::string shellToastMsg_;
+    DWORD shellToastExpireTick_ = 0;
+    bool shellToastWasVisible_ = false;
 
     // Double-buffered shell GDI surface
     HDC cacheDC_ = NULL;

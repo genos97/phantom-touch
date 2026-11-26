@@ -85,6 +85,13 @@ public:
     static void warmCache();
     static void clearCache();
 
+    // Runtime Per-Monitor DPI helpers (U2)
+    static void setActiveDpi(int dpi);
+    static int activeDpi();
+    static int dp(int px);
+    static float dpf(float px);
+    static int queryWindowDpi(HWND hwnd);
+
     static void drawToggleSwitch(Gdiplus::Graphics& g, const RECT& rc, bool on, uint32_t accentArgb);
     static void drawSlider(Gdiplus::Graphics& g, const RECT& trackRc, float norm01, uint32_t accentArgb, bool hovered);
     static void drawIcon(Gdiplus::Graphics& g, UiIcon icon, float cx, float cy, float sz, uint32_t colorArgb);
@@ -92,6 +99,7 @@ public:
     // Pure math helper: fits a phone screen (phoneW x phoneH) into a viewport host box preserving exact aspect ratio
     static ViewportRect computeAspectFit(int hostW, int hostH, uint32_t phoneW, uint32_t phoneH, int padding = 0);
 
-    // Enable Windows 11 dark titlebar / native rounded corners dynamically via dwmapi.dll
-    static void enableDarkDwmFrame(HWND hwnd);
+    // Enable Windows 11 dark titlebar / native rounded corners dynamically via System32 dwmapi.dll (U3)
+    static bool enableDarkDwmFrame(HWND hwnd);
+    static void setDwmBorderActive(HWND hwnd, bool active);
 };

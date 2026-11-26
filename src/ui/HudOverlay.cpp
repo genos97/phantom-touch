@@ -706,7 +706,6 @@ void HudOverlay::onMouseMove(int x, int y) {
         default: break;
     }
     host_->hudOnProfileChanged(false);
-    renderLayered();
 }
 
 void HudOverlay::onMouseUp() {

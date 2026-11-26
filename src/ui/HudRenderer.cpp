@@ -16,14 +16,14 @@ uint32_t withAlpha(uint32_t rgbHex, float alpha01) {
 
 uint32_t nodeAccentRgb(KeyActionType act) {
     switch (act) {
-        case NODE_DOWN_UP:        return 0x2CE59Bu; // Emerald
-        case NODE_HOLD_VIEW:      return 0x00D4FFu; // Cyan
-        case NODE_SWIPE:          return 0xFFB84Du; // Amber
-        case NODE_CURSOR_TOGGLE:  return 0xC49BFFu; // Soft lavender
+        case NODE_DOWN_UP:        return Theme::HUD_HOLD & 0x00FFFFFFu;
+        case NODE_HOLD_VIEW:      return Theme::HUD_TAP & 0x00FFFFFFu;
+        case NODE_SWIPE:          return Theme::HUD_SWIPE & 0x00FFFFFFu;
+        case NODE_CURSOR_TOGGLE:
         case NODE_RESET_VIEW:
         case NODE_SWITCH_SENS:
-        case NODE_REACTIVATE_JOY: return 0xFFD066u; // Soft gold
-        default:                  return 0xDCE8FAu; // Crisp frosted white-slate
+        case NODE_REACTIVATE_JOY: return Theme::HUD_TOGGLE & 0x00FFFFFFu;
+        default:                  return 0xDCE8FAu;
     }
 }
 
@@ -94,10 +94,16 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                                    int selectedBtnIndex, int hoveredBtnIndex,
                                    bool hoverDeleteChip, bool waitingButtonRebind,
                                    float playOpacity) {
-    // Resolve edge-anchored coordinates (20:9 <-> 16:9) seamlessly for visual placement
-    Profile resolved = ProfileDefaults::resolveLayout(rawProfile, static_cast<uint32_t>(w > 0 ? w : 1920),
+    // S2(c): avoid copying Profile on every paint unless edge-anchored resolution is enabled
+    Profile resolvedCopy;
+    const Profile* profilePtr = &rawProfile;
+    if (rawProfile.edgeAnchored) {
+        resolvedCopy = ProfileDefaults::resolveLayout(rawProfile,
+                                                      static_cast<uint32_t>(w > 0 ? w : 1920),
                                                       static_cast<uint32_t>(h > 0 ? h : 1080));
-    const Profile& profile = resolved;
+        profilePtr = &resolvedCopy;
+    }
+    const Profile& profile = *profilePtr;
     // In Play Mode, obey user's HUD Opacity smoothly per-pixel; in Edit Mode keep crisp full clarity
     float op = editMode ? 1.0f : ((playOpacity < 0.15f) ? 0.15f : (playOpacity > 1.0f ? 1.0f : playOpacity));
     float fw = static_cast<float>(w);
@@ -202,12 +208,12 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
             float aScale = active ? 1.0f : 0.48f;
             drawFrostedCap(g, fx, fy, r * 2.0f, r * 2.0f, r,
                            withAlpha(0x141923u, (editMode ? 0.72f : 0.40f * op) * aScale),
-                           withAlpha(active ? 0xFF6B7Au : 0x8A9BB5u, (editMode ? 0.85f : 0.52f * op) * aScale),
+                           withAlpha(active ? (Theme::HUD_FIRE & 0x00FFFFFFu) : 0x8A9BB5u, (editMode ? 0.85f : 0.52f * op) * aScale),
                            editMode ? 1.5f : 1.15f);
             drawSubtleText(g, fireTxt, fx, fy, editMode ? 11.0f : 9.5f, true,
                            withAlpha(0xFFF0F2u, (editMode ? 0.95f : 0.82f * op) * aScale));
             if (editMode) {
-                drawSubtleText(g, sub, fx, fy + r + 9.5f, 9.0f, true, withAlpha(0xFFB3BAu, 0.82f * aScale));
+                drawSubtleText(g, sub, fx, fy + r + 9.5f, 9.0f, true, withAlpha(0xFFD0B8u, 0.82f * aScale));
             }
         };
 

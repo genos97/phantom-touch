@@ -4,7 +4,13 @@
 #include <cmath>
 #include <map>
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
 namespace {
+
+int g_activeDpi = 96;
 
 struct GdiFontCache {
     CRITICAL_SECTION lock;
@@ -49,7 +55,13 @@ struct GdiFontCache {
         if (!lockInit) return;
         EnterCriticalSection(&lock);
         if (!active) {
-            fam = new Gdiplus::FontFamily(L"Segoe UI");
+            Gdiplus::FontFamily* varFam = new Gdiplus::FontFamily(L"Segoe UI Variable Text");
+            if (varFam->IsAvailable()) {
+                fam = varFam;
+            } else {
+                delete varFam;
+                fam = new Gdiplus::FontFamily(L"Segoe UI");
+            }
             fmtLeft = new Gdiplus::StringFormat();
             fmtLeft->SetAlignment(Gdiplus::StringAlignmentNear);
             fmtLeft->SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -67,20 +79,57 @@ struct GdiFontCache {
             fmtRight->SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
             active = true;
-            static const float kSizes[] = { 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 18.0f };
+            const float scale = (g_activeDpi > 0) ? (static_cast<float>(g_activeDpi) / 96.0f) : 1.0f;
+            static const float kSizes[] = { 8.5f, 10.0f, 10.5f, 11.0f, 11.5f, 12.0f, 12.5f, 13.0f, 15.0f, 18.0f };
             for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); ++i) {
-                getOrCreateFontLocked(kSizes[i], false);
-                getOrCreateFontLocked(kSizes[i], true);
+                const float scaled = kSizes[i] * scale;
+                getOrCreateFontLocked(scaled, false);
+                getOrCreateFontLocked(scaled, true);
             }
 
-            Gdiplus::Bitmap bmp(16, 16, PixelFormat32bppPARGB);
-            Gdiplus::Graphics g(&bmp);
-            g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-            Gdiplus::SolidBrush br(Gdiplus::Color(255, 255, 255, 255));
-            Gdiplus::Font* reg = getOrCreateFontLocked(12.0f, false);
-            Gdiplus::Font* bld = getOrCreateFontLocked(12.0f, true);
-            if (reg) g.DrawString(L"A", 1, reg, Gdiplus::PointF(0.0f, 0.0f), fmtLeft, &br);
-            if (bld) g.DrawString(L"A", 1, bld, Gdiplus::PointF(0.0f, 0.0f), fmtLeft, &br);
+            // Use a BI_RGB 32-bit DIBSection + HDC so GDI+ actually initializes ClearType
+            // glyph caches (PixelFormat32bppPARGB silently disables ClearType until first Paint).
+            HDC memDC = CreateCompatibleDC(NULL);
+            if (memDC) {
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = 64;
+                bmi.bmiHeader.biHeight = -32;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                void* bits = NULL;
+                HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+                if (hBmp) {
+                    HGDIOBJ oldBmp = SelectObject(memDC, hBmp);
+                    {
+                        Gdiplus::Graphics g(memDC);
+                        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+                        Gdiplus::SolidBrush fillBr(Gdiplus::Color(255, 31, 41, 55));
+                        Gdiplus::GraphicsPath path;
+                        path.AddArc(0.0f, 0.0f, 8.0f, 8.0f, 180.0f, 90.0f);
+                        path.AddArc(16.0f, 0.0f, 8.0f, 8.0f, 270.0f, 90.0f);
+                        path.AddArc(16.0f, 8.0f, 8.0f, 8.0f, 0.0f, 90.0f);
+                        path.AddArc(0.0f, 8.0f, 8.0f, 8.0f, 90.0f, 90.0f);
+                        path.CloseFigure();
+                        g.FillPath(&fillBr, &path);
+
+                        Gdiplus::SolidBrush br(Gdiplus::Color(255, 255, 255, 255));
+                        static const float kWarmTextSizes[] = { 11.5f, 13.0f };
+                        for (size_t i = 0; i < sizeof(kWarmTextSizes) / sizeof(kWarmTextSizes[0]); ++i) {
+                            const float sz = kWarmTextSizes[i] * scale;
+                            Gdiplus::Font* reg = getOrCreateFontLocked(sz, false);
+                            Gdiplus::Font* bld = getOrCreateFontLocked(sz, true);
+                            if (reg) g.DrawString(L"Phantom Touch 0123456789", 24, reg, Gdiplus::PointF(0.0f, 0.0f), fmtLeft, &br);
+                            if (bld) g.DrawString(L"Phantom Touch 0123456789", 24, bld, Gdiplus::PointF(0.0f, 12.0f), fmtLeft, &br);
+                        }
+                    }
+                    SelectObject(memDC, oldBmp);
+                    DeleteObject(hBmp);
+                }
+                DeleteDC(memDC);
+            }
         }
         LeaveCriticalSection(&lock);
     }
@@ -127,6 +176,41 @@ void GdiPlusDraw::warmCache() {
 
 void GdiPlusDraw::clearCache() {
     g_fontCache.clear();
+}
+
+void GdiPlusDraw::setActiveDpi(int dpi) {
+    if (dpi < 96) dpi = 96;
+    if (dpi > 384) dpi = 384;
+    g_activeDpi = dpi;
+}
+
+int GdiPlusDraw::activeDpi() {
+    return g_activeDpi;
+}
+
+int GdiPlusDraw::dp(int px) {
+    return (g_activeDpi <= 96) ? px : ((px * g_activeDpi + 48) / 96);
+}
+
+float GdiPlusDraw::dpf(float px) {
+    return (g_activeDpi <= 96) ? px : (px * static_cast<float>(g_activeDpi) / 96.0f);
+}
+
+int GdiPlusDraw::queryWindowDpi(HWND hwnd) {
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32 && hwnd) {
+        typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+        GetDpiForWindowFn fn = reinterpret_cast<GetDpiForWindowFn>(
+            reinterpret_cast<void*>(GetProcAddress(hUser32, "GetDpiForWindow")));
+        if (fn) {
+            UINT d = fn(hwnd);
+            if (d >= 72 && d <= 384) return static_cast<int>(d);
+        }
+    }
+    HDC hdc = GetDC(hwnd);
+    int dpi = hdc ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+    if (hdc) ReleaseDC(hwnd, hdc);
+    return (dpi >= 72) ? dpi : 96;
 }
 
 Gdiplus::Color GdiPlusDraw::argb(uint32_t c) {
@@ -227,12 +311,13 @@ void GdiPlusDraw::vLine(Gdiplus::Graphics& g, int x, int y1, int y2, uint32_t ar
 void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
                            float x, float cy, float sizePx, bool bold, uint32_t colorArgb, float maxW) {
     std::wstring wtxt = toWide(text);
+    const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
-    float width = (maxW > 1.0f) ? maxW : 1600.0f;
-    Gdiplus::RectF layout(x, cy - sizePx * 1.1f, width, sizePx * 2.2f);
+    float width = (maxW > 1.0f) ? maxW : 2400.0f;
+    Gdiplus::RectF layout(x, cy - px * 1.1f, width, px * 2.2f);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
         if (font && g_fontCache.fmtLeft) {
             g.DrawString(wtxt.c_str(), -1, font, layout, g_fontCache.fmtLeft, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -241,7 +326,7 @@ void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
         LeaveCriticalSection(&g_fontCache.lock);
     }
     Gdiplus::FontFamily fam(L"Segoe UI");
-    Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentNear);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -253,11 +338,12 @@ void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
 void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
                              float cx, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::PointF pt(cx, cy);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
         if (font && g_fontCache.fmtCenter) {
             g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtCenter, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -266,7 +352,7 @@ void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
         LeaveCriticalSection(&g_fontCache.lock);
     }
     Gdiplus::FontFamily fam(L"Segoe UI");
-    Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -277,11 +363,12 @@ void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
 void GdiPlusDraw::textRight(Gdiplus::Graphics& g, const std::string& text,
                             float rightX, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::PointF pt(rightX, cy);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
         if (font && g_fontCache.fmtRight) {
             g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtRight, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -290,7 +377,7 @@ void GdiPlusDraw::textRight(Gdiplus::Graphics& g, const std::string& text,
         LeaveCriticalSection(&g_fontCache.lock);
     }
     Gdiplus::FontFamily fam(L"Segoe UI");
-    Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentFar);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -591,10 +678,11 @@ ViewportRect GdiPlusDraw::computeAspectFit(int hostW, int hostH, uint32_t phoneW
     return out;
 }
 
-void GdiPlusDraw::enableDarkDwmFrame(HWND hwnd) {
-    if (!hwnd) return;
-    HMODULE hDwm = LoadLibraryA("dwmapi.dll");
-    if (!hDwm) return;
+bool GdiPlusDraw::enableDarkDwmFrame(HWND hwnd) {
+    if (!hwnd) return false;
+    HMODULE hDwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hDwm) return false;
+    bool roundedOk = false;
     typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
     DwmSetWindowAttributeFn fn = reinterpret_cast<DwmSetWindowAttributeFn>(
         reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
@@ -602,8 +690,23 @@ void GdiPlusDraw::enableDarkDwmFrame(HWND hwnd) {
         BOOL dark = TRUE;
         fn(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
         DWORD cornerPref = 2 /* DWMWCP_ROUND */;
-        fn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref));
-        COLORREF borderCol = RGB(35, 46, 66);
+        roundedOk = SUCCEEDED(fn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref)));
+        COLORREF borderCol = RGB(48, 74, 108);
+        fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
+    }
+    FreeLibrary(hDwm);
+    return roundedOk;
+}
+
+void GdiPlusDraw::setDwmBorderActive(HWND hwnd, bool active) {
+    if (!hwnd) return;
+    HMODULE hDwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hDwm) return;
+    typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
+    DwmSetWindowAttributeFn fn = reinterpret_cast<DwmSetWindowAttributeFn>(
+        reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
+    if (fn) {
+        COLORREF borderCol = active ? RGB(48, 74, 108) : RGB(28, 38, 56);
         fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
     }
     FreeLibrary(hDwm);

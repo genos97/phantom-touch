@@ -8,85 +8,6 @@
 
 namespace {
 
-enum DrawerActionId {
-    DA_TAB_0 = 200,
-    DA_TAB_1,
-    DA_TAB_2,
-    DA_TAB_3,
-    DA_CLOSE,
-    DA_SAVE,
-
-    // Keys tab
-    DA_ADD_NODE,        // extra = KeyActionType
-    DA_CLEAR_BUTTONS,
-    DA_INSP_LABEL,
-    DA_INSP_REBIND,
-    DA_INSP_MOUSE_VK,   // extra = VK
-    DA_INSP_ACT_PREV,
-    DA_INSP_ACT_NEXT,
-    DA_INSP_SCOPE,
-    DA_INSP_RSTVIEW,
-    DA_INSP_REJOY,
-    DA_INSP_DELETE,
-
-    // Sens & Physics tab
-    DA_FIRE_CLAW,
-    DA_FIRE_DRAG,
-    DA_FIRE_DUAL,
-    DA_BOUNDS_UNBOUNDED,
-    DA_BOUNDS_BOXED,
-    DA_POLL_125,
-    DA_POLL_250,
-    DA_POLL_500,
-    DA_POLL_MAX,
-    DA_JOY_GLIDE,
-    DA_JOY_FAST,
-    DA_TOGGLE_INVERT_Y,
-    DA_TOGGLE_REMEMBER_CURSOR,
-    DA_REBIND_TOGGLE_AIM,
-    DA_SET_TOGGLE_MMB,
-    DA_REBIND_HOLD_UNLOCK,
-    DA_CLEAR_HOLD_UNLOCK,
-    DA_RESET_SENS,
-
-    // Profiles tab
-    DA_FOCUS_NEW_NAME,
-    DA_CREATE_BLANK,
-    DA_CREATE_CLONE,
-    DA_LOAD_PROFILE,    // extra = idx
-    DA_DELETE_PROFILE,  // extra = idx
-    DA_TOGGLE_KEYMAP_MODE,
-    DA_LINK_CURRENT_APP,
-    DA_UNLINK_APP,
-    DA_TOGGLE_EDGE_ANCHOR,
-    DA_CALIBRATE_ASPECT,
-
-    // Device & Stream tab
-    DA_STREAM_PRESET,   // extra = StreamPresetId
-    DA_STREAM_FPS,      // extra = 0/60/90/120
-    DA_STREAM_BITRATE,  // extra = 8/12/16/24
-    DA_STREAM_MAXSIZE,  // extra = 0/1920/1600/1280
-    DA_CODEC_OPTS,      // extra = 0 (default), 1 (CBR+NoB), 2 (WiFi intra)
-    DA_CYCLE_ENCODER,
-    DA_TOGGLE_NATIVE_VIDEO,
-    DA_TOGGLE_VSYNC,
-    DA_TOGGLE_VIRTUAL_DISPLAY,
-    DA_VD_PRESET,       // extra = 0 (1080p), 1 (720p), 2 (auto)
-    DA_TOGGLE_GAMEPAD,
-    DA_TOGGLE_AUDIO,
-    DA_AUDIO_BUFFER,    // extra = 20 / 25 / 30
-    DA_TOGGLE_AUDIO_RAW,
-    DA_TOGGLE_SCREEN_OFF,
-    DA_TOGGLE_STAY_AWAKE,
-    DA_TOGGLE_AUTO_SWITCH,
-    DA_TOGGLE_RCLICK_BACK,
-    DA_APPLY_RECONNECT,
-    DA_DISCONNECT,
-    DA_RUN_LATENCY_PROBE,
-    DA_FOCUS_WIRELESS,
-    DA_CONNECT_WIRELESS
-};
-
 enum DrawerSliderId {
     DSL_SENS_X = 1,
     DSL_SENS_Y,
@@ -115,6 +36,10 @@ float clampf(float v, float lo, float hi) {
 std::string baseName(const std::string& p) {
     size_t pos = p.find_last_of("\\/");
     return (pos == std::string::npos) ? p : p.substr(pos + 1);
+}
+
+int dp(int px) {
+    return GdiPlusDraw::dp(px);
 }
 
 } // namespace
@@ -158,20 +83,48 @@ bool DrawerPanel::containsPoint(int x, int y) const {
     return ptIn(bounds_, x, y);
 }
 
+bool DrawerPanel::hoverItemAt(int x, int y, int& outId, RECT& outRc) const {
+    for (size_t i = 0; i < sliders_.size(); ++i) {
+        if (ptIn(sliders_[i].hitRc, x, y)) {
+            outId = 1000 + sliders_[i].id;
+            outRc = sliders_[i].hitRc;
+            return true;
+        }
+    }
+    for (size_t i = 0; i < hotspots_.size(); ++i) {
+        if (ptIn(hotspots_[i].rc, x, y)) {
+            outId = (hotspots_[i].id << 8) ^ (hotspots_[i].extra & 0xFF);
+            outRc = hotspots_[i].rc;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DrawerPanel::rectForAction(int actionId, int extra, RECT& outRc) const {
+    for (size_t i = 0; i < hotspots_.size(); ++i) {
+        if (hotspots_[i].id == actionId && (extra == -1 || hotspots_[i].extra == extra)) {
+            outRc = hotspots_[i].rc;
+            return true;
+        }
+    }
+    return false;
+}
+
 void DrawerPanel::drawSliderRow(Gdiplus::Graphics& g, int x, int y, int w,
                                 const char* label, float val, float minV, float maxV,
                                 const char* valText, uint32_t accent, int sliderId,
                                 int hoverX, int hoverY) {
-    const int lblW = 104;
-    const int valW = 48;
+    const int lblW = dp(104);
+    const int valW = dp(48);
     const int trX = x + lblW;
-    const int trW = w - lblW - valW - 6;
-    const int cy = y + 13;
+    const int trW = w - lblW - valW - dp(6);
+    const int cy = y + dp(13);
 
-    GdiPlusDraw::textLeft(g, label, static_cast<float>(x), static_cast<float>(cy), 11.5f, false, Theme::TEXT_SECONDARY, static_cast<float>(lblW - 4));
+    GdiPlusDraw::textLeft(g, label, static_cast<float>(x), static_cast<float>(cy), 11.5f, false, Theme::TEXT_SECONDARY, static_cast<float>(lblW - dp(4)));
 
-    RECT tr = { trX, cy - 3, trX + trW, cy + 3 };
-    RECT hit = { trX - 8, y, trX + trW + 8, y + 26 };
+    RECT tr = { trX, cy - dp(3), trX + trW, cy + dp(3) };
+    RECT hit = { trX - dp(8), y, trX + trW + dp(8), y + dp(26) };
     float norm = (maxV > minV) ? clampf((val - minV) / (maxV - minV), 0.0f, 1.0f) : 0.0f;
     bool hov = (activeSliderId_ == sliderId) || ptIn(hit, hoverX, hoverY);
     GdiPlusDraw::drawSlider(g, tr, norm, accent, hov);
@@ -185,12 +138,12 @@ void DrawerPanel::drawSliderRow(Gdiplus::Graphics& g, int x, int y, int w,
 void DrawerPanel::drawToggleRow(Gdiplus::Graphics& g, int x, int y, int w,
                                 const char* label, bool on, uint32_t accent, int actionId,
                                 int hoverX, int hoverY) {
-    RECT row = { x, y, x + w, y + 30 };
+    RECT row = { x, y, x + w, y + dp(30) };
     bool hov = ptIn(row, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, row, 7.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+    GdiPlusDraw::roundedCard(g, row, GdiPlusDraw::dpf(7.0f), hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              Theme::BORDER_SUBTLE, 1.0f);
-    GdiPlusDraw::textLeft(g, label, static_cast<float>(x + 10), static_cast<float>(y + 15), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 64));
-    RECT sw = { x + w - 48, y + 5, x + w - 8, y + 25 };
+    GdiPlusDraw::textLeft(g, label, static_cast<float>(x + dp(10)), static_cast<float>(y + dp(15)), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - dp(64)));
+    RECT sw = { x + w - dp(48), y + dp(5), x + w - dp(8), y + dp(25) };
     GdiPlusDraw::drawToggleSwitch(g, sw, on, accent);
     if (row.bottom > bodyClip_.top && row.top < bodyClip_.bottom) {
         hotspots_.push_back(Hotspot{ row, actionId, 0 });
@@ -213,9 +166,9 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
     GdiPlusDraw::fillRect(g, bounds, Theme::BG_DRAWER);
     GdiPlusDraw::vLine(g, bounds.left, bounds.top, bounds.bottom, Theme::BORDER_STRONG);
 
-    const int x0 = bounds.left + 12;
-    const int w = (bounds.right - bounds.left) - 24;
-    const int hdrY = bounds.top + 10;
+    const int x0 = bounds.left + dp(12);
+    const int w = (bounds.right - bounds.left) - dp(24);
+    const int hdrY = bounds.top + dp(10);
 
     // 1. Drawer Header + Close button
     static const char* kTitles[4] = {
@@ -224,26 +177,26 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
         "PROFILES MANAGER",
         "DEVICE & STREAM"
     };
-    GdiPlusDraw::textLeft(g, kTitles[activeTab_], static_cast<float>(x0), static_cast<float>(hdrY + 12), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - 32));
+    GdiPlusDraw::textLeft(g, kTitles[activeTab_], static_cast<float>(x0), static_cast<float>(hdrY + dp(12)), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - dp(32)));
 
-    RECT rCls = { bounds.right - 34, hdrY, bounds.right - 12, hdrY + 24 };
+    RECT rCls = { bounds.right - dp(34), hdrY, bounds.right - dp(12), hdrY + dp(24) };
     bool hovCls = ptIn(rCls, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rCls, 6.0f, hovCls ? Theme::ACCENT_RED_BG : Theme::BG_CARD,
+    GdiPlusDraw::roundedCard(g, rCls, GdiPlusDraw::dpf(6.0f), hovCls ? Theme::ACCENT_RED_BG : Theme::BG_CARD,
                              hovCls ? Theme::ACCENT_RED : Theme::BORDER_SUBTLE, 1.0f);
     GdiPlusDraw::drawIcon(g, ICON_CLOSE, static_cast<float>(rCls.left + rCls.right) * 0.5f,
-                          static_cast<float>(rCls.top + rCls.bottom) * 0.5f, 10.0f,
+                          static_cast<float>(rCls.top + rCls.bottom) * 0.5f, GdiPlusDraw::dpf(10.0f),
                           hovCls ? Theme::ACCENT_RED : Theme::TEXT_SECONDARY);
     hotspots_.push_back(Hotspot{ rCls, DA_CLOSE, 0 });
 
     // 2. 4 Navigation Tabs
     const char* tabNames[4] = { "KEYS", "SENS", "PROFILES", "DEVICE" };
-    int tabY = hdrY + 32;
-    int tabW = (w - 12) / 4;
+    int tabY = hdrY + dp(32);
+    int tabW = (w - dp(12)) / 4;
     for (int i = 0; i < 4; ++i) {
-        RECT tr = { x0 + i * (tabW + 4), tabY, x0 + i * (tabW + 4) + tabW, tabY + 26 };
+        RECT tr = { x0 + i * (tabW + dp(4)), tabY, x0 + i * (tabW + dp(4)) + tabW, tabY + dp(26) };
         bool active = (activeTab_ == i);
         bool hov = ptIn(tr, hoverX, hoverY);
-        GdiPlusDraw::roundedCard(g, tr, 6.0f,
+        GdiPlusDraw::roundedCard(g, tr, GdiPlusDraw::dpf(6.0f),
                                  active ? Theme::ACCENT_CYAN_BG : (hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD),
                                  active ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE,
                                  active ? 1.4f : 1.0f);
@@ -254,8 +207,8 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
         hotspots_.push_back(Hotspot{ tr, DA_TAB_0 + i, 0 });
     }
 
-    int sepTop = tabY + 34;
-    int footerH = 46;
+    int sepTop = tabY + dp(34);
+    int footerH = dp(46);
     int sepBot = bounds.bottom - footerH;
     GdiPlusDraw::hLine(g, bounds.left + 1, bounds.right, sepTop, Theme::BORDER_CHROME);
     GdiPlusDraw::hLine(g, bounds.left + 1, bounds.right, sepBot, Theme::BORDER_CHROME);
@@ -269,7 +222,7 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
                             static_cast<INT>(bodyClip_.right - bodyClip_.left),
                             static_cast<INT>(bodyClip_.bottom - bodyClip_.top)));
 
-    int startY = bodyClip_.top + 10 - scrollY_[activeTab_];
+    int startY = bodyClip_.top + dp(10) - scrollY_[activeTab_];
     int endY = startY;
     if (activeTab_ == 0) {
         endY = paintTabKeys(g, x0, startY, w, profile, selectedBtnIndex, waitingNodeRebind, hoverX, hoverY);
@@ -281,40 +234,40 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
         endY = paintTabDevice(g, x0, startY, w, settings, connected, deviceLabel, logs, hoverX, hoverY);
     }
 
-    int contentH = (endY - startY) + 20;
+    int contentH = (endY - startY) + dp(20);
     int viewH = bodyClip_.bottom - bodyClip_.top;
     maxScrollY_ = (contentH > viewH) ? (contentH - viewH) : 0;
     if (scrollY_[activeTab_] > maxScrollY_) scrollY_[activeTab_] = maxScrollY_;
     if (scrollY_[activeTab_] < 0) scrollY_[activeTab_] = 0;
 
     // Subtle scrollbar thumb when scrollable
-    if (maxScrollY_ > 0 && viewH > 30) {
-        float thumbH = clampf(static_cast<float>(viewH * viewH) / static_cast<float>(contentH), 28.0f, static_cast<float>(viewH - 8));
+    if (maxScrollY_ > 0 && viewH > dp(30)) {
+        float thumbH = clampf(static_cast<float>(viewH * viewH) / static_cast<float>(contentH), GdiPlusDraw::dpf(28.0f), static_cast<float>(viewH - dp(8)));
         float ratio = static_cast<float>(scrollY_[activeTab_]) / static_cast<float>(maxScrollY_);
-        float thumbY = static_cast<float>(bodyClip_.top + 4) + ratio * (static_cast<float>(viewH - 8) - thumbH);
-        GdiPlusDraw::fillRoundedRect(g, static_cast<float>(bounds.right - 6), thumbY, 4.0f, thumbH, 2.0f, Theme::BORDER_STRONG);
+        float thumbY = static_cast<float>(bodyClip_.top + dp(4)) + ratio * (static_cast<float>(viewH - dp(8)) - thumbH);
+        GdiPlusDraw::fillRoundedRect(g, static_cast<float>(bounds.right - dp(6)), thumbY, GdiPlusDraw::dpf(4.0f), thumbH, GdiPlusDraw::dpf(2.0f), Theme::BORDER_STRONG);
     }
 
     g.Restore(savedState);
 
     // 4. Persistent Footer Bar (Auto-Save Status + Save Now + Done)
-    int fy = sepBot + 9;
-    GdiPlusDraw::textLeft(g, "Auto-Saved", static_cast<float>(x0), static_cast<float>(fy + 14), 11.0f, true, Theme::ACCENT_GREEN, 90.0f);
+    int fy = sepBot + dp(9);
+    GdiPlusDraw::textLeft(g, "Auto-Saved", static_cast<float>(x0), static_cast<float>(fy + dp(14)), 11.0f, true, Theme::ACCENT_GREEN, static_cast<float>(dp(90)));
 
-    RECT rSave = { x0 + 96, fy, x0 + 214, fy + 28 };
+    RECT rSave = { x0 + dp(96), fy, x0 + dp(214), fy + dp(28) };
     bool hovSave = ptIn(rSave, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rSave, 7.0f, hovSave ? Theme::ACCENT_GREEN : Theme::ACCENT_GREEN_BG,
+    GdiPlusDraw::roundedCard(g, rSave, GdiPlusDraw::dpf(7.0f), hovSave ? Theme::ACCENT_GREEN : Theme::ACCENT_GREEN_BG,
                              Theme::ACCENT_GREEN, 1.1f);
     GdiPlusDraw::textCenter(g, "SAVE (Ctrl+S)", static_cast<float>(rSave.left + rSave.right) * 0.5f,
-                            static_cast<float>(fy + 14), 11.0f, true, hovSave ? 0xFF07130Du : Theme::TEXT_PRIMARY);
+                            static_cast<float>(fy + dp(14)), 11.0f, true, hovSave ? 0xFF07130Du : Theme::TEXT_PRIMARY);
     hotspots_.push_back(Hotspot{ rSave, DA_SAVE, 0 });
 
-    RECT rDone = { rSave.right + 8, fy, bounds.right - 12, fy + 28 };
+    RECT rDone = { rSave.right + dp(8), fy, bounds.right - dp(12), fy + dp(28) };
     bool hovDone = ptIn(rDone, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rDone, 7.0f, hovDone ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG,
+    GdiPlusDraw::roundedCard(g, rDone, GdiPlusDraw::dpf(7.0f), hovDone ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG,
                              Theme::ACCENT_CYAN, 1.1f);
     GdiPlusDraw::textCenter(g, "DONE (F2)", static_cast<float>(rDone.left + rDone.right) * 0.5f,
-                            static_cast<float>(fy + 14), 11.0f, true, hovDone ? 0xFF07131Au : Theme::TEXT_PRIMARY);
+                            static_cast<float>(fy + dp(14)), 11.0f, true, hovDone ? 0xFF07131Au : Theme::TEXT_PRIMARY);
     hotspots_.push_back(Hotspot{ rDone, DA_CLOSE, 0 });
 }
 

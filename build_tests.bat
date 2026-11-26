@@ -46,6 +46,8 @@ if defined MINGW64_BIN (
     src\engine\InputEngine.cpp ^
     src\ui\GdiPlusDraw.cpp ^
     src\ui\HudRenderer.cpp ^
+    src\ui\TopBar.cpp ^
+    src\ui\SideRail.cpp ^
     src\ui\DrawerPanel.cpp ^
     -o tests\test_core.exe ^
     -static ^

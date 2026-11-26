@@ -15,6 +15,9 @@
 #include "engine/ThreadScheduling.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "ui/SideRail.hpp"
+#include "ui/Theme.hpp"
+#include "ui/TopBar.hpp"
 #include "video/D3D11Renderer.hpp"
 #include "video/H264Decoder.hpp"
 #include "video/LatencyTelemetry.hpp"
@@ -166,8 +169,11 @@ static void testProfileRoundTrip() {
         createUi.paint(g, drawerRc, editCopy, dummySet, tmpCustom, dummySel, false, false, "", "", noLogs, -1, -1);
     }
     DrawerActionResult mkRes;
-    // "+ BLANK CONFIG" button sits at y = 307..337 inside drawerRc (after Per-App Link card + Mode toggle)
-    assert(createUi.onMouseDown(80, 322, editCopy, dummySet, dummySel, mkRes));
+    // C2: use rectForAction test hook instead of brittle hard-coded pixel coordinates
+    RECT rBlankBtn = { 0, 0, 0, 0 };
+    assert(createUi.rectForAction(DA_CREATE_BLANK, 0, rBlankBtn));
+    assert(createUi.onMouseDown((rBlankBtn.left + rBlankBtn.right) / 2, (rBlankBtn.top + rBlankBtn.bottom) / 2,
+                                editCopy, dummySet, dummySel, mkRes));
     assert(mkRes.requestSwitchProfile && mkRes.switchProfilePath == (tmpDir + "\\my_custom_2.cfg"));
     // Verify original my_custom.cfg was NOT overwritten and my_custom_2.cfg has 0 buttons!
     Profile verifyOrig, verifyBlank2;
@@ -261,18 +267,21 @@ static void testEmulatorShellHelpersAndDrawer() {
         drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", "com.dts.freefiremax", logs, -1, -1);
     }
 
-    // Inspector layout inside drawer (body starts at y=87, startY=97):
-    // Card top=97, header+22=129, label+32=161, rebind+34=195, mouse row y=195..217, scroll row y=222..246
-    DrawerActionResult rMmb;
-    assert(drawer.onMouseDown(12 + 10 + 2 * 62 + 25, 206, loaded, settings, sel, rMmb));
-    assert(loaded.buttons[0].vk == VK_MBUTTON && rMmb.profileModified);
+    // C2: click Key Inspector & SENS controls via DrawerPanel::rectForAction(...)
+    RECT rMmb = { 0, 0, 0, 0 }, rUp = { 0, 0, 0, 0 }, rDn = { 0, 0, 0, 0 };
+    assert(drawer.rectForAction(DA_INSP_MOUSE_VK, VK_MBUTTON, rMmb));
+    DrawerActionResult rMmbRes;
+    assert(drawer.onMouseDown((rMmb.left + rMmb.right) / 2, (rMmb.top + rMmb.bottom) / 2, loaded, settings, sel, rMmbRes));
+    assert(loaded.buttons[0].vk == VK_MBUTTON && rMmbRes.profileModified);
 
+    assert(drawer.rectForAction(DA_INSP_MOUSE_VK, VK_CUSTOM_MWHEEL_UP, rUp));
     DrawerActionResult rScUp;
-    assert(drawer.onMouseDown(80, 234, loaded, settings, sel, rScUp));
+    assert(drawer.onMouseDown((rUp.left + rUp.right) / 2, (rUp.top + rUp.bottom) / 2, loaded, settings, sel, rScUp));
     assert(loaded.buttons[0].vk == VK_CUSTOM_MWHEEL_UP);
 
+    assert(drawer.rectForAction(DA_INSP_MOUSE_VK, VK_CUSTOM_MWHEEL_DOWN, rDn));
     DrawerActionResult rScDn;
-    assert(drawer.onMouseDown(260, 234, loaded, settings, sel, rScDn));
+    assert(drawer.onMouseDown((rDn.left + rDn.right) / 2, (rDn.top + rDn.bottom) / 2, loaded, settings, sel, rScDn));
     assert(loaded.buttons[0].vk == VK_CUSTOM_MWHEEL_DOWN);
 
     // Switch to SENS tab (tab 1) and verify LShift normalization on Lock/Unlock Key rebind
@@ -281,10 +290,10 @@ static void testEmulatorShellHelpersAndDrawer() {
         Gdiplus::Graphics g(memDC);
         drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", "com.dts.freefiremax", logs, -1, -1);
     }
-    // Trigger Lock/Unlock rebind -> reject LMB -> bind VK_SHIFT -> normalized to VK_LSHIFT
-    // Find by scrolling or direct hit (height 900 fits entire SENS tab!)
+    RECT rRebind = { 0, 0, 0, 0 };
+    assert(drawer.rectForAction(DA_REBIND_TOGGLE_AIM, 0, rRebind));
     DrawerActionResult rReb;
-    assert(drawer.onMouseDown(120, 748, loaded, settings, sel, rReb));
+    assert(drawer.onMouseDown((rRebind.left + rRebind.right) / 2, (rRebind.top + rRebind.bottom) / 2, loaded, settings, sel, rReb));
     assert(drawer.isRebindingToggleAim());
 
     DrawerActionResult rLmb;
@@ -1173,6 +1182,85 @@ static void testSprint1bPhase2PresetsAndTelemetry() {
     std::printf("[Test] Sprint 1b (2.1/2.2/2.3/2.4/2.5/2.6 presets, encoders & thermal) OK!\n");
 }
 
+static void testSprint2aUiFoundation() {
+    // 1. U1 contrast/HUD tokens
+    assert(Theme::BG_CARD == 0xFF232E42u);
+    assert(Theme::TEXT_MUTED == 0xFF8B9BB4u);
+    assert(Theme::HUD_FIRE == 0xFFFF8A3Du);
+
+    // 2. U2 Theme::Metrics at 96 / 144 (150%) / 192 (200%) DPI
+    Theme::Metrics m100, m150, m200;
+    m100.dpi = 96;
+    m150.dpi = 144;
+    m200.dpi = 192;
+    assert(m100.topBarH() == 40 && m150.topBarH() == 60 && m200.topBarH() == 80);
+    assert(m100.railW() == 54 && m150.railW() == 81 && m200.railW() == 108);
+    assert(m100.drawerW() == 356 && m150.drawerW() == 534 && m200.drawerW() == 712);
+    assert(m100.minWinW() == 960 && m150.minWinW() == 1440 && m200.minWinW() == 1920);
+    assert(m200.minWinH() == 1200);
+
+    // 3. C1/C2/U2/U3/S2(a): TopBar maximizeButtonRect & hoverItemAt + SideRail + DrawerPanel at 100/150/200% DPI
+    Profile p = ProfileDefaults::createFreeFire();
+    EngineTelemetry tel;
+    AppSettings s;
+    std::vector<std::string> logs;
+    HDC scDC = GetDC(NULL);
+    HDC mDC = CreateCompatibleDC(scDC);
+    HBITMAP bmp = CreateCompatibleBitmap(scDC, 1400, 1800);
+    HGDIOBJ old = SelectObject(mDC, bmp);
+
+    const int dpis[3] = { 96, 144, 192 };
+    for (int i = 0; i < 3; ++i) {
+        GdiPlusDraw::setActiveDpi(dpis[i]);
+        Theme::Metrics mm;
+        mm.dpi = dpis[i];
+
+        TopBar tb;
+        RECT tbRc = { 0, 0, mm.dp(1200), mm.topBarH() };
+        {
+            Gdiplus::Graphics g(mDC);
+            tb.paint(g, tbRc, "SM-G990E", true, false, p, tel, false, false, -1, -1);
+        }
+        RECT maxRc = tb.maximizeButtonRect();
+        assert(maxRc.right > maxRc.left && maxRc.bottom > maxRc.top);
+        assert(tb.hitTest((maxRc.left + maxRc.right) / 2, (maxRc.top + maxRc.bottom) / 2) == TB_MAXIMIZE);
+        int hid = -1;
+        RECT hrc = { 0, 0, 0, 0 };
+        assert(tb.hoverItemAt((maxRc.left + maxRc.right) / 2, (maxRc.top + maxRc.bottom) / 2, hid, hrc));
+        assert(hid == TB_MAXIMIZE && hrc.left == maxRc.left);
+
+        SideRail sr;
+        SideRailState srSt;
+        srSt.connected = true;
+        RECT srRc = { mm.dp(1146), mm.topBarH(), mm.dp(1200), mm.dp(760) };
+        {
+            Gdiplus::Graphics g(mDC);
+            sr.paint(g, srRc, srSt, -1, -1);
+        }
+        assert(sr.hoverItemAt((srRc.left + srRc.right) / 2, mm.topBarH() + mm.dp(16), hid, hrc));
+        assert(hid == SR_AIM_TOGGLE);
+
+        DrawerPanel dpnl;
+        dpnl.setProfilesDir("profiles", "profiles\\freefire.cfg");
+        dpnl.setActiveTab(0);
+        RECT dRc = { 0, 0, mm.drawerW(), mm.dp(850) };
+        {
+            Gdiplus::Graphics g(mDC);
+            dpnl.paint(g, dRc, p, s, "profiles\\freefire.cfg", 0, false, true, "SM-G990E", "com.dts.freefiremax", logs, -1, -1);
+        }
+        RECT rMmb = { 0, 0, 0, 0 };
+        assert(dpnl.rectForAction(DA_INSP_MOUSE_VK, VK_MBUTTON, rMmb));
+        assert(rMmb.bottom <= dRc.bottom && rMmb.right > rMmb.left);
+    }
+    GdiPlusDraw::setActiveDpi(96);
+
+    SelectObject(mDC, old);
+    DeleteObject(bmp);
+    DeleteDC(mDC);
+    ReleaseDC(NULL, scDC);
+    std::printf("[Test] Sprint 2A (C1/C2/U1/U2/U3/S2/S4/N29/N32) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1188,6 +1276,7 @@ int main() {
     testSprint0Fixes();
     testSprint1LatencyAndAsync();
     testSprint1bPhase2PresetsAndTelemetry();
-    std::printf("ALL SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    testSprint2aUiFoundation();
+    std::printf("ALL SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }
