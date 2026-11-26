@@ -174,7 +174,7 @@ void InputEngine::syncFpsViewConfigLocked(uint32_t w, uint32_t h) {
         cfg.rectTop    = minY;
         cfg.rectRight  = maxX;
         cfg.rectBottom = maxY;
-        cfg.touchDownRandomRangePx = 50;
+        cfg.touchDownRandomRangePx = 0; // P2: deterministic center re-plant (no artificial jitter)
     }
 
     viewStack_.configureMain(cfg);
@@ -221,6 +221,43 @@ void InputEngine::setProfile(const Profile& profile) {
     LeaveCriticalSection(&lock_);
 }
 
+void InputEngine::updateTuning(const Profile& profile) {
+    // N28: live-update sensitivities, fireMode, HUD flags, pollHz WITHOUT releasing active touches!
+    EnterCriticalSection(&lock_);
+    auto copyTuning = [&](Profile& dst) {
+        dst.sensX              = profile.sensX;
+        dst.sensY              = profile.sensY;
+        dst.fireSensX          = profile.fireSensX;
+        dst.fireSensY          = profile.fireSensY;
+        dst.scopeSensX         = profile.scopeSensX;
+        dst.scopeSensY         = profile.scopeSensY;
+        dst.accelPower         = profile.accelPower;
+        dst.accelRefSpeed      = profile.accelRefSpeed;
+        dst.accelCap           = profile.accelCap;
+        dst.smoothing          = profile.smoothing;
+        dst.ffCounterAccel     = profile.ffCounterAccel;
+        dst.invertY            = profile.invertY;
+        dst.unboundedAim       = profile.unboundedAim;
+        dst.fireMode           = profile.fireMode;
+        dst.showHudInPlay      = profile.showHudInPlay;
+        dst.hudOpacity         = profile.hudOpacity;
+        dst.pollHz             = profile.pollHz;
+        dst.idleResetMs        = profile.idleResetMs;
+        dst.touchDownDelayMs   = profile.touchDownDelayMs;
+        dst.touchUpDelayMs     = profile.touchUpDelayMs;
+        dst.tapJitterPx        = profile.tapJitterPx;
+        dst.rememberCursorPos  = profile.rememberCursorPos;
+        dst.cursorScrollStepPx = profile.cursorScrollStepPx;
+    };
+    copyTuning(rawProfile_);
+    copyTuning(profile_);
+    InterlockedExchange(&pollHzAtomic_, profile_.pollHz);
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    syncFpsViewConfigLocked(w, h);
+    LeaveCriticalSection(&lock_);
+}
+
 Profile InputEngine::getProfileCopy() const {
     EnterCriticalSection(&lock_);
     Profile copy = rawProfile_;
@@ -233,8 +270,23 @@ void InputEngine::setGamepadEnabled(bool enabled) {
     gamepad_.setEnabled(enabled);
     if (!enabled) {
         gamepad_.releaseAll(packetsThisSec_);
+        if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
     }
     LeaveCriticalSection(&lock_);
+}
+
+void InputEngine::setAppFocused(bool focused) {
+    LONG val = focused ? 1 : 0;
+    if (InterlockedExchange(&appFocused_, val) != val && wakeEvent_) {
+        SetEvent(wakeEvent_);
+    }
+}
+
+void InputEngine::setEditMode(bool editing) {
+    LONG val = editing ? 1 : 0;
+    if (InterlockedExchange(&editMode_, val) != val && wakeEvent_) {
+        SetEvent(wakeEvent_);
+    }
 }
 
 void InputEngine::setAimMode(bool enabled) {
@@ -605,7 +657,7 @@ bool InputEngine::onKeyEvent(int vk, bool down, bool& outRequestToggleAim) {
     return consumed;
 }
 
-void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
+void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs, bool fromGamepad) {
     if (!profile_.keymapEnabled) return;
     bool isAim = (aimMode_ != 0);
     bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
@@ -618,8 +670,8 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
 
-    // Cursor Mode: mouse buttons ONLY trigger NODE_CURSOR_TOGGLE; all keyboard keys remain active!
-    if (!isAim && mouseBtn) {
+    // Cursor Mode: mouse buttons ONLY trigger NODE_CURSOR_TOGGLE, EXCEPT gamepad triggers (E2)!
+    if (!isAim && !fromGamepad && mouseBtn) {
         if (down) {
             ActionEffects eff;
             actions_.dispatchKey(vk, true, false, profile_, heldKeys_, w, h, nowMs,
@@ -635,19 +687,27 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
         bool keyMatches = KeyCodes::matches(vk, b.vk) &&
                           (b.comboVk == 0 || KeyCodes::isKeyHeld(heldKeys_, b.comboVk));
         if (keyMatches) {
-            if (!isAim && b.action == NODE_HOLD_VIEW) continue;
+            if (!isAim && !fromGamepad && b.action == NODE_HOLD_VIEW) continue;
             hasCustomButtonOnVk = true;
             break;
         }
     }
 
-    // 2. WASD Virtual Joystick (active in BOTH Aim Mode and Cursor Mode)
-    if (joystick_.handleKey(vk, down, !hasCustomButtonOnVk, profile_, w, h, nowMs, packetsThisSec_)) {
+    // 2. WASD Virtual Joystick (E3: single joystick owner; last-input-wins over gamepad left stick!)
+    if (!fromGamepad && joystick_.handleKey(vk, down, !hasCustomButtonOnVk, profile_, w, h, nowMs, packetsThisSec_)) {
+        if (joystick_.isDown()) {
+            if (joyOwner_ == JOY_GAMEPAD) {
+                gamepad_.releaseJoystickOnly(packetsThisSec_);
+            }
+            joyOwner_ = JOY_KEYBOARD;
+        } else if (joyOwner_ == JOY_KEYBOARD) {
+            joyOwner_ = JOY_NONE;
+        }
         return;
     }
 
-    // 3. Fire Button (DRAG-FIRE, CLAW-LEFT, DUAL-DRAG)
-    if ((isAim || !KeyCodes::isMouseKey(profile_.fireVk)) && KeyCodes::matches(vk, profile_.fireVk)) {
+    // 3. Fire Button (DRAG-FIRE, CLAW-LEFT, DUAL-DRAG; E2: gamepad RT works in cursor mode too)
+    if ((isAim || fromGamepad || !KeyCodes::isMouseKey(profile_.fireVk)) && KeyCodes::matches(vk, profile_.fireVk)) {
         if (isWheel) {
             if (down) {
                 pressFireLocked(nowMs);
@@ -693,7 +753,7 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
 
     // 4. Action Buttons (2-level combo lookup + 10 KeyActionType behaviors)
     ActionEffects eff;
-    actions_.dispatchKey(vk, down, isAim, profile_, heldKeys_, w, h, nowMs,
+    actions_.dispatchKey(vk, down, (isAim || fromGamepad), profile_, heldKeys_, w, h, nowMs,
                          scopeSensActive_, eff, packetsThisSec_);
 
     if (eff.pushHoldView && eff.holdViewIdx >= 0 &&
@@ -802,6 +862,8 @@ void InputEngine::releaseAllLocked() {
     releaseMouseTouchesLocked();
     joystick_.release(packetsThisSec_);
     gamepad_.releaseAll(packetsThisSec_);
+    joyOwner_ = JOY_NONE;
+    prevGpStickDeflected_ = false;
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     actions_.releaseButtons(profile_, false, packetsThisSec_);
     // Final bounded-pool safety sweep: guarantees 0 active touches left on the phone
@@ -875,18 +937,30 @@ bool InputEngine::processTick(double nowMs) {
     actions_.tick(profile_, nowMs, packetsThisSec_);
     joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
 
-    // Stage 3: XInput Gamepad-to-Touch polling (360° analog left stick + right stick look + buttons/triggers)
+    // Stage 3: XInput Gamepad-to-Touch polling (E3 single joystick owner + E4 focus/edit gating)
     double dtMs = (lastTickMs_ > 0.0) ? clampd(nowMs - lastTickMs_, 0.5, 40.0) : 4.0;
     lastTickMs_ = nowMs;
     GamepadFrameOutput gpOut;
-    if (profile_.keymapEnabled && !joystick_.isDown()) {
-        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut);
+    if (appFocused_ == 0 || editMode_ != 0) {
+        gamepad_.suspendForFocusLoss(packetsThisSec_, gpOut);
+        if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
+        prevGpStickDeflected_ = false;
     } else if (profile_.keymapEnabled) {
-        // Keyboard WASD currently holds joystick; still poll gamepad buttons & right stick
-        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut);
+        bool kbOwnsJoy = (joyOwner_ == JOY_KEYBOARD);
+        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut, kbOwnsJoy);
+        if (gpOut.stickDeflected && !prevGpStickDeflected_ && kbOwnsJoy) {
+            // Fresh gamepad stick deflection while WASD owns joystick -> last-input-wins handoff on next tick!
+            joystick_.release(packetsThisSec_);
+            joyOwner_ = JOY_GAMEPAD;
+        } else if (gpOut.analogJoyActive) {
+            joyOwner_ = JOY_GAMEPAD;
+        } else if (!gpOut.stickDeflected && joyOwner_ == JOY_GAMEPAD) {
+            joyOwner_ = JOY_NONE;
+        }
+        prevGpStickDeflected_ = gpOut.stickDeflected;
     }
     for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
-        processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs);
+        processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs, true);
     }
     bool hasGpLook = (std::fabs(gpOut.lookDx) > 0.001 || std::fabs(gpOut.lookDy) > 0.001);
 

@@ -51,14 +51,14 @@ ViewportHost::~ViewportHost() {
 LRESULT CALLBACK ViewportHost::hostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     ViewportHost* self = nullptr;
     if (msg == WM_NCCREATE) {
-        CREATESTRUCTA* cs = reinterpret_cast<CREATESTRUCTA*>(lParam);
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         self = reinterpret_cast<ViewportHost*>(cs->lpCreateParams);
-        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     } else {
-        self = reinterpret_cast<ViewportHost*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        self = reinterpret_cast<ViewportHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
     if (self) return self->handleHostMessage(hwnd, msg, wParam, lParam);
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -92,7 +92,7 @@ LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_SYSKEYUP:
         case WM_SYSCHAR:
             if (parentHwnd_) {
-                return SendMessageA(parentHwnd_, msg, wParam, lParam);
+                return SendMessageW(parentHwnd_, msg, wParam, lParam);
             }
             break;
         case WM_LBUTTONDOWN:
@@ -116,46 +116,55 @@ LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
                 POINT pt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
                 MapWindowPoints(hwnd, parentHwnd_, &pt, 1);
-                SendMessageA(parentHwnd_, msg, wParam, MAKELPARAM(pt.x, pt.y));
+                SendMessageW(parentHwnd_, msg, wParam, MAKELPARAM(pt.x, pt.y));
             }
             return 0;
         }
         case WM_MOUSELEAVE:
-            if (parentHwnd_) PostMessageA(parentHwnd_, WM_MOUSELEAVE, 0, 0);
+            if (parentHwnd_) PostMessageW(parentHwnd_, WM_MOUSELEAVE, 0, 0);
             return 0;
         case WM_MOUSEWHEEL:
             if (parentHwnd_) {
-                SendMessageA(parentHwnd_, msg, wParam, lParam);
+                SendMessageW(parentHwnd_, msg, wParam, lParam);
                 return 0;
             }
             break;
         default:
             break;
     }
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 bool ViewportHost::create(HWND parentHwnd, HINSTANCE hInst) {
     parentHwnd_ = parentHwnd;
     static bool classRegistered = false;
     if (!classRegistered) {
-        WNDCLASSEXA wc;
+        WNDCLASSEXW wc;
         ZeroMemory(&wc, sizeof(wc));
         wc.cbSize = sizeof(wc);
         wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
         wc.lpfnWndProc = ViewportHost::hostWndProc;
         wc.hInstance = hInst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.lpszClassName = "PhantomTouchViewportHost";
-        if (!RegisterClassExA(&wc)) return false;
+        wc.lpszClassName = L"PhantomTouchViewportHost";
+        if (!RegisterClassExW(&wc)) return false;
         classRegistered = true;
     }
 
-    hwnd_ = CreateWindowExA(0, "PhantomTouchViewportHost", "",
+    hwnd_ = CreateWindowExW(0, L"PhantomTouchViewportHost", L"",
                             WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                             0, 0, 100, 100,
                             parentHwnd, NULL, hInst, this);
     return hwnd_ != NULL;
+}
+
+bool ViewportHost::rebuildNativeDevice(std::string& outError) {
+    if (!d3d_.rebuildDevice(outError)) {
+        return false;
+    }
+    updateVideoLayout(lastPhoneW_, lastPhoneH_);
+    renderNativeFrame(true);
+    return true;
 }
 
 bool ViewportHost::ensureNativeDeviceInitialized(std::string& outError) {

@@ -871,6 +871,136 @@ static void testStage3EmulatorFeatures() {
     std::printf("[Test] Stage 3 (Edge-Anchored 20:9<->16:9, Virtual Display cfg, XInput Gamepad, ISO QR + mDNS) OK!\n");
 }
 
+static void testSprint0Fixes() {
+    // 1. V4: Session header parser (server rotation vs client resize vs video packet)
+    const uint8_t hdrServerRot[12] = { 0x80, 0, 0, 0, 0, 0, 0x04, 0x38, 0, 0, 0x09, 0x24 }; // 1080x2340
+    uint32_t outW = 0, outH = 0;
+    bool clientResized = true;
+    assert(ScrcpyBridge::parseV4SessionHeader(hdrServerRot, outW, outH, clientResized));
+    assert(outW == 1080 && outH == 2340 && !clientResized);
+
+    const uint8_t hdrClientResize[12] = { 0x80, 0, 0, 0x01, 0, 0, 0x07, 0x80, 0, 0, 0x04, 0x38 }; // 1920x1080
+    assert(ScrcpyBridge::parseV4SessionHeader(hdrClientResize, outW, outH, clientResized));
+    assert(outW == 1920 && outH == 1080 && clientResized);
+
+    const uint8_t hdrVideoPkt[12] = { 0x40, 0, 0, 0x01, 0, 0, 0, 0x64, 0, 0, 0x01, 0x00 };
+    assert(!ScrcpyBridge::parseV4SessionHeader(hdrVideoPkt, outW, outH, clientResized));
+
+    // 2. V5: serializeResizeDisplay byte-for-byte (type 21, even-rounded width/height)
+    uint8_t rbuf[5] = {0};
+    assert(ScrcpyBridge::serializeResizeDisplay(rbuf, 1921, 1081) == 5);
+    assert(rbuf[0] == 21 && rbuf[1] == 0x07 && rbuf[2] == 0x80 && rbuf[3] == 0x04 && rbuf[4] == 0x38);
+
+    // 3. V10: Default mirrorFps is 0 (Uncapped) and buildScrcpyArgs omits --max-fps
+    AppSettings defSet;
+    assert(defSet.mirrorFps == 0);
+    assert(defSet.buildScrcpyArgs().find("--max-fps") == std::string::npos);
+
+    // 4. V12 / V7: Version major parser handles >=10 cleanly
+    assert(ScrcpyBridge::parseMajorVersion("5.0.1") == 5);
+    assert(ScrcpyBridge::parseMajorVersion("10.2.0") == 10);
+
+    // 5. B3: Pure ASCII check & UTF-8 code-point safe chunking
+    assert(ScrcpyBridge::isPureAscii("Hello, World 123!"));
+    assert(!ScrcpyBridge::isPureAscii("Zażółć gęślą jaźń 写真"));
+    const std::string utf8Multi = "abc\xE2\x82\xACxyz\xF0\x9F\x98\x80"; // "abc€xyz😀"
+    std::vector<std::string> chunks = ScrcpyBridge::splitUtf8Chunks(utf8Multi, 5);
+    std::string rejoined;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        assert(!chunks[i].empty());
+        assert((static_cast<unsigned char>(chunks[i][0]) & 0xC0u) != 0x80u); // Never starts on continuation byte!
+        rejoined += chunks[i];
+    }
+    assert(rejoined == utf8Multi);
+
+    // 6. B6: BCryptGenRandom pairing code (>=10 alphanumeric chars, distinct across calls)
+    std::string c1 = QrCodeGen::generateSecurePairingCode(12);
+    std::string c2 = QrCodeGen::generateSecurePairingCode(12);
+    assert(c1.size() == 12 && c2.size() == 12 && c1 != c2);
+    for (size_t i = 0; i < c1.size(); ++i) {
+        char ch = c1[i];
+        bool alnum = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        assert(alnum);
+    }
+
+    // 7. E1: AltGr (Ctrl+Alt) is NOT treated as Ctrl shortcut
+    assert(KeyCodes::isPureCtrlShortcut(true, false));
+    assert(!KeyCodes::isPureCtrlShortcut(true, true));
+    assert(!KeyCodes::isPureCtrlShortcut(false, false));
+
+    // 8. E2, E3, E4: Gamepad trigger in cursor mode + owner suppression + focus-loss neutral latch
+    std::vector<RecordedTouch> gpLog;
+    uint32_t gpPkts = 0;
+    GamepadController gp;
+    gp.setTouchSink(recordTouchCb, &gpLog);
+    Profile gpProf = ProfileDefaults::createFreeFire();
+
+    GamepadSnapshot sStick;
+    sStick.connected = true;
+    sStick.lx = 0.0f; sStick.ly = 0.90f;
+    sStick.rt = 0.85f; // E2: trigger held
+    GamepadFrameOutput gpOut;
+    gp.processSnapshot(sStick, gpProf, 1920, 1080, 10.0, gpPkts, gpOut, true /* suppressLeftStick for E3 */);
+    assert(gpOut.stickDeflected && !gpOut.analogJoyActive && !gp.isJoyDown() && gpLog.empty());
+    assert(gpOut.keyDeltaCount == 1 && gpOut.keyDeltas[0].vk == gpProf.fireVk && gpOut.keyDeltas[0].down);
+
+    // E4: Focus loss lifts held trigger and latches until released to neutral
+    gp.suspendForFocusLoss(gpPkts, gpOut);
+    assert(gpOut.keyDeltaCount == 1 && gpOut.keyDeltas[0].vk == gpProf.fireVk && !gpOut.keyDeltas[0].down);
+    // Holding RT still depressed after focus returns -> must NOT re-trigger!
+    gp.processSnapshot(sStick, gpProf, 1920, 1080, 10.0, gpPkts, gpOut, false);
+    assert(gpOut.keyDeltaCount == 0);
+    // Return RT to neutral, then press again -> fires cleanly!
+    GamepadSnapshot sNeutral;
+    sNeutral.connected = true;
+    gp.processSnapshot(sNeutral, gpProf, 1920, 1080, 10.0, gpPkts, gpOut, false);
+    gp.processSnapshot(sStick, gpProf, 1920, 1080, 10.0, gpPkts, gpOut, false);
+    assert(gpOut.keyDeltaCount == 1 && gpOut.keyDeltas[0].vk == gpProf.fireVk && gpOut.keyDeltas[0].down);
+
+    // 9. P2 & N12: zero default jitter + comma/hash/backslash escaping in ProfileStore
+    assert(Profile().tapJitterPx == 0 && ProfileDefaults::createFreeFire().tapJitterPx == 0);
+    Profile escProf = ProfileDefaults::createFreeFire();
+    escProf.name = "My #1, Pro\\Cfg";
+    escProf.buttons[0].label = "A,B#1\\2";
+    const std::string tmpEsc = "profiles\\_test_escape.cfg";
+    assert(ProfileStore::save(tmpEsc, escProf));
+    Profile escLoaded;
+    assert(ProfileStore::load(tmpEsc, escLoaded));
+    std::remove(tmpEsc.c_str());
+    assert(escLoaded.name == "My #1, Pro\\Cfg");
+    assert(!escLoaded.buttons.empty() && escLoaded.buttons[0].label == "A,B#1\\2");
+
+    // 10. N28: InputEngine::updateTuning must NOT release active touches!
+    ScrcpyBridge tBridge;
+    InputEngine tEng(&tBridge);
+    tEng.setGamepadEnabled(false);
+    Profile tProf = ProfileDefaults::createFreeFire();
+    tEng.setProfile(tProf);
+    std::vector<RecordedTouch> n28Log;
+    tEng.setTouchSinkForTest(recordTouchCb, &n28Log);
+    bool dummyToggle = false;
+    tEng.onKeyEvent('W', true, dummyToggle);
+    assert(tEng.getTelemetry().joyDown);
+    size_t upCountBefore = 0;
+    for (size_t i = 0; i < n28Log.size(); ++i) {
+        if (n28Log[i].action == TOUCH_UP) ++upCountBefore;
+    }
+    tProf.sensX = 1.75f;
+    tProf.fireMode = FIRE_MODE_DRAG_RIGHT;
+    tProf.showHudInPlay = false;
+    tEng.updateTuning(tProf);
+    size_t upCountAfter = 0;
+    for (size_t i = 0; i < n28Log.size(); ++i) {
+        if (n28Log[i].action == TOUCH_UP) ++upCountAfter;
+    }
+    assert(upCountAfter == upCountBefore && tEng.getTelemetry().joyDown);
+    assert(std::fabs(tEng.getProfileCopy().sensX - 1.75f) < 0.01f);
+    assert(tEng.getProfileCopy().fireMode == FIRE_MODE_DRAG_RIGHT && !tEng.getProfileCopy().showHudInPlay);
+    tEng.releaseAllTouches();
+
+    std::printf("[Test] Sprint 0 (V4/V5/V10/V12/B3/B6/E1/E2/E3/E4/P2/N12/N28) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -883,6 +1013,7 @@ int main() {
     testStage1EmulatorFeatures();
     testStage2VideoPipeline();
     testStage3EmulatorFeatures();
-    std::printf("ALL STAGE 1 + STAGE 2 + STAGE 3 REAL-PHONE EMULATOR TESTS PASSED!\n");
+    testSprint0Fixes();
+    std::printf("ALL SPRINT 0 + STAGE 1-3 REAL-PHONE EMULATOR TESTS PASSED!\n");
     return 0;
 }

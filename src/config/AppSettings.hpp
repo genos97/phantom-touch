@@ -12,8 +12,8 @@ struct AppSettings {
     bool maximized = false;
     bool alwaysOnTop = false;
 
-    // Mirror stream parameters (defaults match the smooth 90 FPS 16M setup)
-    int mirrorFps = 90;       // 60 / 90 / 120
+    // Mirror stream parameters (Uncapped default per LATENCY_PLAN V10; set 60/90/120 on Wi-Fi)
+    int mirrorFps = 0;        // 0 = Uncapped, 60 / 90 / 120
     int mirrorBitrateMbps = 16; // 8 / 12 / 16 / 24
     int mirrorMaxSize = 0;    // 0 = Native, 1600, 1280
     bool mirrorAudio = false; // Forward device audio (scrcpy 5.0 supports native audio)

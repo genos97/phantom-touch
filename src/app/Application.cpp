@@ -11,11 +11,16 @@
 #include <string>
 
 std::string Application::getExeDir() {
-    char buf[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, buf, MAX_PATH);
-    std::string s(buf);
-    size_t pos = s.find_last_of("\\/");
-    return (pos == std::string::npos) ? "." : s.substr(0, pos);
+    wchar_t wbuf[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, wbuf, MAX_PATH);
+    std::wstring ws(wbuf);
+    size_t pos = ws.find_last_of(L"\\/");
+    std::wstring wdir = (pos == std::wstring::npos) ? L"." : ws.substr(0, pos);
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), static_cast<int>(wdir.size()), NULL, 0, NULL, NULL);
+    if (bytes <= 0) return ".";
+    std::string out(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), static_cast<int>(wdir.size()), &out[0], bytes, NULL, NULL);
+    return out;
 }
 
 void Application::enableDpiAwareness() {
@@ -36,12 +41,12 @@ void Application::enableDpiAwareness() {
 
 void Application::printUsage() {
     std::printf(
-        "Phantom Touch v2.0 — Production Emulator Shell & Multi-Touch Keymapper\n"
+        "Phantom Touch v2.1 — Production Emulator Shell & Multi-Touch Keymapper\n"
         "======================================================================\n"
         "Usage:\n"
         "  PhantomTouch.exe [options]\n\n"
         "Options:\n"
-        "  --profile <file>   Load a specific profile (default: last active or profiles\\freefire.cfg)\n"
+        "  --profile <file>   Load a specific profile (default: last active or profiles\\desktop.cfg)\n"
         "  --demo             Launch directly into Offline Keymap Studio (no phone required)\n"
         "  --no-mirror        Connect control bridge without spawning embedded display\n"
         "  --console          Attach a debug console window for live stdout logs\n"
@@ -90,7 +95,7 @@ int Application::run(int argc, char** argv) {
     // Single-instance guard: bring existing Phantom Touch shell to front instead of double-launching
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Local\\PhantomTouchEmulatorShellMutex");
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowA("PhantomTouchShellClass", NULL);
+        HWND existing = FindWindowW(L"PhantomTouchShellClass", NULL);
         if (existing) {
             if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
@@ -106,12 +111,20 @@ int Application::run(int argc, char** argv) {
     CreateDirectoryA(profilesDir.c_str(), NULL);
     std::string settingsPath = profilesDir + "\\.shell_settings.cfg";
 
+    bool firstRunDesktop = false;
     if (!explicitProfile) {
         std::string lastPath = ProfileStore::loadLastActive(profilesDir);
-        profilePath = lastPath.empty() ? (profilesDir + "\\freefire.cfg") : lastPath;
+        if (lastPath.empty()) {
+            profilePath = profilesDir + "\\desktop.cfg";
+            firstRunDesktop = true;
+        } else {
+            profilePath = lastPath;
+        }
     }
 
-    Profile profile = ProfileDefaults::createFreeFire();
+    Profile profile = firstRunDesktop
+        ? ProfileDefaults::createDesktop("Desktop (Typing)")
+        : ProfileDefaults::createFreeFire();
     if (!ProfileStore::load(profilePath, profile)) {
         ProfileStore::save(profilePath, profile);
     }

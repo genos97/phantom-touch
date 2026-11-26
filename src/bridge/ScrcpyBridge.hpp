@@ -43,8 +43,9 @@ typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
 
 struct BridgeStreamConfig {
     int maxSize = 0;            // 0 = native phone resolution
-    int maxFps = 1;             // 1 for legacy metadata-only, 60/90/120 for native video
-    int bitrateMbps = 0;        // 0 = 100kbps metadata-only, 8..24 Mbps for native video
+    int maxFps = 0;             // 0 = uncapped (V10), >0 = cap FPS; metadataOnly forces 1 FPS
+    int bitrateMbps = 16;       // Video bitrate in Mbps (metadataOnly forces 100kbps)
+    bool metadataOnly = false;  // True for legacy 1 FPS control-only mode
     bool stayAwake = true;
     bool virtualDisplay = false;
     std::string virtualDisplaySpec; // e.g. "1920x1080/320", "1280x720/240", or "auto"
@@ -64,6 +65,11 @@ public:
     static std::vector<AdbDeviceInfo> parseAdbDevicesOutput(const std::string& raw);
     static std::vector<MdnsServiceInfo> parseMdnsServicesOutput(const std::string& raw);
     static std::string parseForegroundPackage(const std::string& dumpsysRaw);
+    static int parseMajorVersion(const std::string& versionStr);
+    static bool parseV4SessionHeader(const uint8_t hdr[12], uint32_t& outW, uint32_t& outH, bool& outClientResized);
+    static size_t serializeResizeDisplay(uint8_t* buf, uint16_t width, uint16_t height);
+    static bool isPureAscii(const std::string& utf8);
+    static std::vector<std::string> splitUtf8Chunks(const std::string& utf8, size_t maxBytes);
 
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,
@@ -94,6 +100,8 @@ public:
     bool sendSetClipboard(const std::string& utf8Text, bool paste);
     bool sendGetClipboard(uint8_t copyKey); // 0=NONE, 1=COPY, 2=CUT
     bool sendStartApp(const std::string& appName);
+    bool sendResetVideo();
+    bool sendResizeDisplay(uint16_t width, uint16_t height);
     void sendAndroidNav(uint32_t androidKeycode);
     bool setDisplayPower(bool on);
 
@@ -121,8 +129,8 @@ private:
     std::string adbPrefix() const;
     bool sendAll(SOCKET s, const uint8_t* data, int len);
     bool recvAll(SOCKET s, uint8_t* data, int len);
-    bool runCommandCapture(const std::string& cmdLine, std::string& outText, DWORD& outExitCode);
-    bool runCommandCaptureBinary(const std::string& cmdLine, std::vector<uint8_t>& outBytes, DWORD& outExitCode);
+    bool runCommandCapture(const std::string& cmdLine, std::string& outText, DWORD& outExitCode, DWORD timeoutMs = 15000);
+    bool runCommandCaptureBinary(const std::string& cmdLine, std::vector<uint8_t>& outBytes, DWORD& outExitCode, DWORD timeoutMs = 15000);
 
     bool wsaInit_ = false;
     volatile LONG connected_ = 0;
@@ -139,6 +147,7 @@ private:
 
     mutable CRITICAL_SECTION sendLock_;
     mutable CRITICAL_SECTION metaLock_;
+    mutable CRITICAL_SECTION procSpawnLock_;
 
     std::string adbExe_;
     std::string activeSerial_;

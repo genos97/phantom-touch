@@ -38,6 +38,8 @@ public:
     bool isHardwareAccelerated() const { return hardwareAccel_; }
     bool isFlipModel() const { return flipModel_; }
     bool supportsGpuNv12() const { return supportsGpuNv12Srv_; }
+    bool isDeviceLost() const { return deviceLost_ != 0; }
+    bool rebuildDevice(std::string& outError);
     ID3D11Device* d3dDevice() const { return device_; }
 
     // Resizes swap chain backbuffer to match ViewportHost client dimensions (thread-safe)
@@ -88,12 +90,17 @@ private:
     mutable CRITICAL_SECTION frameLock_; // Protects stagedFrame_ / stagedHud_ / hasFrame_
 
     HWND targetHwnd_ = NULL;
+    HWND savedHwnd_ = NULL;
+    int savedW_ = 640;
+    int savedH_ = 360;
     int backbufW_ = 0;
     int backbufH_ = 0;
     bool hardwareAccel_ = false;
     bool flipModel_ = false;
     bool tearingSupported_ = false;
     bool supportsGpuNv12Srv_ = false;
+    bool occluded_ = false;
+    volatile LONG deviceLost_ = 0;
     UINT swapChainFlags_ = 0;
     volatile LONG lastPresentTick_ = 0;
 

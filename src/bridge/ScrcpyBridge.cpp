@@ -11,24 +11,46 @@
 
 namespace {
 
+std::wstring utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), NULL, 0);
+    if (wlen <= 0) return std::wstring();
+    std::wstring ws(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), &ws[0], wlen);
+    return ws;
+}
+
+std::string wideToUtf8(const std::wstring& ws) {
+    if (ws.empty()) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), NULL, 0, NULL, NULL);
+    if (len <= 0) return std::string();
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), &out[0], len, NULL, NULL);
+    return out;
+}
+
 bool fileExists(const std::string& path) {
-    DWORD attr = GetFileAttributesA(path.c_str());
+    std::wstring wp = utf8ToWide(path);
+    if (wp.empty()) return false;
+    DWORD attr = GetFileAttributesW(wp.c_str());
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
 std::string getExeDir() {
-    char buf[MAX_PATH] = {0};
-    GetModuleFileNameA(NULL, buf, MAX_PATH);
-    std::string s(buf);
+    wchar_t buf[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, buf, MAX_PATH);
+    std::string s = wideToUtf8(buf);
     size_t pos = s.find_last_of("\\/");
     return (pos == std::string::npos) ? "." : s.substr(0, pos);
 }
 
 std::string findInPath(const std::string& filename) {
-    char buf[MAX_PATH] = {0};
-    DWORD n = SearchPathA(NULL, filename.c_str(), NULL, MAX_PATH, buf, NULL);
+    wchar_t buf[MAX_PATH] = {0};
+    std::wstring wname = utf8ToWide(filename);
+    if (wname.empty()) return "";
+    DWORD n = SearchPathW(NULL, wname.c_str(), NULL, MAX_PATH, buf, NULL);
     if (n > 0 && n < MAX_PATH) {
-        return std::string(buf);
+        return wideToUtf8(buf);
     }
     return "";
 }
@@ -71,7 +93,7 @@ uint64_t readU64BE(const uint8_t* p) {
 }
 
 std::string parseScrcpyVersion(const std::string& output) {
-    // Expected first line: "scrcpy 3.1 <https://...>"
+    // Expected first line: "scrcpy 5.0.1 <https://...>"
     size_t pos = output.find("scrcpy ");
     if (pos == std::string::npos) return "";
     pos += 7;
@@ -83,11 +105,116 @@ std::string parseScrcpyVersion(const std::string& output) {
     return output.substr(pos, end - pos);
 }
 
+bool spawnProcessWithPipeCapture(CRITICAL_SECTION& procSpawnLock,
+                                 const std::string& cmdLine,
+                                 HANDLE writePipe,
+                                 bool redirectStderr,
+                                 PROCESS_INFORMATION& outPi) {
+    std::wstring wcmd = utf8ToWide(cmdLine);
+    if (wcmd.empty()) return false;
+    std::vector<wchar_t> mutableCmd(wcmd.begin(), wcmd.end());
+    mutableCmd.push_back(L'\0');
+
+    EnterCriticalSection(&procSpawnLock);
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    // Must outlive CreateProcessW: UpdateProcThreadAttribute stores the pointer to inheritList, not a copy!
+    HANDLE inheritList[1] = { writePipe };
+    bool hasAttrList = false;
+    if (attrSize > 0 && InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
+        if (UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      inheritList, sizeof(inheritList), NULL, NULL)) {
+            hasAttrList = true;
+        } else {
+            DeleteProcThreadAttributeList(attrList);
+        }
+    }
+
+    STARTUPINFOEXW siex;
+    ZeroMemory(&siex, sizeof(siex));
+    siex.StartupInfo.cb = hasAttrList ? sizeof(STARTUPINFOEXW) : sizeof(STARTUPINFOW);
+    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    siex.StartupInfo.wShowWindow = SW_HIDE;
+    siex.StartupInfo.hStdOutput = writePipe;
+    siex.StartupInfo.hStdError  = redirectStderr ? writePipe : NULL;
+    siex.lpAttributeList = hasAttrList ? attrList : NULL;
+
+    DWORD flags = CREATE_NO_WINDOW | (hasAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0u);
+    ZeroMemory(&outPi, sizeof(outPi));
+    BOOL ok = CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, TRUE,
+                             flags, NULL, NULL, &siex.StartupInfo, &outPi);
+
+    if (hasAttrList) {
+        DeleteProcThreadAttributeList(attrList);
+    }
+    LeaveCriticalSection(&procSpawnLock);
+    return ok != FALSE;
+}
+
+bool readPipeWithTimeout(HANDLE readPipe, HANDLE procHandle, DWORD timeoutMs,
+                         std::vector<uint8_t>& outBytes, DWORD& outExitCode) {
+    outBytes.clear();
+    outExitCode = 1;
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+    uint8_t buf[4096];
+
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(readPipe, NULL, 0, NULL, &avail, NULL)) {
+            break;
+        }
+        if (avail > 0) {
+            DWORD toRead = (avail > sizeof(buf)) ? static_cast<DWORD>(sizeof(buf)) : avail;
+            DWORD bytesRead = 0;
+            if (ReadFile(readPipe, buf, toRead, &bytesRead, NULL) && bytesRead > 0) {
+                outBytes.insert(outBytes.end(), buf, buf + bytesRead);
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        if (WaitForSingleObject(procHandle, 20) == WAIT_OBJECT_0) {
+            // Drain any trailing bytes written before process exit
+            while (PeekNamedPipe(readPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+                DWORD toRead = (avail > sizeof(buf)) ? static_cast<DWORD>(sizeof(buf)) : avail;
+                DWORD bytesRead = 0;
+                if (ReadFile(readPipe, buf, toRead, &bytesRead, NULL) && bytesRead > 0) {
+                    outBytes.insert(outBytes.end(), buf, buf + bytesRead);
+                } else {
+                    break;
+                }
+            }
+            GetExitCodeProcess(procHandle, &outExitCode);
+            return true;
+        }
+
+        if (GetTickCount64() >= deadline) {
+            TerminateProcess(procHandle, 1);
+            WaitForSingleObject(procHandle, 500);
+            outExitCode = STILL_ACTIVE;
+            return false;
+        }
+    }
+
+    if (WaitForSingleObject(procHandle, 500) == WAIT_OBJECT_0) {
+        GetExitCodeProcess(procHandle, &outExitCode);
+        return true;
+    }
+    TerminateProcess(procHandle, 1);
+    outExitCode = STILL_ACTIVE;
+    return false;
+}
+
 } // namespace
 
 ScrcpyBridge::ScrcpyBridge() {
     InitializeCriticalSection(&sendLock_);
     InitializeCriticalSection(&metaLock_);
+    InitializeCriticalSection(&procSpawnLock_);
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
         wsaInit_ = true;
@@ -99,11 +226,13 @@ ScrcpyBridge::~ScrcpyBridge() {
     if (wsaInit_) {
         WSACleanup();
     }
-    DeleteCriticalSection(&sendLock_);
+    DeleteCriticalSection(&procSpawnLock_);
     DeleteCriticalSection(&metaLock_);
+    DeleteCriticalSection(&sendLock_);
 }
 
-bool ScrcpyBridge::runCommandCapture(const std::string& cmdLine, std::string& outText, DWORD& outExitCode) {
+bool ScrcpyBridge::runCommandCapture(const std::string& cmdLine, std::string& outText,
+                                     DWORD& outExitCode, DWORD timeoutMs) {
     outText.clear();
     outExitCode = 1;
 
@@ -116,22 +245,8 @@ bool ScrcpyBridge::runCommandCapture(const std::string& cmdLine, std::string& ou
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = writePipe;
-    si.hStdError  = writePipe;
-
     PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
-    std::vector<char> mutableCmd(cmdLine.begin(), cmdLine.end());
-    mutableCmd.push_back('\0');
-
-    BOOL ok = CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    bool ok = spawnProcessWithPipeCapture(procSpawnLock_, cmdLine, writePipe, true, pi);
     CloseHandle(writePipe);
 
     if (!ok) {
@@ -139,23 +254,20 @@ bool ScrcpyBridge::runCommandCapture(const std::string& cmdLine, std::string& ou
         return false;
     }
 
-    char buf[1024];
-    DWORD bytesRead = 0;
-    while (ReadFile(readPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
-        buf[bytesRead] = '\0';
-        outText.append(buf, bytesRead);
+    std::vector<uint8_t> bytes;
+    bool finished = readPipeWithTimeout(readPipe, pi.hProcess, timeoutMs, bytes, outExitCode);
+    if (!bytes.empty()) {
+        outText.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
-
-    WaitForSingleObject(pi.hProcess, 15000);
-    GetExitCodeProcess(pi.hProcess, &outExitCode);
 
     CloseHandle(readPipe);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return true;
+    return finished;
 }
 
-bool ScrcpyBridge::runCommandCaptureBinary(const std::string& cmdLine, std::vector<uint8_t>& outBytes, DWORD& outExitCode) {
+bool ScrcpyBridge::runCommandCaptureBinary(const std::string& cmdLine, std::vector<uint8_t>& outBytes,
+                                           DWORD& outExitCode, DWORD timeoutMs) {
     outBytes.clear();
     outExitCode = 1;
 
@@ -168,41 +280,21 @@ bool ScrcpyBridge::runCommandCaptureBinary(const std::string& cmdLine, std::vect
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = writePipe;
-    si.hStdError  = NULL;
-
     PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
-    std::vector<char> mutableCmd(cmdLine.begin(), cmdLine.end());
-    mutableCmd.push_back('\0');
-
-    BOOL ok = CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    bool ok = spawnProcessWithPipeCapture(procSpawnLock_, cmdLine, writePipe, false, pi);
     CloseHandle(writePipe);
+
     if (!ok) {
         CloseHandle(readPipe);
         return false;
     }
 
-    uint8_t buf[4096];
-    DWORD bytesRead = 0;
-    while (ReadFile(readPipe, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
-        outBytes.insert(outBytes.end(), buf, buf + bytesRead);
-    }
-
-    WaitForSingleObject(pi.hProcess, 15000);
-    GetExitCodeProcess(pi.hProcess, &outExitCode);
+    bool finished = readPipeWithTimeout(readPipe, pi.hProcess, timeoutMs, outBytes, outExitCode);
 
     CloseHandle(readPipe);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return true;
+    return finished;
 }
 
 void ScrcpyBridge::appendLog(const std::string& line) {
@@ -297,6 +389,69 @@ bool ScrcpyBridge::connectWireless(const ToolPaths& tools, const std::string& ip
     return (raw.find("connected to") != std::string::npos || raw.find("already connected") != std::string::npos);
 }
 
+int ScrcpyBridge::parseMajorVersion(const std::string& versionStr) {
+    int major = 0;
+    bool any = false;
+    for (size_t i = 0; i < versionStr.size(); ++i) {
+        char c = versionStr[i];
+        if (c >= '0' && c <= '9') {
+            major = major * 10 + (c - '0');
+            any = true;
+        } else {
+            break;
+        }
+    }
+    return any ? major : 0;
+}
+
+bool ScrcpyBridge::parseV4SessionHeader(const uint8_t hdr[12], uint32_t& outW, uint32_t& outH, bool& outClientResized) {
+    if ((hdr[0] & 0x80u) == 0) return false;
+    outClientResized = ((hdr[3] & 0x01u) != 0);
+    outW = readU32BE(hdr + 4);
+    outH = readU32BE(hdr + 8);
+    return (outW >= 64 && outH >= 64 && outW <= 8192 && outH <= 8192);
+}
+
+size_t ScrcpyBridge::serializeResizeDisplay(uint8_t* buf, uint16_t width, uint16_t height) {
+    uint16_t ew = static_cast<uint16_t>(width & ~1u);
+    uint16_t eh = static_cast<uint16_t>(height & ~1u);
+    if (ew < 160) ew = 160;
+    if (eh < 160) eh = 160;
+    buf[0] = 21; // SC_CONTROL_MSG_TYPE_RESIZE_DISPLAY
+    writeU16BE(buf + 1, ew);
+    writeU16BE(buf + 3, eh);
+    return 5;
+}
+
+bool ScrcpyBridge::isPureAscii(const std::string& utf8) {
+    for (size_t i = 0; i < utf8.size(); ++i) {
+        if (static_cast<unsigned char>(utf8[i]) >= 0x80u) return false;
+    }
+    return true;
+}
+
+std::vector<std::string> ScrcpyBridge::splitUtf8Chunks(const std::string& utf8, size_t maxBytes) {
+    std::vector<std::string> chunks;
+    if (utf8.empty()) return chunks;
+    if (maxBytes < 4) maxBytes = 4;
+    size_t off = 0;
+    while (off < utf8.size()) {
+        size_t end = off + maxBytes;
+        if (end >= utf8.size()) {
+            end = utf8.size();
+        } else {
+            // Never slice inside a multi-byte UTF-8 sequence (continuation bytes have bits 10xxxxxx)
+            while (end > off && (static_cast<unsigned char>(utf8[end]) & 0xC0u) == 0x80u) {
+                --end;
+            }
+            if (end == off) end = off + maxBytes; // Malformed input safety
+        }
+        chunks.push_back(utf8.substr(off, end - off));
+        off = end;
+    }
+    return chunks;
+}
+
 bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
     std::string exeDir = getExeDir();
     std::vector<std::string> dirs;
@@ -332,7 +487,9 @@ bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
         outPaths.scrcpyVersion = parseScrcpyVersion(verOut);
     }
     if (outPaths.scrcpyVersion.empty()) {
-        outPaths.scrcpyVersion = "3.1";
+        outError = "Could not detect scrcpy version from scrcpy.exe --version (expected v5.0.1).\n"
+                   "Re-run setup_scrcpy.ps1 to install the pinned official scrcpy release.";
+        return false;
     }
     return true;
 }
@@ -356,7 +513,7 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
         cmd += " " + extraArgs;
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -365,11 +522,12 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
-    std::vector<char> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back('\0');
+    std::wstring wcmd = utf8ToWide(cmd);
+    std::vector<wchar_t> mutableCmd(wcmd.begin(), wcmd.end());
+    mutableCmd.push_back(L'\0');
 
-    if (!CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (wcmd.empty() || !CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, FALSE,
+                                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         outError = "Failed to launch scrcpy mirror window.";
         return false;
     }
@@ -387,7 +545,7 @@ bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::strin
     if (!deviceSerial.empty()) {
         cmd += " -s \"" + deviceSerial + "\"";
     }
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -395,10 +553,11 @@ bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::strin
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
-    std::vector<char> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back('\0');
-    if (!CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    std::wstring wcmd = utf8ToWide(cmd);
+    std::vector<wchar_t> mutableCmd(wcmd.begin(), wcmd.end());
+    mutableCmd.push_back(L'\0');
+    if (wcmd.empty() || !CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, FALSE,
+                                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         outError = "Failed to launch scrcpy audio-only relay.";
         return false;
     }
@@ -488,6 +647,7 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
     cfg.maxSize = controlMaxSize;
     cfg.maxFps = 1;
     cfg.bitrateMbps = 0;
+    cfg.metadataOnly = true;
     cfg.stayAwake = stayAwake;
     cfg.virtualDisplay = false;
     return connectSession(tools, cfg, outError, deviceSerial);
@@ -570,13 +730,34 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
         return false;
     }
 
-    // 4. Launch scrcpy-server (either full native H.264 stream + control, or legacy 1 FPS metadata + control)
-    const int fps = (cfg.maxFps > 0) ? cfg.maxFps : 1;
-    const uint32_t bps = (cfg.bitrateMbps > 0) ? static_cast<uint32_t>(cfg.bitrateMbps) * 1000000u : 100000u;
-    char streamBuf[96];
-    std::snprintf(streamBuf, sizeof(streamBuf), " max_fps=%d video_bit_rate=%u", fps, bps);
+    // 4. Launch scrcpy-server (V10: uncapped FPS unless metadataOnly or explicit cap; B1: cleanup=true; B2/V5: virtual display)
+    if (cfg.virtualDisplay) {
+        std::string sdkOut;
+        DWORD sdkEc = 0;
+        if (runCommandCapture(adb + " shell getprop ro.build.version.sdk", sdkOut, sdkEc, 5000)) {
+            int sdk = std::atoi(sdkOut.c_str());
+            if (sdk > 0 && sdk < 29) {
+                outError = "Second-Phone Virtual Display requires Android 10 (API 29) or newer.";
+                return false;
+            }
+        }
+    }
 
-    const bool isV4OrNewer = (!tools.scrcpyVersion.empty() && tools.scrcpyVersion[0] >= '4');
+    std::string streamOpts;
+    if (cfg.metadataOnly) {
+        streamOpts = " max_fps=1 video_bit_rate=100000";
+    } else {
+        const uint32_t bps = (cfg.bitrateMbps > 0) ? static_cast<uint32_t>(cfg.bitrateMbps) * 1000000u : 16000000u;
+        char bbuf[64];
+        if (cfg.maxFps > 0) {
+            std::snprintf(bbuf, sizeof(bbuf), " max_fps=%d video_bit_rate=%u", cfg.maxFps, bps);
+        } else {
+            std::snprintf(bbuf, sizeof(bbuf), " video_bit_rate=%u", bps);
+        }
+        streamOpts = bbuf;
+    }
+
+    const bool isV4OrNewer = (parseMajorVersion(tools.scrcpyVersion) >= 4);
     std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
@@ -585,7 +766,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
                          " audio=false"
                          " control=true"
                          " video_codec=h264" +
-                         std::string(streamBuf) +
+                         streamOpts +
                          " tunnel_forward=true"
                          " send_dummy_byte=true"
                          " send_device_meta=true" +
@@ -594,7 +775,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
                          " clipboard_autosync=true"
                          " power_on=true"
                          " stay_awake=" + std::string(cfg.stayAwake ? "true" : "false") +
-                         " cleanup=false";
+                         " cleanup=true";
     if (cfg.maxSize > 0) {
         char szBuf[32];
         std::snprintf(szBuf, sizeof(szBuf), " max_size=%d", cfg.maxSize);
@@ -602,15 +783,16 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     }
     if (cfg.virtualDisplay) {
         // Stage 3 "Second Phone" Virtual Display Mode (keeps physical phone screen free!)
+        // B2: display_ime_policy=local keep_active=true; V5: omit flex_display on "auto" so it uses device display size & DPI
         if (cfg.virtualDisplaySpec.empty() || cfg.virtualDisplaySpec == "auto") {
-            srvCmd += " new_display=";
+            srvCmd += " new_display= display_ime_policy=local keep_active=true vd_destroy_content=false";
         } else {
-            srvCmd += " new_display=" + cfg.virtualDisplaySpec;
+            srvCmd += " new_display=" + cfg.virtualDisplaySpec +
+                      " flex_display=true display_ime_policy=local keep_active=true vd_destroy_content=false";
         }
-        srvCmd += " flex_display=true vd_destroy_content=false";
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -618,11 +800,12 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
-    std::vector<char> mutableSrv(srvCmd.begin(), srvCmd.end());
-    mutableSrv.push_back('\0');
+    std::wstring wSrvCmd = utf8ToWide(srvCmd);
+    std::vector<wchar_t> mutableSrv(wSrvCmd.begin(), wSrvCmd.end());
+    mutableSrv.push_back(L'\0');
 
-    if (!CreateProcessA(NULL, mutableSrv.data(), NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (wSrvCmd.empty() || !CreateProcessW(NULL, mutableSrv.data(), NULL, NULL, FALSE,
+                                           CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         outError = "Failed to start scrcpy-server process.";
         return false;
     }
@@ -889,22 +1072,23 @@ bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode, uint32_t
 
 bool ScrcpyBridge::sendText(const std::string& utf8Text) {
     if (!connected_ || utf8Text.empty()) return false;
+    // B3: Android KeyCharacterMap only injects ASCII; route any non-ASCII UTF-8 via clipboard-paste
+    if (!isPureAscii(utf8Text)) {
+        return sendSetClipboard(utf8Text, true);
+    }
     // SC_CONTROL_MSG_TYPE_INJECT_TEXT (type=1): [1:1][len:4 BE][utf8 bytes] (max 300B per scrcpy packet)
-    const size_t kChunk = 250;
-    size_t off = 0;
-    while (off < utf8Text.size()) {
-        size_t n = utf8Text.size() - off;
-        if (n > kChunk) n = kChunk;
-        std::vector<uint8_t> msg(5 + n);
+    std::vector<std::string> chunks = splitUtf8Chunks(utf8Text, 250);
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const std::string& chunk = chunks[i];
+        std::vector<uint8_t> msg(5 + chunk.size());
         msg[0] = 1;
-        writeU32BE(msg.data() + 1, static_cast<uint32_t>(n));
-        std::memcpy(msg.data() + 5, utf8Text.data() + off, n);
+        writeU32BE(msg.data() + 1, static_cast<uint32_t>(chunk.size()));
+        std::memcpy(msg.data() + 5, chunk.data(), chunk.size());
 
         EnterCriticalSection(&sendLock_);
         bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
         LeaveCriticalSection(&sendLock_);
         if (!ok) return false;
-        off += n;
     }
     return true;
 }
@@ -964,6 +1148,25 @@ bool ScrcpyBridge::sendStartApp(const std::string& appName) {
     std::memcpy(msg.data() + 2, appName.data(), len);
     EnterCriticalSection(&sendLock_);
     bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
+}
+
+bool ScrcpyBridge::sendResetVideo() {
+    if (!connected_) return false;
+    uint8_t msg[1] = { 17 }; // SC_CONTROL_MSG_TYPE_RESET_VIDEO
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
+}
+
+bool ScrcpyBridge::sendResizeDisplay(uint16_t width, uint16_t height) {
+    if (!connected_) return false;
+    uint8_t msg[5];
+    size_t len = serializeResizeDisplay(msg, width, height);
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, static_cast<int>(len));
     LeaveCriticalSection(&sendLock_);
     return ok;
 }
@@ -1028,11 +1231,11 @@ std::string ScrcpyBridge::queryForegroundPackage() {
     std::string raw;
     DWORD ec = 0;
     std::string adb = adbPrefix();
-    if (runCommandCapture(adb + " shell \"dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp'\"", raw, ec)) {
+    if (runCommandCapture(adb + " shell \"dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp'\"", raw, ec, 5000)) {
         std::string pkg = parseForegroundPackage(raw);
         if (!pkg.empty()) return pkg;
     }
-    if (runCommandCapture(adb + " shell \"dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'\"", raw, ec)) {
+    if (runCommandCapture(adb + " shell \"dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'\"", raw, ec, 5000)) {
         std::string pkg = parseForegroundPackage(raw);
         if (!pkg.empty()) return pkg;
     }
@@ -1044,7 +1247,7 @@ bool ScrcpyBridge::installApk(const std::string& localApkPath, std::string& outM
     if (adbExe_.empty()) { outMsg = "ADB not ready"; return false; }
     std::string raw;
     DWORD ec = 0;
-    if (!runCommandCapture(adbPrefix() + " install -r \"" + localApkPath + "\"", raw, ec)) {
+    if (!runCommandCapture(adbPrefix() + " install -r \"" + localApkPath + "\"", raw, ec, 60000)) {
         outMsg = "Failed to execute adb install";
         return false;
     }
@@ -1063,7 +1266,7 @@ bool ScrcpyBridge::pushFileToDownloads(const std::string& localFilePath, std::st
     std::string remote = "/sdcard/Download/" + fname;
     std::string raw;
     DWORD ec = 0;
-    if (!runCommandCapture(adbPrefix() + " push \"" + localFilePath + "\" \"" + remote + "\"", raw, ec) || ec != 0) {
+    if (!runCommandCapture(adbPrefix() + " push \"" + localFilePath + "\" \"" + remote + "\"", raw, ec, 60000) || ec != 0) {
         outMsg = "Push failed for " + fname;
         appendLog("[Push] " + outMsg);
         return false;
@@ -1134,18 +1337,19 @@ void ScrcpyBridge::runVideoReader() {
         uint8_t hdr[12];
         if (!recvAll(videoSock_, hdr, 12)) break;
 
-        // scrcpy v4/v5+ emits a 12-byte session header on every screen rotation/reconfiguration
-        if (isV4Proto_ && readU32BE(hdr) == 0x80000000u) {
-            uint32_t newW = readU32BE(hdr + 4);
-            uint32_t newH = readU32BE(hdr + 8);
-            if (newW >= 64 && newH >= 64 && newW <= 8192 && newH <= 8192) {
+        // scrcpy v4/v5+ emits a 12-byte session header (top bit set!) on rotation or client-requested resize
+        if (isV4Proto_ && (hdr[0] & 0x80u) != 0) {
+            uint32_t newW = 0, newH = 0;
+            bool clientResized = false;
+            if (parseV4SessionHeader(hdr, newW, newH, clientResized)) {
                 EnterCriticalSection(&metaLock_);
                 bool changed = (newW != screenW_ || newH != screenH_);
                 screenW_ = newW;
                 screenH_ = newH;
                 LeaveCriticalSection(&metaLock_);
                 if (changed) {
-                    std::printf("[Bridge] Screen rotation/resize (v4/v5 session): %ux%u\n", newW, newH);
+                    std::printf("[Bridge] Screen rotation/resize (v4/v5 session%s): %ux%u\n",
+                                clientResized ? " [client]" : "", newW, newH);
                 }
             }
             continue;

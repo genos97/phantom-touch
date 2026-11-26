@@ -42,11 +42,14 @@ public:
     void stop();
 
     void setProfile(const Profile& profile);
+    void updateTuning(const Profile& profile);
     Profile getProfileCopy() const;
 
     void setAimMode(bool enabled);
     bool isAimMode() const { return aimMode_ != 0; }
     void setGamepadEnabled(bool enabled);
+    void setAppFocused(bool focused);
+    void setEditMode(bool editing);
 
     // Non-blocking raw mouse & hook entry points (safe from WM_INPUT / WH_*_LL)
     void onRawMouseDelta(int dx, int dy);
@@ -101,7 +104,7 @@ private:
     void rebuildKeyRouteCacheLocked();
     void syncFpsViewConfigLocked(uint32_t w, uint32_t h);
     bool classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim);
-    void processKeyEventLocked(int vk, bool down, double nowMs);
+    void processKeyEventLocked(int vk, bool down, double nowMs, bool fromGamepad = false);
     void processDirectCursorLocked(TouchAction action, float normX, float normY);
     void processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs);
     void releaseCursorScrollLocked();
@@ -126,6 +129,16 @@ private:
     volatile LONG stopFlag_ = 0;
     volatile LONG aimMode_ = 0;
     volatile LONG pollHzAtomic_ = 250;
+    volatile LONG appFocused_ = 1;
+    volatile LONG editMode_ = 0;
+
+    enum JoyOwner {
+        JOY_NONE = 0,
+        JOY_KEYBOARD = 1,
+        JOY_GAMEPAD = 2
+    };
+    JoyOwner joyOwner_ = JOY_NONE;
+    bool prevGpStickDeflected_ = false;
 
     // Non-blocking hook input queues & route cache (protected by inputLock_)
     std::vector<QueuedKeyEvent> pendingKeys_;

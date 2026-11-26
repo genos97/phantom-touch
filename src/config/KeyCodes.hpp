@@ -29,4 +29,7 @@ public:
 
     // Converts a Win32 VK into an Android AKEYCODE_* (0 if unmapped) for desktop typing & shortcuts
     static uint32_t vkToAndroidKeycode(int vk);
+
+    // E1 (AltGr vs Ctrl): returns true only for pure Ctrl shortcuts (Ctrl held, Alt NOT held)
+    static bool isPureCtrlShortcut(bool ctrlDown, bool altDown);
 };

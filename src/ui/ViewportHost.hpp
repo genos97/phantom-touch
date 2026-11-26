@@ -46,6 +46,8 @@ public:
     ID3D11Device* d3dDevice() const { return d3d_.d3dDevice(); }
     bool supportsGpuNv12() const { return d3d_.supportsGpuNv12(); }
     bool isFlipModel() const { return d3d_.isFlipModel(); }
+    bool isNativeDeviceLost() const { return d3d_.isDeviceLost(); }
+    bool rebuildNativeDevice(std::string& outError);
     DWORD lastPresentTick() const { return d3d_.lastPresentTick(); }
     bool presentGpuNV12Frame(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
                              uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,

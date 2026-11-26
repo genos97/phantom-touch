@@ -24,6 +24,7 @@ struct GamepadKeyDelta {
 struct GamepadFrameOutput {
     bool connected = false;
     bool analogJoyActive = false;
+    bool stickDeflected = false; // Raw left-stick deflection before owner suppression (E3)
     double lookDx = 0.0;     // Virtual mouse delta X for FpsViewStack
     double lookDy = 0.0;     // Virtual mouse delta Y for FpsViewStack
     int keyDeltaCount = 0;
@@ -49,12 +50,21 @@ public:
 
     // Polls Windows XInput (slots 0..3) and processes analog sticks + buttons for one engine tick.
     void pollAndProcess(const Profile& profile, uint32_t screenW, uint32_t screenH,
-                        double dtMs, uint32_t& packetsCounter, GamepadFrameOutput& out);
+                        double dtMs, uint32_t& packetsCounter, GamepadFrameOutput& out,
+                        bool suppressLeftStick = false);
 
     // Pure deterministic processor (used by both pollAndProcess and headless unit tests!).
     void processSnapshot(const GamepadSnapshot& snap, const Profile& profile,
                          uint32_t screenW, uint32_t screenH, double dtMs,
-                         uint32_t& packetsCounter, GamepadFrameOutput& out);
+                         uint32_t& packetsCounter, GamepadFrameOutput& out,
+                         bool suppressLeftStick = false);
+
+    // Releases active analog joystick touch only (used during E3 keyboard/gamepad handoff).
+    void releaseJoystickOnly(uint32_t& packetsCounter);
+
+    // Suspends gamepad on focus loss or edit mode: lifts joystick, emits key-ups, and latches
+    // held buttons so they must return to neutral before firing again (E4).
+    void suspendForFocusLoss(uint32_t& packetsCounter, GamepadFrameOutput& out);
 
     // Releases active analog joystick touch & resets button edge-tracking state cleanly.
     void releaseAll(uint32_t& packetsCounter);
@@ -85,4 +95,7 @@ private:
     uint16_t prevButtons_ = 0;
     bool prevLt_ = false;
     bool prevRt_ = false;
+    uint16_t suppressedButtons_ = 0;
+    bool suppressedLt_ = false;
+    bool suppressedRt_ = false;
 };

@@ -11,6 +11,7 @@
 #include "ui/ViewportHost.hpp"
 #include "video/H264Decoder.hpp"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -55,10 +56,12 @@ public:
 private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static DWORD WINAPI connectThreadProc(LPVOID param);
+    static DWORD WINAPI legacyFallbackThreadProc(LPVOID param);
     static DWORD WINAPI wirelessThreadProc(LPVOID param);
     static DWORD WINAPI appWatcherThreadProc(LPVOID param);
     static DWORD WINAPI dropWorkerThreadProc(LPVOID param);
     static DWORD WINAPI qrPairThreadProc(LPVOID param);
+    static DWORD WINAPI profileSaveWorkerProc(LPVOID param);
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
     static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame);
@@ -73,6 +76,9 @@ private:
     bool mapShellClientToVideoNorm(int mx, int my, float& outNx, float& outNy, bool requireInside) const;
 
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    void handleLeftButtonDown(HWND hwnd, int mx, int my);
+    void startAsyncLegacyFallback(const std::string& reason);
+    void applyTuningToEngine();
 
     void registerRawInput();
     void installHooks();
@@ -167,11 +173,14 @@ private:
     std::string pendingForegroundPkg_;
     std::string lastGameProfilePath_;
     std::string manualOverridePkg_;
+    std::map<std::string, std::string> sessionAppProfiles_; // E5: session app -> profile memory
     std::string pendingDeviceClip_;
     std::string lastSyncedClip_;
     std::vector<std::string> pendingDropFiles_;
     std::string pendingDropToast_;
+    std::string pendingFallbackReason_;
     bool rightClickBackSwallowUp_ = false;
+    wchar_t highSurrogate_ = 0;
 
     Profile profile_;
     bool profileDirty_ = false;
@@ -216,6 +225,10 @@ private:
     uint32_t lastPhoneH_ = 1080;
     DWORD lastTelemetryPaintTick_ = 0;
     DWORD lastTopBarPaintTick_ = 0;
+    DWORD pendingVdResizeTick_ = 0;
+    bool hasPendingVdResize_ = false;
+    DWORD profileSaveDueTick_ = 0;
+    bool hasPendingProfileSave_ = false;
     bool sawEmbeddedMirror_ = false;
     bool nativeVideoSession_ = false;
     bool d3dHudDragging_ = false;
@@ -223,6 +236,9 @@ private:
     volatile LONG aimModeAtomic_ = 0;
     volatile LONG autoSwitchAtomic_ = 1;
     volatile LONG gameProfileAtomic_ = 1;
+    volatile LONG deviceResetPending_ = 0;
+    volatile LONG reinitDecoderFlag_ = 0;
+    volatile LONG fallbackPending_ = 0;
     H264Decoder h264Decoder_;
 
     struct HudVisualSig {

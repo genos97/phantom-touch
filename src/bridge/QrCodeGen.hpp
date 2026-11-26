@@ -21,4 +21,5 @@ class QrCodeGen {
 public:
     static bool encode(const std::string& text, QrMatrix& outMatrix);
     static std::string buildAndroidAdbPairPayload(const std::string& serviceName, const std::string& password);
+    static std::string generateSecurePairingCode(size_t length = 12);
 };

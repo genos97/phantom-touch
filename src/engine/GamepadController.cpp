@@ -96,9 +96,12 @@ void GamepadController::ensureXInputLoaded() {
     if (loadAttempted_) return;
     loadAttempted_ = true;
 
-    const char* dlls[3] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+    const wchar_t* dlls[3] = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll" };
     for (int i = 0; i < 3; ++i) {
-        HMODULE mod = LoadLibraryA(dlls[i]);
+        HMODULE mod = LoadLibraryExW(dlls[i], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (mod) {
             void* fn = reinterpret_cast<void*>(GetProcAddress(mod, "XInputGetState"));
             if (fn) {
@@ -137,18 +140,45 @@ void GamepadController::emit(TouchAction action, int32_t px, int32_t py, uint32_
     ++packetsCounter;
 }
 
-void GamepadController::releaseAll(uint32_t& packetsCounter) {
+void GamepadController::releaseJoystickOnly(uint32_t& packetsCounter) {
     if (joyDown_) {
         joyDown_ = false;
         emit(TOUCH_UP, joyLastX_, joyLastY_, packetsCounter);
     }
+}
+
+void GamepadController::suspendForFocusLoss(uint32_t& packetsCounter, GamepadFrameOutput& out) {
+    out = GamepadFrameOutput();
+    out.connected = connected_;
+    releaseJoystickOnly(packetsCounter);
+    for (size_t i = 0; i < sizeof(kButtonTable) / sizeof(kButtonTable[0]); ++i) {
+        if ((prevButtons_ & kButtonTable[i].mask) && out.keyDeltaCount < 16) {
+            out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ kButtonTable[i].vk, false };
+        }
+    }
+    if (prevRt_ && out.keyDeltaCount < 16) out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ 0x01, false };
+    if (prevLt_ && out.keyDeltaCount < 16) out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ VK_RBUTTON, false };
+    suppressedButtons_ |= prevButtons_;
+    if (prevLt_) suppressedLt_ = true;
+    if (prevRt_) suppressedRt_ = true;
+    prevButtons_ = 0;
+    prevLt_ = false;
+    prevRt_ = false;
+}
+
+void GamepadController::releaseAll(uint32_t& packetsCounter) {
+    releaseJoystickOnly(packetsCounter);
+    suppressedButtons_ |= prevButtons_;
+    if (prevLt_) suppressedLt_ = true;
+    if (prevRt_) suppressedRt_ = true;
     prevButtons_ = 0;
     prevLt_ = false;
     prevRt_ = false;
 }
 
 void GamepadController::pollAndProcess(const Profile& profile, uint32_t screenW, uint32_t screenH,
-                                       double dtMs, uint32_t& packetsCounter, GamepadFrameOutput& out) {
+                                       double dtMs, uint32_t& packetsCounter, GamepadFrameOutput& out,
+                                       bool suppressLeftStick) {
     out = GamepadFrameOutput();
     if (!enabled_) {
         if (connected_ || joyDown_) {
@@ -195,25 +225,34 @@ void GamepadController::pollAndProcess(const Profile& profile, uint32_t screenW,
         snap.buttons = st.Gamepad.wButtons;
     }
 
-    processSnapshot(snap, profile, screenW, screenH, dtMs, packetsCounter, out);
+    processSnapshot(snap, profile, screenW, screenH, dtMs, packetsCounter, out, suppressLeftStick);
 }
 
 void GamepadController::processSnapshot(const GamepadSnapshot& snap, const Profile& profile,
                                         uint32_t screenW, uint32_t screenH, double dtMs,
-                                        uint32_t& packetsCounter, GamepadFrameOutput& out) {
+                                        uint32_t& packetsCounter, GamepadFrameOutput& out,
+                                        bool suppressLeftStick) {
     out = GamepadFrameOutput();
     out.connected = snap.connected;
+
+    // E4: Clear neutral-button latches as soon as each button/trigger physically releases
+    if (!snap.connected) {
+        suppressedButtons_ = 0;
+        suppressedLt_ = false;
+        suppressedRt_ = false;
+    } else {
+        suppressedButtons_ = static_cast<uint16_t>(suppressedButtons_ & snap.buttons);
+        if (snap.lt < 0.15f) suppressedLt_ = false;
+        if (snap.rt < 0.15f) suppressedRt_ = false;
+    }
 
     if (!snap.connected || !profile.keymapEnabled) {
         if (connected_ && !snap.connected) {
             connected_ = false;
         }
-        if (joyDown_) {
-            joyDown_ = false;
-            emit(TOUCH_UP, joyLastX_, joyLastY_, packetsCounter);
-        }
-        // Release any held gamepad buttons cleanly if controller unplugged mid-game
-        if (!snap.connected) {
+        releaseJoystickOnly(packetsCounter);
+        // Release any held gamepad buttons cleanly if controller unplugged or typing profile active
+        if (!snap.connected || prevButtons_ != 0 || prevLt_ || prevRt_) {
             for (size_t i = 0; i < sizeof(kButtonTable) / sizeof(kButtonTable[0]); ++i) {
                 if ((prevButtons_ & kButtonTable[i].mask) && out.keyDeltaCount < 16) {
                     out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ kButtonTable[i].vk, false };
@@ -234,7 +273,8 @@ void GamepadController::processSnapshot(const GamepadSnapshot& snap, const Profi
 
     // 1. Left Thumbstick -> smooth 360° analog virtual joystick (walk -> run -> sprint radius!)
     const float lMag = std::sqrt(snap.lx * snap.lx + snap.ly * snap.ly);
-    if (lMag > 0.02f) {
+    out.stickDeflected = (lMag > 0.02f);
+    if (out.stickDeflected && !suppressLeftStick) {
         out.analogJoyActive = true;
         const double cx = static_cast<double>(profile.joyX) * static_cast<double>(w);
         const double cy = static_cast<double>(profile.joyY) * static_cast<double>(h);
@@ -260,9 +300,8 @@ void GamepadController::processSnapshot(const GamepadSnapshot& snap, const Profi
             joyLastX_ = tx;
             joyLastY_ = ty;
         }
-    } else if (joyDown_) {
-        joyDown_ = false;
-        emit(TOUCH_UP, joyLastX_, joyLastY_, packetsCounter);
+    } else {
+        releaseJoystickOnly(packetsCounter);
     }
 
     // 2. Right Thumbstick -> quadratic 360° camera look velocity scaled by dtMs
@@ -275,9 +314,9 @@ void GamepadController::processSnapshot(const GamepadSnapshot& snap, const Profi
         out.lookDy = (-static_cast<double>(snap.ry) / static_cast<double>(rMag)) * step;
     }
 
-    // 3. Triggers (RT -> Fire, LT -> Scope)
-    const bool rtNow = (snap.rt >= 0.22f);
-    const bool ltNow = (snap.lt >= 0.22f);
+    // 3. Triggers (RT -> Fire, LT -> Scope), respecting E4 neutral-return latches
+    const bool rtNow = (snap.rt >= 0.22f) && !suppressedRt_;
+    const bool ltNow = (snap.lt >= 0.22f) && !suppressedLt_;
     if (rtNow != prevRt_ && out.keyDeltaCount < 16) {
         prevRt_ = rtNow;
         out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ profile.fireVk, rtNow };
@@ -287,15 +326,16 @@ void GamepadController::processSnapshot(const GamepadSnapshot& snap, const Profi
         out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ VK_RBUTTON, ltNow };
     }
 
-    // 4. Face, Shoulder & D-Pad buttons -> edge-triggered profile button events
-    const uint16_t changed = static_cast<uint16_t>(snap.buttons ^ prevButtons_);
+    // 4. Face, Shoulder & D-Pad buttons -> edge-triggered profile button events (respecting E4 latch)
+    const uint16_t effButtons = static_cast<uint16_t>(snap.buttons & ~suppressedButtons_);
+    const uint16_t changed = static_cast<uint16_t>(effButtons ^ prevButtons_);
     if (changed != 0) {
         for (size_t i = 0; i < sizeof(kButtonTable) / sizeof(kButtonTable[0]); ++i) {
             if ((changed & kButtonTable[i].mask) && out.keyDeltaCount < 16) {
-                bool pressed = (snap.buttons & kButtonTable[i].mask) != 0;
+                bool pressed = (effButtons & kButtonTable[i].mask) != 0;
                 out.keyDeltas[out.keyDeltaCount++] = GamepadKeyDelta{ kButtonTable[i].vk, pressed };
             }
         }
-        prevButtons_ = snap.buttons;
+        prevButtons_ = effButtons;
     }
 }

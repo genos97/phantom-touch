@@ -1,5 +1,13 @@
 #include "bridge/QrCodeGen.hpp"
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <cstring>
 
 namespace {
@@ -146,6 +154,49 @@ int evaluatePenalty(const std::vector<uint8_t>& mod, int sz) {
 
 std::string QrCodeGen::buildAndroidAdbPairPayload(const std::string& serviceName, const std::string& password) {
     return "WIFI:T:ADB;S:" + serviceName + ";P:" + password + ";;";
+}
+
+std::string QrCodeGen::generateSecurePairingCode(size_t length) {
+    if (length == 0) return "";
+    static const char kAlphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const size_t kAlphaLen = sizeof(kAlphabet) - 1; // 62 chars
+    const unsigned int kLimit = (256u / static_cast<unsigned int>(kAlphaLen)) * static_cast<unsigned int>(kAlphaLen); // 248
+
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+    typedef LONG (WINAPI *PFN_BCryptGenRandom)(void*, unsigned char*, unsigned long, unsigned long);
+    HMODULE hBcrypt = LoadLibraryExW(L"bcrypt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    PFN_BCryptGenRandom fnRand = hBcrypt
+        ? reinterpret_cast<PFN_BCryptGenRandom>(reinterpret_cast<void*>(GetProcAddress(hBcrypt, "BCryptGenRandom")))
+        : nullptr;
+
+    std::string out;
+    out.reserve(length);
+    unsigned char buf[64];
+    while (out.size() < length) {
+        bool ok = false;
+        if (fnRand) {
+            if (fnRand(NULL, buf, sizeof(buf), 0x00000002u /* BCRYPT_USE_SYSTEM_PREFERRED_RNG */) == 0) {
+                ok = true;
+            }
+        }
+        if (!ok) {
+            // Cryptographically non-ideal fallback only if bcrypt unavailable (should never happen on Win7+)
+            LARGE_INTEGER pc;
+            for (size_t i = 0; i < sizeof(buf); ++i) {
+                QueryPerformanceCounter(&pc);
+                buf[i] = static_cast<unsigned char>((pc.QuadPart ^ (GetTickCount() + i * 31u)) & 0xFFu);
+            }
+        }
+        for (size_t i = 0; i < sizeof(buf) && out.size() < length; ++i) {
+            if (buf[i] < kLimit) {
+                out.push_back(kAlphabet[buf[i] % kAlphaLen]);
+            }
+        }
+    }
+    if (hBcrypt) FreeLibrary(hBcrypt);
+    return out;
 }
 
 bool QrCodeGen::encode(const std::string& text, QrMatrix& outMatrix) {

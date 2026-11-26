@@ -18,10 +18,9 @@
 //   3. Dual Boundary Modes:
 //      - Unbounded (Free Fire): infinite travel rect, exact center landing,
 //        optional nonlinear horizontal counter-acceleration.
-//      - Boxed (PUBG/CODM/custom): bounded move rect with Â±50px landing
-//        jitter; exiting the boundary emits TOUCH_UP, waits >=15ms
-//        non-blockingly (touchDownDelay floor), and seamlessly re-plants
-//        near center on the next delta for infinite 360Â° rotation.
+//      - Boxed (PUBG/CODM/custom): bounded move rect with deterministic center landing;
+//        exiting the boundary emits TOUCH_UP, waits >=15ms non-blockingly (touchDownDelay
+//        floor), and seamlessly re-plants at center on the next delta for infinite 360° rotation.
 //   4. Idle Auto-Release: Re-centers after inactivity so the next flick
 //      starts near center with full travel room.
 //   5. View Stack (FpsViewStack): Supports pushing temporary mouse-linked

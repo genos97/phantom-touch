@@ -131,8 +131,13 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
     EnterCriticalSection(&d3dLock_);
 
     targetHwnd_ = targetHwnd;
+    savedHwnd_ = targetHwnd;
     backbufW_ = (initialW > 8) ? initialW : 640;
     backbufH_ = (initialH > 8) ? initialH : 360;
+    savedW_ = backbufW_;
+    savedH_ = backbufH_;
+    occluded_ = false;
+    InterlockedExchange(&deviceLost_, 0);
 
     D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1,
@@ -464,8 +469,42 @@ void D3D11Renderer::shutdown() {
     flipModel_ = false;
     tearingSupported_ = false;
     supportsGpuNv12Srv_ = false;
+    occluded_ = false;
     swapChainFlags_ = 0;
     LeaveCriticalSection(&d3dLock_);
+}
+
+bool D3D11Renderer::rebuildDevice(std::string& outError) {
+    HWND hwndCopy = savedHwnd_;
+    int wCopy = savedW_;
+    int hCopy = savedH_;
+    if (!hwndCopy || !IsWindow(hwndCopy)) {
+        outError = "Cannot rebuild D3D11 device: window destroyed.";
+        return false;
+    }
+    if (backbufW_ >= 8) wCopy = backbufW_;
+    if (backbufH_ >= 8) hCopy = backbufH_;
+
+    // Preserve staged HUD across device reset so HUD re-uploads automatically
+    std::vector<uint8_t> hudCopy;
+    int hw = 0, hh = 0;
+    bool hadHud = false;
+    EnterCriticalSection(&frameLock_);
+    if (hasHud_ && !stagedHud_.empty()) {
+        hudCopy = stagedHud_;
+        hw = stagedHudW_;
+        hh = stagedHudH_;
+        hadHud = true;
+    }
+    LeaveCriticalSection(&frameLock_);
+
+    if (!init(hwndCopy, wCopy, hCopy, outError)) {
+        return false;
+    }
+    if (hadHud) {
+        updateHudBitmap(hudCopy.data(), hw, hh);
+    }
+    return true;
 }
 
 void D3D11Renderer::resize(int width, int height) {
@@ -483,6 +522,10 @@ void D3D11Renderer::resize(int width, int height) {
     if (SUCCEEDED(hr) && createRenderTargetLocked()) {
         backbufW_ = width;
         backbufH_ = height;
+        savedW_ = width;
+        savedH_ = height;
+    } else if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        InterlockedExchange(&deviceLost_, 1);
     }
     LeaveCriticalSection(&d3dLock_);
 }
@@ -774,7 +817,19 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
 }
 
 void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay) {
-    if (!isInitialized() || !rtv_ || backbufW_ < 8 || backbufH_ < 8) return;
+    if (!isInitialized() || !rtv_ || backbufW_ < 8 || backbufH_ < 8 || deviceLost_ != 0) return;
+
+    if (occluded_) {
+        HRESULT thr = swapChain_->Present(0, DXGI_PRESENT_TEST);
+        if (thr == DXGI_STATUS_OCCLUDED) {
+            return;
+        }
+        if (thr == DXGI_ERROR_DEVICE_REMOVED || thr == DXGI_ERROR_DEVICE_RESET) {
+            InterlockedExchange(&deviceLost_, 1);
+            return;
+        }
+        occluded_ = false;
+    }
 
     // 1. Upload staged NV12 frame if submitNV12Frame() was used (unit tests / external caller)
     bool readyVideo = false;
@@ -898,8 +953,15 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
     }
 
     UINT presentFlags = (flipModel_ && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
-    swapChain_->Present(0, presentFlags);
-    InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
+    HRESULT phr = swapChain_->Present(0, presentFlags);
+    if (phr == DXGI_STATUS_OCCLUDED) {
+        occluded_ = true;
+    } else if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
+        InterlockedExchange(&deviceLost_, 1);
+    } else {
+        occluded_ = false;
+        InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
+    }
 }
 
 bool D3D11Renderer::convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<uint8_t>& outBgra) {

@@ -35,9 +35,14 @@ std::string AppSettings::buildScrcpyArgs() const {
     // Only video/audio flags valid with scrcpy --no-control!
     // (stay_awake and turn_screen_off are handled via our control=true server bridge!)
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "--max-fps=%d --video-bit-rate=%dM",
-                  clampInt(mirrorFps, 30, 144),
-                  clampInt(mirrorBitrateMbps, 2, 64));
+    if (mirrorFps > 0) {
+        std::snprintf(buf, sizeof(buf), "--max-fps=%d --video-bit-rate=%dM",
+                      clampInt(mirrorFps, 30, 144),
+                      clampInt(mirrorBitrateMbps, 2, 64));
+    } else {
+        std::snprintf(buf, sizeof(buf), "--video-bit-rate=%dM",
+                      clampInt(mirrorBitrateMbps, 2, 64));
+    }
     std::string args(buf);
     if (mirrorMaxSize > 0) {
         char sz[48];
@@ -73,7 +78,10 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "win_h") s.winH = clampInt(std::atoi(v.c_str()), 560, 2160);
         else if (k == "maximized") s.maximized = (v == "1");
         else if (k == "always_on_top") s.alwaysOnTop = (v == "1");
-        else if (k == "mirror_fps") s.mirrorFps = clampInt(std::atoi(v.c_str()), 30, 144);
+        else if (k == "mirror_fps") {
+            int f = std::atoi(v.c_str());
+            s.mirrorFps = (f <= 0) ? 0 : clampInt(f, 30, 144);
+        }
         else if (k == "mirror_bitrate_mbps") s.mirrorBitrateMbps = clampInt(std::atoi(v.c_str()), 2, 64);
         else if (k == "mirror_max_size") s.mirrorMaxSize = clampInt(std::atoi(v.c_str()), 0, 4096);
         else if (k == "mirror_audio") s.mirrorAudio = (v == "1");

@@ -34,6 +34,14 @@ static const UINT MSG_FOREGROUND_APP     = WM_APP + 16;
 static const UINT MSG_DROP_TOAST         = WM_APP + 17;
 static const UINT MSG_ANDROID_BACK       = WM_APP + 18;
 static const UINT MSG_QR_PAIR_UPDATE     = WM_APP + 20;
+static const UINT MSG_DEVICE_LOST        = WM_APP + 21;
+static const UINT MSG_VIDEO_FALLBACK     = WM_APP + 22;
+
+struct ProfileSaveJob {
+    std::string path;
+    std::string profilesDir;
+    Profile profile;
+};
 
 LRESULT CALLBACK shellMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (g_shellInstance) return g_shellInstance->handleLowLevelMouse(nCode, wParam, lParam);
@@ -172,7 +180,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
     hInst_ = hInst;
     g_shellInstance = this;
 
-    WNDCLASSEXA wc;
+    WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
@@ -182,9 +190,9 @@ bool ShellWindow::create(HINSTANCE hInst) {
     wc.hIconSm = LoadIconA(hInst_, MAKEINTRESOURCEA(101));
     if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "PhantomTouchShellClass";
+    wc.lpszClassName = L"PhantomTouchShellClass";
 
-    if (!RegisterClassExA(&wc)) return false;
+    if (!RegisterClassExW(&wc)) return false;
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
@@ -205,7 +213,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
     DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN;
     DWORD exStyle = WS_EX_APPWINDOW | (settings_.alwaysOnTop ? WS_EX_TOPMOST : 0);
 
-    hwnd_ = CreateWindowExA(exStyle, wc.lpszClassName, "Phantom Touch",
+    hwnd_ = CreateWindowExW(exStyle, wc.lpszClassName, L"Phantom Touch",
                             style, x, y, w, h, NULL, NULL, hInst_, this);
     if (!hwnd_) return false;
 
@@ -259,9 +267,9 @@ bool ShellWindow::create(HINSTANCE hInst) {
 
 int ShellWindow::runMessageLoop() {
     MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
     return static_cast<int>(msg.wParam);
 }
@@ -308,13 +316,39 @@ void ShellWindow::saveSettings() {
     AppSettingsStore::save(settingsPath_, settings_);
 }
 
+DWORD WINAPI ShellWindow::profileSaveWorkerProc(LPVOID param) {
+    ProfileSaveJob* job = static_cast<ProfileSaveJob*>(param);
+    if (job) {
+        if (ProfileStore::save(job->path, job->profile)) {
+            ProfileStore::saveLastActive(job->profilesDir, job->path);
+        }
+        delete job;
+    }
+    return 0;
+}
+
 void ShellWindow::applyProfileToEngine(bool autoSaveNow) {
     engine_->setProfile(profile_);
     hudOverlay_.applyOpacity(editMode_, profile_.hudOpacity);
     profileDirty_ = true;
+    lastHudSig_.valid = false;
+    lastTopBarSig_.valid = false;
     if (autoSaveNow) {
         saveCurrentProfile(true);
     }
+    hudOverlay_.invalidate();
+    invalidateShell();
+}
+
+void ShellWindow::applyTuningToEngine() {
+    // N28: non-disruptive live update (preserves active touches) + 500ms debounced async disk save!
+    engine_->updateTuning(profile_);
+    hudOverlay_.applyOpacity(editMode_, profile_.hudOpacity);
+    profileDirty_ = true;
+    lastHudSig_.valid = false;
+    lastTopBarSig_.valid = false;
+    profileSaveDueTick_ = GetTickCount() + 500;
+    hasPendingProfileSave_ = true;
     hudOverlay_.invalidate();
     invalidateShell();
 }
@@ -374,6 +408,11 @@ void ShellWindow::layoutChildren() {
     }
 
     viewportHost_.setBounds(viewportRc_);
+    if (bridge_->isVirtualDisplayActive() && settings_.virtualDisplaySpec != "auto" &&
+        (viewportRc_.right - viewportRc_.left) >= 160 && (viewportRc_.bottom - viewportRc_.top) >= 160) {
+        pendingVdResizeTick_ = GetTickCount() + 150;
+        hasPendingVdResize_ = true;
+    }
     syncHudAndVideo();
     invalidateShell();
 }
@@ -471,16 +510,29 @@ void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->nativeVideoSession_ || !data || size == 0) return;
 
+    if (InterlockedCompareExchange(&self->reinitDecoderFlag_, 0, 1) == 1) {
+        self->h264Decoder_.shutdown();
+    }
+
     if (!self->h264Decoder_.isInitialized()) {
         uint32_t pw = 1920, ph = 1080;
         self->bridge_->getScreenSize(pw, ph);
-        ID3D11Device* gpuDev = self->viewportHost_.supportsGpuNv12()
+        ID3D11Device* gpuDev = (self->viewportHost_.supportsGpuNv12() && !self->viewportHost_.isNativeDeviceLost())
             ? self->viewportHost_.d3dDevice()
             : nullptr;
         std::string err;
-        if (!self->h264Decoder_.init(pw, ph, err, gpuDev)) {
+        bool inited = self->h264Decoder_.init(pw, ph, err, gpuDev);
+        if (!inited && gpuDev != nullptr) {
+            // N3: Hardware decoder init failed -> automatically fall back to CPU H.264 MFT before giving up!
+            self->bridge_->appendLog("[Video] DXVA H.264 init failed (" + err + "), retrying CPU decoder...");
+            inited = self->h264Decoder_.init(pw, ph, err, nullptr);
+        }
+        if (!inited) {
             self->bridge_->appendLog("[Video] H.264 MFT init failed: " + err);
             self->nativeVideoSession_ = false;
+            if (self->hwnd_ && InterlockedCompareExchange(&self->fallbackPending_, 1, 0) == 0) {
+                PostMessageW(self->hwnd_, MSG_VIDEO_FALLBACK, 0, 0);
+            }
             return;
         }
         self->h264Decoder_.setGpuFrameCallback(ShellWindow::onDecodedGpuFrame, self);
@@ -498,6 +550,10 @@ void ShellWindow::onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_
     if (!self || !self->nativeVideoSession_) return;
     // Present directly from video thread so the Win32 UI / input-hook thread stays <1% CPU!
     self->viewportHost_.presentGpuNV12Frame(nv12Tex, subresourceIdx, cropX, cropY, outW, outH, true);
+    if (self->viewportHost_.isNativeDeviceLost() && self->hwnd_ &&
+        InterlockedCompareExchange(&self->deviceResetPending_, 1, 0) == 0) {
+        PostMessageW(self->hwnd_, MSG_DEVICE_LOST, 0, 0);
+    }
 }
 
 void ShellWindow::onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
@@ -507,6 +563,10 @@ void ShellWindow::onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8
     if (!self || !self->nativeVideoSession_) return;
     // Direct upload + Present on video thread (0 intermediate copies, 0 UI-thread stall!)
     self->viewportHost_.presentCpuNV12Frame(yPlane, uvPlane, stride, cropX, cropY, outW, outH, true);
+    if (self->viewportHost_.isNativeDeviceLost() && self->hwnd_ &&
+        InterlockedCompareExchange(&self->deviceResetPending_, 1, 0) == 0) {
+        PostMessageW(self->hwnd_, MSG_DEVICE_LOST, 0, 0);
+    }
 }
 
 void ShellWindow::onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h) {
@@ -570,6 +630,18 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
 
         ok = self->bridge_->connectSession(self->tools_, cfg, err, self->pendingSerial_);
         if (ok) {
+            if (cfg.virtualDisplay) {
+                // B2: launch target app (first linked package or Settings) onto the virtual display!
+                std::string appToLaunch = "com.android.settings";
+                if (self->profile_.keymapEnabled && !self->profile_.appPackage.empty()) {
+                    size_t comma = self->profile_.appPackage.find(',');
+                    std::string first = (comma == std::string::npos)
+                        ? self->profile_.appPackage
+                        : self->profile_.appPackage.substr(0, comma);
+                    if (!first.empty()) appToLaunch = first;
+                }
+                self->bridge_->sendStartApp(appToLaunch);
+            }
             if (self->settings_.turnScreenOff && !cfg.virtualDisplay) {
                 self->bridge_->setDisplayPower(false);
             }
@@ -606,8 +678,59 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
     self->asyncResultOk_ = ok;
     self->asyncResultMsg_ = ok ? ("Connected to " + self->bridge_->deviceName()) : err;
     InterlockedExchange(&self->connecting_, 0);
-    if (self->hwnd_) PostMessageA(self->hwnd_, MSG_CONNECT_DONE, 0, 0);
+    if (self->hwnd_) PostMessageW(self->hwnd_, MSG_CONNECT_DONE, 0, 0);
     return 0;
+}
+
+DWORD WINAPI ShellWindow::legacyFallbackThreadProc(LPVOID param) {
+    ShellWindow* self = static_cast<ShellWindow*>(param);
+    std::string serial = self->bridge_->activeSerial();
+    self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+    self->bridge_->disconnect();
+
+    self->nativeVideoSession_ = false;
+    std::string err;
+    bool ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
+                                            serial, self->settings_.stayAwake);
+    if (ok) {
+        if (self->settings_.turnScreenOff) {
+            self->bridge_->setDisplayPower(false);
+        }
+        if (!self->noMirror_) {
+            std::string mErr;
+            std::string args = self->settings_.buildScrcpyArgs();
+            if (!self->bridge_->launchMirrorWindow(self->tools_, args, self->mirrorTitle_, mErr, true, self->bridge_->activeSerial())) {
+                self->bridge_->appendLog("[Mirror] " + mErr);
+            }
+        }
+    }
+    self->asyncResultOk_ = ok;
+    self->asyncResultMsg_ = ok ? self->pendingFallbackReason_ : err;
+    InterlockedExchange(&self->connecting_, 0);
+    InterlockedExchange(&self->fallbackPending_, 0);
+    if (self->hwnd_) PostMessageW(self->hwnd_, MSG_CONNECT_DONE, 0, 0);
+    return 0;
+}
+
+void ShellWindow::startAsyncLegacyFallback(const std::string& reason) {
+    // N4: Shut down native video stream BEFORE launching legacy scrcpy.exe (never run two encoders!)
+    if (connecting_) return;
+    if (connectThread_) {
+        WaitForSingleObject(connectThread_, 1000);
+        CloseHandle(connectThread_);
+        connectThread_ = NULL;
+    }
+    setAimMode(false);
+    hudOverlay_.setEmbeddedD3DMode(false);
+    bridge_->setVideoPacketCallback(nullptr, nullptr);
+    h264Decoder_.shutdown();
+    viewportHost_.disableNativeVideo();
+    nativeVideoSession_ = false;
+    pendingFallbackReason_ = reason;
+    hubStatusMsg_ = reason + " Switching to scrcpy fallback...";
+    InterlockedExchange(&connecting_, 1);
+    connectThread_ = CreateThread(NULL, 0, legacyFallbackThreadProc, this, 0, NULL);
+    invalidateShell();
 }
 
 void ShellWindow::startAsyncConnect(const std::string& serial) {
@@ -727,14 +850,9 @@ void ShellWindow::startQrWirelessPairing() {
     }
     stopQrWirelessPairing();
 
-    std::srand(static_cast<unsigned int>(std::time(NULL) ^ GetTickCount()));
-    int code = 100000 + (std::rand() % 900000);
-    int tag  = 1000 + (std::rand() % 9000);
-    char sbuf[48], pbuf[16];
-    std::snprintf(sbuf, sizeof(sbuf), "studio-PT%d", tag);
-    std::snprintf(pbuf, sizeof(pbuf), "%06d", code);
-    qrServiceName_ = sbuf;
-    qrPairPassword_ = pbuf;
+    // B6: cryptographically random 12-char pairing code & service suffix via BCryptGenRandom
+    qrServiceName_ = "studio-PT" + QrCodeGen::generateSecurePairingCode(6);
+    qrPairPassword_ = QrCodeGen::generateSecurePairingCode(12);
 
     std::string payload = QrCodeGen::buildAndroidAdbPairPayload(qrServiceName_, qrPairPassword_);
     QrCodeGen::encode(payload, qrMatrix_);
@@ -968,25 +1086,23 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
 
     // Already on a profile explicitly linked to this app
     if (ProfileDefaults::matchesPackage(profile_.appPackage, pkg)) {
+        if (profile_.keymapEnabled) sessionAppProfiles_[pkg] = profilePath_;
         return;
     }
 
     // First detection right after launch: never yank user away from a manually chosen unlinked game profile
     if (prevPkg.empty() && profile_.keymapEnabled && profile_.appPackage.empty()) {
+        sessionAppProfiles_[pkg] = profilePath_; // E5: remember which app used this unlinked profile!
         return;
     }
 
     // Search for a saved profile linked to pkg (prefer lastGameProfilePath_ first!)
     std::string matchedPath;
-    bool lastGameUnlinked = false;
     if (!lastGameProfilePath_.empty()) {
         Profile cand;
-        if (ProfileStore::load(lastGameProfilePath_, cand) && cand.keymapEnabled) {
-            if (ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
-                matchedPath = lastGameProfilePath_;
-            } else if (cand.appPackage.empty()) {
-                lastGameUnlinked = true;
-            }
+        if (ProfileStore::load(lastGameProfilePath_, cand) && cand.keymapEnabled &&
+            ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
+            matchedPath = lastGameProfilePath_;
         }
     }
     if (matchedPath.empty()) {
@@ -1001,11 +1117,15 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
         }
     }
 
-    // If user cloned freefire.cfg into a custom unlinked profile (e.g. my_custom.cfg),
-    // automatically restore THEIR custom profile when launching Free Fire instead of generic freefire.cfg!
-    if (lastGameUnlinked && !lastGameProfilePath_.empty() &&
-        ProfileDefaults::matchesPackage("com.dts.freefiremax,com.dts.freefireth,com.dts.freefireind", pkg)) {
-        matchedPath = lastGameProfilePath_;
+    // E5: Remember which unlinked profile the user chose for this app in the current session!
+    if (matchedPath.empty()) {
+        std::map<std::string, std::string>::const_iterator it = sessionAppProfiles_.find(pkg);
+        if (it != sessionAppProfiles_.end() && !it->second.empty()) {
+            Profile cand;
+            if (ProfileStore::load(it->second, cand) && cand.keymapEnabled) {
+                matchedPath = it->second;
+            }
+        }
     }
 
     if (!matchedPath.empty()) {
@@ -1075,11 +1195,14 @@ void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) 
 }
 
 bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
-    if (!bridge_->isConnected() || aimMode_ || editMode_) return false;
-    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    // N8: never leak PC keystrokes/typing into phone when a game keymap profile is active!
+    if (!bridge_->isConnected() || aimMode_ || editMode_ || profile_.keymapEnabled) return false;
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
-    if (ctrl && down) {
+    // E1: only treat Ctrl shortcuts when Alt (AltGr) is NOT pressed!
+    if (KeyCodes::isPureCtrlShortcut(ctrl, alt) && down) {
         if (vk == 'V') {
             std::string clip = readWindowsClipboardUtf8();
             if (!clip.empty()) {
@@ -1117,7 +1240,7 @@ bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
         if (akc != 0) {
             uint32_t meta = 0;
             if (shift) meta |= 0x41u;   // AMETA_SHIFT_ON | AMETA_SHIFT_LEFT_ON
-            if (ctrl)  meta |= 0x3000u; // AMETA_CTRL_ON  | AMETA_CTRL_LEFT_ON
+            if (KeyCodes::isPureCtrlShortcut(ctrl, alt)) meta |= 0x3000u; // AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON
             bridge_->sendKeycode(down ? 0u : 1u, akc, meta);
             return true;
         }
@@ -1126,9 +1249,14 @@ bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
 }
 
 bool ShellWindow::handleDesktopChar(wchar_t ch) {
-    if (!bridge_->isConnected() || aimMode_ || editMode_) return false;
+    // N8: text typing only runs in Typing/Desktop profiles (keymapEnabled == false)
+    if (!bridge_->isConnected() || aimMode_ || editMode_ || profile_.keymapEnabled) return false;
     if (ch < 32 || ch == 127) return false; // Control chars handled in WM_KEYDOWN
-    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) return false;
+    // E1: allow AltGr (Ctrl+Alt) printable characters through! Only block pure Ctrl+<char>.
+    if (KeyCodes::isPureCtrlShortcut((GetKeyState(VK_CONTROL) & 0x8000) != 0,
+                                     (GetKeyState(VK_MENU) & 0x8000) != 0)) {
+        return false;
+    }
 
     wchar_t buf[2] = { ch, L'\0' };
     int bytes = WideCharToMultiByte(CP_UTF8, 0, buf, 1, NULL, 0, NULL, NULL);
@@ -1144,6 +1272,9 @@ void ShellWindow::setAimMode(bool enabled) {
     if (enabled && !profile_.keymapEnabled) {
         if (!lastGameProfilePath_.empty() && switchProfilePath(lastGameProfilePath_, false)) {
             manualOverridePkg_ = activeAppPackage_;
+            if (!activeAppPackage_.empty()) {
+                sessionAppProfiles_[activeAppPackage_] = profilePath_;
+            }
             hudOverlay_.showToast("Game Profile Active: " + profile_.name + " · Press " +
                                   KeyCodes::toName(profile_.toggleAimVk) + " / F1 for Aim Lock", 2400);
             return;
@@ -1215,6 +1346,7 @@ void ShellWindow::setEditMode(bool enabled) {
     if (editMode_ == enabled) return;
 
     editMode_ = enabled;
+    engine_->setEditMode(editMode_);
     if (editMode_) {
         engine_->releaseAllTouches();
     } else {
@@ -1275,7 +1407,7 @@ void ShellWindow::toggleAlwaysOnTop() {
 
 void ShellWindow::toggleFireMode() {
     profile_.fireMode = (profile_.fireMode + 1) % 3;
-    applyProfileToEngine(true);
+    applyTuningToEngine();
     const char* msg = (profile_.fireMode == FIRE_MODE_DRAG_RIGHT) ? "Fire Mode: DRAG-FIRE (Right)"
                     : (profile_.fireMode == FIRE_MODE_CLAW_LEFT)  ? "Fire Mode: CLAW-LEFT (Separate)"
                                                                   : "Fire Mode: DUAL-DRAG";
@@ -1284,7 +1416,7 @@ void ShellWindow::toggleFireMode() {
 
 void ShellWindow::toggleHud() {
     profile_.showHudInPlay = !profile_.showHudInPlay;
-    applyProfileToEngine(true);
+    applyTuningToEngine();
     hudOverlay_.showToast(profile_.showHudInPlay ? "HUD Key Badges: VISIBLE" : "HUD Key Badges: HIDDEN", 1200);
 }
 
@@ -1360,6 +1492,9 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     if (res.requestSwitchProfile && !res.switchProfilePath.empty()) {
         if (switchProfilePath(res.switchProfilePath, false)) {
             manualOverridePkg_ = activeAppPackage_;
+            if (!activeAppPackage_.empty() && profile_.keymapEnabled) {
+                sessionAppProfiles_[activeAppPackage_] = profilePath_;
+            }
             hudOverlay_.showToast("Loaded config: " + profile_.name, 2000);
         }
     }
@@ -1650,8 +1785,11 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
+    bool altDown = ((kb->flags & LLKHF_ALTDOWN) != 0) || ((GetKeyState(VK_MENU) & 0x8000) != 0);
+    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
     if (!bridge_->isConnected() && !demoMode_) {
-        if (down && !isRepeat && vk == VK_F11) { PostMessageA(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
+        if (down && !isRepeat && !altDown && vk == VK_F11) { PostMessageW(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
@@ -1660,59 +1798,65 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
             if (down) {
                 if (!isRepeat && aimMode_ && !holdUnlockedAim_) {
                     holdUnlockedAim_ = true;
-                    PostMessageA(hwnd_, MSG_UNLOCK_AIM, 0, 0);
+                    PostMessageW(hwnd_, MSG_UNLOCK_AIM, 0, 0);
                 }
                 if (holdUnlockedAim_) return 1;
             }
         }
 
-        if (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1) {
+        if (!altDown && (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1)) {
             if (down) {
                 if (!isRepeat && !toggleAimKeyDown_) {
                     toggleAimKeyDown_ = true;
-                    PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+                    PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
                 }
                 return 1;
             }
         }
-    } else if (vk == VK_F1 && down) {
+    } else if (!altDown && vk == VK_F1 && down) {
         // Quick 1-key recovery from Desktop Typing Mode back to last Game Profile
         if (!isRepeat && !toggleAimKeyDown_) {
             toggleAimKeyDown_ = true;
-            PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+            PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
         }
         return 1;
     }
 
     if (down && isRepeat) {
-        if (aimMode_ || engine_->isKeyMapped(vk, false)) return 1;
+        if (!altDown && (aimMode_ || engine_->isKeyMapped(vk, false))) return 1;
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
-    // In unlocked Cursor Mode, allow Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A / Ctrl+Z clipboard shortcuts directly!
-    if (!aimMode_ && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) {
+    // E1: In unlocked Cursor Mode, allow pure Ctrl+C/V/X/A/Z (never match AltGr as Ctrl!)
+    if (!aimMode_ && KeyCodes::isPureCtrlShortcut(ctrlDown, altDown)) {
         if (vk == 'C' || vk == 'V' || vk == 'X' || vk == 'A' || vk == 'Z') {
             return CallNextHookEx(keyHook_, nCode, wParam, lParam);
         }
     }
 
-    if (down) {
-        if (vk == VK_F2)  { PostMessageA(hwnd_, MSG_TOGGLE_STUDIO, 0, 0); return 1; }
-        if (vk == VK_F3)  { PostMessageA(hwnd_, MSG_CYCLE_FIRE, 0, 0); return 1; }
-        if (vk == VK_F4)  { PostMessageA(hwnd_, MSG_TOGGLE_HUD, 0, 0); return 1; }
-        if (vk == VK_F11) { PostMessageA(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
-        if (vk == profile_.resetTouchVk) { PostMessageA(hwnd_, MSG_RESET_TOUCH, 0, 0); return 1; }
+    // N31: Do NOT intercept fixed hotkeys while Alt is held (so Alt+F4 closes cleanly!)
+    if (down && !altDown) {
+        if (vk == VK_F2)  { PostMessageW(hwnd_, MSG_TOGGLE_STUDIO, 0, 0); return 1; }
+        if (vk == VK_F3)  { PostMessageW(hwnd_, MSG_CYCLE_FIRE, 0, 0); return 1; }
+        if (vk == VK_F4)  { PostMessageW(hwnd_, MSG_TOGGLE_HUD, 0, 0); return 1; }
+        if (vk == VK_F11) { PostMessageW(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
+        if (vk == profile_.resetTouchVk) { PostMessageW(hwnd_, MSG_RESET_TOUCH, 0, 0); return 1; }
         if (profile_.keymapEnabled) {
-            if (vk == VK_OEM_4)     { PostMessageA(hwnd_, MSG_SENS_X_DOWN, 0, 0); return 1; }
-            if (vk == VK_OEM_6)     { PostMessageA(hwnd_, MSG_SENS_X_UP, 0, 0); return 1; }
-            if (vk == VK_OEM_MINUS) { PostMessageA(hwnd_, MSG_SENS_Y_DOWN, 0, 0); return 1; }
-            if (vk == VK_OEM_PLUS)  { PostMessageA(hwnd_, MSG_SENS_Y_UP, 0, 0); return 1; }
+            if (vk == VK_OEM_4)     { PostMessageW(hwnd_, MSG_SENS_X_DOWN, 0, 0); return 1; }
+            if (vk == VK_OEM_6)     { PostMessageW(hwnd_, MSG_SENS_X_UP, 0, 0); return 1; }
+            if (vk == VK_OEM_MINUS) { PostMessageW(hwnd_, MSG_SENS_Y_DOWN, 0, 0); return 1; }
+            if (vk == VK_OEM_PLUS)  { PostMessageW(hwnd_, MSG_SENS_Y_UP, 0, 0); return 1; }
         }
+    }
+
+    if (altDown && !aimMode_) {
+        // Never swallow AltGr or Alt+shortcut keys outside Aim Lock
+        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
     bool reqToggle = false;
     bool consumed = engine_->onKeyEvent(vk, down, reqToggle);
-    if (reqToggle) PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+    if (reqToggle) PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
     if (consumed) return 1;
 
     return CallNextHookEx(keyHook_, nCode, wParam, lParam);
@@ -1723,14 +1867,14 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
 LRESULT CALLBACK ShellWindow::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     ShellWindow* self = NULL;
     if (msg == WM_NCCREATE) {
-        CREATESTRUCTA* cs = reinterpret_cast<CREATESTRUCTA*>(lParam);
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         self = reinterpret_cast<ShellWindow*>(cs->lpCreateParams);
-        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     } else {
-        self = reinterpret_cast<ShellWindow*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        self = reinterpret_cast<ShellWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
     if (self) return self->handleMessage(hwnd, msg, wParam, lParam);
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1855,14 +1999,32 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     hudOverlay_.showToast(modeTag + " · F2 Studio | " + KeyCodes::toName(profile_.toggleAimVk) + "/F1 Aim", 3600);
                 } else {
                     bridge_->appendLog("[D3D11] Fallback to scrcpy.exe: " + d3dErr);
-                    nativeVideoSession_ = false;
-                    bridge_->setVideoPacketCallback(nullptr, nullptr);
-                    std::string mErr;
-                    bridge_->launchMirrorWindow(tools_, settings_.buildScrcpyArgs(), mirrorTitle_, mErr, true, bridge_->activeSerial());
+                    startAsyncLegacyFallback("D3D11 unavailable (" + d3dErr + ").");
+                    return 0;
                 }
             }
             layoutChildren();
             invalidateShell();
+            return 0;
+        }
+        case MSG_DEVICE_LOST: {
+            std::string rebuildErr;
+            if (viewportHost_.isNativeVideoActive()) {
+                if (viewportHost_.rebuildNativeDevice(rebuildErr)) {
+                    InterlockedExchange(&reinitDecoderFlag_, 1);
+                    bridge_->sendResetVideo();
+                    hudOverlay_.invalidate();
+                    bridge_->appendLog("[D3D11] GPU device reset recovered seamlessly.");
+                } else {
+                    bridge_->appendLog("[D3D11] Device rebuild failed: " + rebuildErr);
+                    startAsyncLegacyFallback("GPU reset failed.");
+                }
+            }
+            InterlockedExchange(&deviceResetPending_, 0);
+            return 0;
+        }
+        case MSG_VIDEO_FALLBACK: {
+            startAsyncLegacyFallback("Hardware/software video decoder unavailable.");
             return 0;
         }
         case MSG_QR_PAIR_UPDATE: {
@@ -1923,12 +2085,17 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_DROPFILES: {
             HDROP hDrop = reinterpret_cast<HDROP>(wParam);
-            UINT count = DragQueryFileA(hDrop, 0xFFFFFFFFu, NULL, 0);
+            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, NULL, 0);
             std::vector<std::string> dropped;
             for (UINT i = 0; i < count; ++i) {
-                char pathBuf[MAX_PATH * 2] = {0};
-                if (DragQueryFileA(hDrop, i, pathBuf, sizeof(pathBuf) - 1) > 0) {
-                    dropped.push_back(std::string(pathBuf));
+                wchar_t wpath[MAX_PATH * 2] = {0};
+                if (DragQueryFileW(hDrop, i, wpath, sizeof(wpath) / sizeof(wpath[0]) - 1) > 0) {
+                    int bytes = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, NULL, 0, NULL, NULL);
+                    if (bytes > 1) {
+                        std::string u8(static_cast<size_t>(bytes - 1), '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &u8[0], bytes - 1, NULL, NULL);
+                        dropped.push_back(u8);
+                    }
                 }
             }
             DragFinish(hDrop);
@@ -1938,28 +2105,29 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case MSG_SENS_X_DOWN:
             profile_.sensX = clampRange(profile_.sensX - 0.05f, 0.10f, 10.0f);
-            applyProfileToEngine(true);
+            applyTuningToEngine();
             { char b[64]; std::snprintf(b, sizeof(b), "Sens X: %.2f  (Y: %.2f)", profile_.sensX, profile_.sensY); hudOverlay_.showToast(b, 1200); }
             return 0;
         case MSG_SENS_X_UP:
             profile_.sensX = clampRange(profile_.sensX + 0.05f, 0.10f, 10.0f);
-            applyProfileToEngine(true);
+            applyTuningToEngine();
             { char b[64]; std::snprintf(b, sizeof(b), "Sens X: %.2f  (Y: %.2f)", profile_.sensX, profile_.sensY); hudOverlay_.showToast(b, 1200); }
             return 0;
         case MSG_SENS_Y_DOWN:
             profile_.sensY = clampRange(profile_.sensY - 0.05f, 0.10f, 10.0f);
-            applyProfileToEngine(true);
+            applyTuningToEngine();
             { char b[64]; std::snprintf(b, sizeof(b), "Sens Y: %.2f  (X: %.2f)", profile_.sensY, profile_.sensX); hudOverlay_.showToast(b, 1200); }
             return 0;
         case MSG_SENS_Y_UP:
             profile_.sensY = clampRange(profile_.sensY + 0.05f, 0.10f, 10.0f);
-            applyProfileToEngine(true);
+            applyTuningToEngine();
             { char b[64]; std::snprintf(b, sizeof(b), "Sens Y: %.2f  (X: %.2f)", profile_.sensY, profile_.sensX); hudOverlay_.showToast(b, 1200); }
             return 0;
 
         case WM_TIMER:
             if (wParam == TIMER_TICK) {
                 bool fg = isAppForeground();
+                engine_->setAppFocused(fg); // E4: gate XInput gamepad polling on window focus!
                 if (!fg) {
                     if (aimMode_) setAimMode(false);
                     if (hadForeground_) engine_->releaseAllTouches();
@@ -1976,6 +2144,26 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 hudOverlay_.checkToastExpired();
 
                 DWORD nowTick = GetTickCount();
+                // V5: Debounced virtual display flex resize
+                if (hasPendingVdResize_ && bridge_->isVirtualDisplayActive() &&
+                    static_cast<LONG>(nowTick - pendingVdResizeTick_) >= 0) {
+                    hasPendingVdResize_ = false;
+                    int vw = viewportRc_.right - viewportRc_.left;
+                    int vh = viewportRc_.bottom - viewportRc_.top;
+                    if (vw >= 160 && vh >= 160) {
+                        bridge_->sendResizeDisplay(static_cast<uint16_t>(vw), static_cast<uint16_t>(vh));
+                    }
+                }
+                // N28: Debounced off-UI-thread profile save (500ms after last sensitivity/toggle press)
+                if (hasPendingProfileSave_ && !profilePath_.empty() &&
+                    static_cast<LONG>(nowTick - profileSaveDueTick_) >= 0) {
+                    hasPendingProfileSave_ = false;
+                    profileDirty_ = false;
+                    ProfileSaveJob* job = new ProfileSaveJob{ profilePath_, profilesDir_, profile_ };
+                    HANDLE hSave = CreateThread(NULL, 0, profileSaveWorkerProc, job, 0, NULL);
+                    if (hSave) CloseHandle(hSave);
+                    else { ProfileStore::save(job->path, job->profile); delete job; }
+                }
                 bool connected = bridge_->isConnected();
                 if ((nowTick - lastTelemetryPaintTick_) >= 150) {
                     lastTelemetryPaintTick_ = nowTick;
@@ -2141,87 +2329,15 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     return 0;
                 }
             }
-            break;
+            // N30: Double-clicks on chrome (TopBar / SideRail / Drawer / Hub) behave as a normal click!
+            handleLeftButtonDown(hwnd, mx, my);
+            return 0;
         }
 
         case WM_LBUTTONDOWN: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
-            SetFocus(hwnd);
-            editingHubWireless_ = false;
-
-            // 1. TopBar interactive controls
-            if (ptIn(topBarRc_, mx, my)) {
-                TopBarAction tb = topBar_.hitTest(mx, my);
-                if (tb != TB_NONE) { handleTopBarAction(tb); return 0; }
-            }
-            // 2. SideRail emulator buttons
-            if (ptIn(railRc_, mx, my)) {
-                SideRailAction sr = sideRail_.hitTest(mx, my);
-                if (sr != SR_NONE) { handleSideRailAction(sr); return 0; }
-            }
-            // 3. Docked Outside-Viewport DrawerPanel
-            if (drawerOpen_ && drawerPanel_.containsPoint(mx, my)) {
-                SetCapture(hwnd);
-                int sel = hudOverlay_.selectedBtnIndex();
-                DrawerActionResult res;
-                if (drawerPanel_.onMouseDown(mx, my, profile_, settings_, sel, res)) {
-                    hudOverlay_.setSelectedBtnIndex(sel);
-                    handleDrawerResult(res);
-                    return 0;
-                }
-            }
-            // Clicking outside drawer clears drawer text/rebind focus so keyboard typing targets the phone!
-            if (drawerOpen_) {
-                drawerPanel_.clearFocus();
-                invalidateShell();
-            }
-            // 4. Native D3D11 Embedded Edit Mode Canvas (same-frame HUD interaction!)
-            if (editMode_ && viewportHost_.isNativeVideoActive()) {
-                int vx = 0, vy = 0;
-                if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
-                    d3dHudDragging_ = true;
-                    SetCapture(hwnd);
-                    hudOverlay_.dispatchMouseDown(vx, vy, false);
-                    return 0;
-                }
-            }
-            // 5. Direct Cursor-Mode Touch on Phone Screen (Native D3D11 Viewport!)
-            if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
-                float nx = 0.0f, ny = 0.0f;
-                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
-                    cursorDirectDragging_ = true;
-                    lastCursorNormX_ = nx;
-                    lastCursorNormY_ = ny;
-                    SetCapture(hwnd);
-                    engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
-                    return 0;
-                }
-            }
-            // 6. Device Hub inside ViewportHost (when disconnected)
-            if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
-                HubClickResult hr = viewportHost_.hitTestHub(mx, my);
-                if (hr.action == HUB_REFRESH_DEVICES) {
-                    refreshAdbDevices();
-                } else if (hr.action == HUB_CONNECT_DEVICE && hr.index >= 0 &&
-                           hr.index < static_cast<int>(adbDevices_.size())) {
-                    startAsyncConnect(adbDevices_[hr.index].serial);
-                } else if (hr.action == HUB_FOCUS_WIFI_ADDR) {
-                    editingHubWireless_ = true;
-                    invalidateShell();
-                } else if (hr.action == HUB_CONNECT_WIFI) {
-                    startAsyncWirelessConnect(settings_.lastWirelessAddr);
-                } else if (hr.action == HUB_TOGGLE_QR_PAIR) {
-                    if (showingQrPair_) { stopQrWirelessPairing(); refreshAdbDevices(); }
-                    else startQrWirelessPairing();
-                } else if (hr.action == HUB_START_OFFLINE_STUDIO) {
-                    stopQrWirelessPairing();
-                    demoMode_ = true;
-                    setDrawerState(true, 0);
-                    hudOverlay_.showToast("Offline Keymap Studio active! Changes auto-save to " + profile_.name, 3000);
-                }
-                return 0;
-            }
+            handleLeftButtonDown(hwnd, mx, my);
             return 0;
         }
 
@@ -2368,11 +2484,6 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_CHAR: {
             wchar_t ch = static_cast<wchar_t>(wParam);
-            if (wParam > 127 && wParam <= 255) {
-                char ab = static_cast<char>(wParam & 0xFFu);
-                wchar_t wb = 0;
-                if (MultiByteToWideChar(CP_ACP, 0, &ab, 1, &wb, 1) == 1) ch = wb;
-            }
             if (editingHubWireless_ && ch >= 32 && ch <= 126) {
                 if (settings_.lastWirelessAddr.size() < 28) {
                     settings_.lastWirelessAddr.push_back(static_cast<char>(ch));
@@ -2388,6 +2499,28 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     return 0;
                 }
             }
+            // B4: handle UTF-16 surrogate pairs (e.g. emoji / rare CJK) seamlessly for Unicode typing
+            if (ch >= 0xD800 && ch <= 0xDBFF) {
+                highSurrogate_ = ch;
+                return 0;
+            }
+            if (ch >= 0xDC00 && ch <= 0xDFFF && highSurrogate_ != 0) {
+                wchar_t pair[2] = { highSurrogate_, ch };
+                highSurrogate_ = 0;
+                if (bridge_->isConnected() && !aimMode_ && !editMode_ && !profile_.keymapEnabled &&
+                    !KeyCodes::isPureCtrlShortcut((GetKeyState(VK_CONTROL) & 0x8000) != 0,
+                                                  (GetKeyState(VK_MENU) & 0x8000) != 0)) {
+                    int bytes = WideCharToMultiByte(CP_UTF8, 0, pair, 2, NULL, 0, NULL, NULL);
+                    if (bytes > 0) {
+                        std::string u8(static_cast<size_t>(bytes), '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, pair, 2, &u8[0], bytes, NULL, NULL);
+                        bridge_->sendText(u8);
+                    }
+                    return 0;
+                }
+                break;
+            }
+            highSurrogate_ = 0;
             if (!editMode_ && handleDesktopChar(ch)) return 0;
             break;
         }
@@ -2432,7 +2565,84 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         default:
             break;
     }
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
+    SetFocus(hwnd);
+    editingHubWireless_ = false;
+
+    // 1. TopBar interactive controls
+    if (ptIn(topBarRc_, mx, my)) {
+        TopBarAction tb = topBar_.hitTest(mx, my);
+        if (tb != TB_NONE) { handleTopBarAction(tb); return; }
+    }
+    // 2. SideRail emulator buttons
+    if (ptIn(railRc_, mx, my)) {
+        SideRailAction sr = sideRail_.hitTest(mx, my);
+        if (sr != SR_NONE) { handleSideRailAction(sr); return; }
+    }
+    // 3. Docked Outside-Viewport DrawerPanel
+    if (drawerOpen_ && drawerPanel_.containsPoint(mx, my)) {
+        SetCapture(hwnd);
+        int sel = hudOverlay_.selectedBtnIndex();
+        DrawerActionResult res;
+        if (drawerPanel_.onMouseDown(mx, my, profile_, settings_, sel, res)) {
+            hudOverlay_.setSelectedBtnIndex(sel);
+            handleDrawerResult(res);
+            return;
+        }
+    }
+    // Clicking outside drawer clears drawer text/rebind focus so keyboard typing targets the phone!
+    if (drawerOpen_) {
+        drawerPanel_.clearFocus();
+        invalidateShell();
+    }
+    // 4. Native D3D11 Embedded Edit Mode Canvas (same-frame HUD interaction!)
+    if (editMode_ && viewportHost_.isNativeVideoActive()) {
+        int vx = 0, vy = 0;
+        if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
+            d3dHudDragging_ = true;
+            SetCapture(hwnd);
+            hudOverlay_.dispatchMouseDown(vx, vy, false);
+            return;
+        }
+    }
+    // 5. Direct Cursor-Mode Touch on Phone Screen (Native D3D11 Viewport!)
+    if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
+        float nx = 0.0f, ny = 0.0f;
+        if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+            cursorDirectDragging_ = true;
+            lastCursorNormX_ = nx;
+            lastCursorNormY_ = ny;
+            SetCapture(hwnd);
+            engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
+            return;
+        }
+    }
+    // 6. Device Hub inside ViewportHost (when disconnected)
+    if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
+        HubClickResult hr = viewportHost_.hitTestHub(mx, my);
+        if (hr.action == HUB_REFRESH_DEVICES) {
+            refreshAdbDevices();
+        } else if (hr.action == HUB_CONNECT_DEVICE && hr.index >= 0 &&
+                   hr.index < static_cast<int>(adbDevices_.size())) {
+            startAsyncConnect(adbDevices_[hr.index].serial);
+        } else if (hr.action == HUB_FOCUS_WIFI_ADDR) {
+            editingHubWireless_ = true;
+            invalidateShell();
+        } else if (hr.action == HUB_CONNECT_WIFI) {
+            startAsyncWirelessConnect(settings_.lastWirelessAddr);
+        } else if (hr.action == HUB_TOGGLE_QR_PAIR) {
+            if (showingQrPair_) { stopQrWirelessPairing(); refreshAdbDevices(); }
+            else startQrWirelessPairing();
+        } else if (hr.action == HUB_START_OFFLINE_STUDIO) {
+            stopQrWirelessPairing();
+            demoMode_ = true;
+            setDrawerState(true, 0);
+            hudOverlay_.showToast("Offline Keymap Studio active! Changes auto-save to " + profile_.name, 3000);
+        }
+    }
 }
 
 void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {

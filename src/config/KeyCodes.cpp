@@ -206,3 +206,7 @@ uint32_t KeyCodes::vkToAndroidKeycode(int vk) {
         default:        return 0;
     }
 }
+
+bool KeyCodes::isPureCtrlShortcut(bool ctrlDown, bool altDown) {
+    return ctrlDown && !altDown;
+}

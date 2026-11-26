@@ -84,7 +84,7 @@ Profile ProfileDefaults::createFreeFire() {
     p.idleResetMs = 700;
     p.touchDownDelayMs = 15;
     p.touchUpDelayMs = 0;
-    p.tapJitterPx = 4;
+    p.tapJitterPx = 0;
 
     p.fireMode = FIRE_MODE_CLAW_LEFT;
     p.fireVk = 0x01; // LMB

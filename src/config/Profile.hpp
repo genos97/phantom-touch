@@ -86,7 +86,7 @@ struct Profile {
     int idleResetMs = 700;
     int touchDownDelayMs = 15;
     int touchUpDelayMs = 0;
-    int tapJitterPx = 4;
+    int tapJitterPx = 0;
 
     // Fire button settings
     int fireMode = FIRE_MODE_CLAW_LEFT;

@@ -759,7 +759,20 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         y += 34;
     };
 
-    drawSeg3("MIRROR MAX FPS", "60 FPS", "90 FPS", "120 FPS", 60, 90, 120, s.mirrorFps, DA_STREAM_FPS);
+    // 4-way selector for MIRROR MAX FPS (V10: Uncapped = 0 default, plus 60/90/120 caps)
+    GdiPlusDraw::textLeft(g, "MIRROR MAX FPS", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    y += 18;
+    const char* fLbls[4] = { "Uncapped", "60", "90", "120" };
+    const int fVals[4] = { 0, 60, 90, 120 };
+    int fw = (w - 12) / 4;
+    for (int i = 0; i < 4; ++i) {
+        RECT r = { x + i * (fw + 4), y, x + i * (fw + 4) + fw, y + 26 };
+        bool on = (s.mirrorFps == fVals[i]);
+        GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD, on ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
+        GdiPlusDraw::textCenter(g, fLbls[i], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.5f, true, on ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_STREAM_FPS, fVals[i] });
+    }
+    y += 34;
 
     // Bitrate 4-way
     GdiPlusDraw::textLeft(g, "VIDEO BITRATE", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);

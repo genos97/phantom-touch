@@ -1,9 +1,10 @@
-# Downloads the latest official Genymobile/scrcpy Windows 64-bit release into .\scrcpy\
+# Downloads the pinned official Genymobile/scrcpy Windows 64-bit release (v5.0.1) into .\scrcpy\
 $ErrorActionPreference = "Stop"
 
+$scrcpyTag = "v5.0.1"
 $destDir = Join-Path $PSScriptRoot "scrcpy"
-Write-Host "Fetching latest official scrcpy release metadata from GitHub..."
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/Genymobile/scrcpy/releases/latest" -Headers @{ "User-Agent" = "scrcpy-keymapper-setup" }
+Write-Host "Fetching official scrcpy $scrcpyTag release metadata from GitHub..."
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/Genymobile/scrcpy/releases/tags/$scrcpyTag" -Headers @{ "User-Agent" = "scrcpy-keymapper-setup" }
 
 $asset = $release.assets | Where-Object { $_.name -match "scrcpy-win64-.*\.zip$" } | Select-Object -First 1
 if (-not $asset) {
@@ -27,4 +28,4 @@ Remove-Item -Force $zipPath
 
 Write-Host ""
 Write-Host "Done! Installed scrcpy $($release.tag_name) into: $destDir"
-Write-Host "Now plug in your Android phone (USB Debugging ON) and run: .\scrcpy_keymapper.exe"
+Write-Host "Now plug in your Android phone (USB Debugging ON) and run: .\PhantomTouch.exe"

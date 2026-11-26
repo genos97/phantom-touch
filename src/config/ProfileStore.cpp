@@ -44,6 +44,70 @@ int clampi(int v, int lo, int hi) {
     return v;
 }
 
+std::string escapeCfgField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\\' || c == ',' || c == '#') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::string unescapeCfgField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char nxt = s[i + 1];
+            if (nxt == '\\' || nxt == ',' || nxt == '#') {
+                out.push_back(nxt);
+                ++i;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+std::string stripUnescapedComment(const std::string& line) {
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '\\' && i + 1 < line.size()) {
+            ++i;
+            continue;
+        }
+        if (line[i] == '#') {
+            return line.substr(0, i);
+        }
+    }
+    return line;
+}
+
+std::vector<std::string> splitUnescapedComma(const std::string& val) {
+    std::vector<std::string> parts;
+    std::string cur;
+    for (size_t i = 0; i < val.size(); ++i) {
+        if (val[i] == '\\' && i + 1 < val.size()) {
+            cur.push_back(val[i]);
+            cur.push_back(val[i + 1]);
+            ++i;
+            continue;
+        }
+        if (val[i] == ',') {
+            parts.push_back(trim(cur));
+            cur.clear();
+            continue;
+        }
+        cur.push_back(val[i]);
+    }
+    parts.push_back(trim(cur));
+    return parts;
+}
+
 } // namespace
 
 std::vector<std::string> ProfileStore::listProfiles(const std::string& profilesDir) {
@@ -123,9 +187,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
 
     std::string line;
     while (std::getline(in, line)) {
-        size_t hash = line.find('#');
-        if (hash != std::string::npos) line = line.substr(0, hash);
-        line = trim(line);
+        line = trim(stripUnescapedComment(line));
         if (line.empty()) continue;
 
         size_t eq = line.find('=');
@@ -134,7 +196,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         std::string key = trim(line.substr(0, eq));
         std::string val = trim(line.substr(eq + 1));
 
-        if (key == "name") p.name = val;
+        if (key == "name") p.name = unescapeCfgField(val);
         else if (key == "app_package") p.appPackage = val;
         else if (key == "keymap_enabled") p.keymapEnabled = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "edge_anchored") p.edgeAnchored = (val == "1" || toUpper(val) == "TRUE");
@@ -211,15 +273,10 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
                 p.buttons.clear();
                 sawAnyButton = true;
             }
-            std::vector<std::string> parts;
-            std::stringstream ss(val);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                parts.push_back(trim(item));
-            }
+            std::vector<std::string> parts = splitUnescapedComma(val);
             if (parts.size() >= 4) {
                 KeyNode n;
-                n.label = parts[0];
+                n.label = unescapeCfgField(parts[0]);
                 KeyCodes::parseCombo(parts[1], n.comboVk, n.vk);
                 n.x = clampf(static_cast<float>(std::atof(parts[2].c_str())), 0.01f, 0.99f);
                 n.y = clampf(static_cast<float>(std::atof(parts[3].c_str())), 0.01f, 0.99f);
@@ -275,7 +332,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "# All coordinates are normalized (0.0 = top/left, 1.0 = bottom/right)\n";
     out << "# Press F2 in-app to drag & drop nodes, T to cycle node Action Type, Ctrl+S to save.\n\n";
 
-    out << "name = " << p.name << "\n";
+    out << "name = " << escapeCfgField(p.name) << "\n";
     out << "app_package = " << p.appPackage << "\n";
     out << "keymap_enabled = " << (p.keymapEnabled ? 1 : 0) << "\n";
     out << "edge_anchored = " << (p.edgeAnchored ? 1 : 0) << "\n";
@@ -339,6 +396,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "buttons_explicit = 1\n";
     for (size_t i = 0; i < p.buttons.size(); ++i) {
         const KeyNode& b = p.buttons[i];
+        std::string escLabel = escapeCfgField(b.label);
         std::string keySpec = KeyCodes::comboToName(b.comboVk, b.vk);
         std::string flagsStr;
         if (b.toggleMode || b.resetView || b.reactivateJoy) {
@@ -351,12 +409,12 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
         }
         if (b.action == NODE_SWIPE) {
             std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d, %.4f, %.4f\n",
-                          b.label.c_str(), keySpec.c_str(), b.x, b.y,
+                          escLabel.c_str(), keySpec.c_str(), b.x, b.y,
                           ProfileDefaults::actionTypeToName(b.action).c_str(),
                           flagsStr.c_str(), b.durationMs, b.x2, b.y2);
         } else {
             std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d\n",
-                          b.label.c_str(), keySpec.c_str(), b.x, b.y,
+                          escLabel.c_str(), keySpec.c_str(), b.x, b.y,
                           ProfileDefaults::actionTypeToName(b.action).c_str(),
                           flagsStr.c_str(), b.durationMs);
         }
