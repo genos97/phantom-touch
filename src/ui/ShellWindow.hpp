@@ -62,7 +62,11 @@ private:
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
     static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame);
-    static void onDecodedFrame(void* ctx, const DecodedNV12Frame& frame);
+    static void onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
+                                  uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH);
+    static void onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
+                                 uint32_t stride, uint32_t cropX, uint32_t cropY,
+                                 uint32_t outW, uint32_t outH);
     static void onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h);
 
     bool mapShellClientToVideoLocal(int mx, int my, int& outVx, int& outVy, bool requireInside) const;
@@ -115,7 +119,7 @@ private:
 
     bool isAppForeground() const;
     bool isPointInVideoScreen(POINT screenPt, float& outNormX, float& outNormY) const;
-    void onPaint(HDC hdc);
+    void onPaint(HDC hdc, const RECT& dirtyRc);
     void invalidateShell();
 
     ScrcpyBridge* bridge_;
@@ -206,16 +210,46 @@ private:
 
     int hoverX_ = -1;
     int hoverY_ = -1;
+    bool hoveringChrome_ = false;
     int addNodeStagger_ = 0;
     uint32_t lastPhoneW_ = 1920;
     uint32_t lastPhoneH_ = 1080;
     DWORD lastTelemetryPaintTick_ = 0;
+    DWORD lastTopBarPaintTick_ = 0;
     bool sawEmbeddedMirror_ = false;
     bool nativeVideoSession_ = false;
     bool d3dHudDragging_ = false;
     bool lastAppliedScreenOff_ = false;
-    volatile LONG videoFramePending_ = 0;
+    volatile LONG aimModeAtomic_ = 0;
+    volatile LONG autoSwitchAtomic_ = 1;
+    volatile LONG gameProfileAtomic_ = 1;
     H264Decoder h264Decoder_;
+
+    struct HudVisualSig {
+        bool valid = false;
+        bool aimMode = false;
+        bool aimFingerDown = false;
+        bool fireHeld = false;
+        bool scopeActive = false;
+        bool holdViewActive = false;
+        bool joyDown = false;
+        bool showHud = false;
+        bool fullscreen = false;
+        int aimQx = -1;
+        int aimQy = -1;
+        uint32_t fsRate = 0;
+    };
+    HudVisualSig lastHudSig_;
+
+    struct TopBarVisualSig {
+        bool valid = false;
+        bool connected = false;
+        bool aimMode = false;
+        bool keymapEnabled = false;
+        int fireMode = 0;
+        uint32_t touchRateHz = 0;
+    };
+    TopBarVisualSig lastTopBarSig_;
 
     // Double-buffered shell GDI surface
     HDC cacheDC_ = NULL;

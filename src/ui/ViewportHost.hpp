@@ -39,9 +39,20 @@ public:
     HWND hwnd() const { return hwnd_; }
 
     // Stage 2 Native Direct3D 11 single-connection renderer
+    bool ensureNativeDeviceInitialized(std::string& outError);
     bool enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError);
     void disableNativeVideo();
     bool isNativeVideoActive() const { return nativeVideoActive_ && d3d_.isInitialized(); }
+    ID3D11Device* d3dDevice() const { return d3d_.d3dDevice(); }
+    bool supportsGpuNv12() const { return d3d_.supportsGpuNv12(); }
+    bool isFlipModel() const { return d3d_.isFlipModel(); }
+    DWORD lastPresentTick() const { return d3d_.lastPresentTick(); }
+    bool presentGpuNV12Frame(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
+                             uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                             bool drawHudOverlay);
+    void presentCpuNV12Frame(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
+                             uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                             bool drawHudOverlay);
     void submitDecodedFrame(const DecodedNV12Frame& frame);
     void updateEmbeddedHud(const void* bgraPremulPixels, int width, int height);
     void renderNativeFrame(bool drawHudOverlay);
@@ -88,8 +99,9 @@ private:
     HWND hwnd_ = NULL;
     HWND parentHwnd_ = NULL;
     HWND embeddedHwnd_ = NULL;
-    bool nativeVideoActive_ = false;
+    volatile LONG nativeVideoActive_ = 0;
     D3D11Renderer d3d_;
+    mutable CRITICAL_SECTION rectLock_;
     RECT hostBounds_;
     ViewportRect videoRect_;
     uint32_t lastPhoneW_ = 1920;

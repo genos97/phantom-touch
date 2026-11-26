@@ -13,27 +13,40 @@ struct DecodedNV12Frame {
     std::vector<uint8_t> data; // Compact NV12 buffer: Y (stride * surfaceH) + UV (stride * surfaceH / 2)
 };
 
-typedef void (*DecodedFrameFn)(void* ctx, const DecodedNV12Frame& frame);
-
+struct ID3D11Device;
+struct ID3D11Texture2D;
 struct IMFTransform;
 struct IMFSample;
+struct IMFDXGIDeviceManager;
 
-// Hardware-accelerated (DXVA / Media Foundation) Annex-B H.264 decoder -> NV12.
+typedef void (*DecodedFrameFn)(void* ctx, const DecodedNV12Frame& frame);
+typedef void (*DecodedGpuFrameFn)(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
+                                  uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH);
+typedef void (*DecodedCpuViewFn)(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
+                                 uint32_t stride, uint32_t cropX, uint32_t cropY,
+                                 uint32_t outW, uint32_t outH);
+
+// Hardware-accelerated (DXVA / D3D11 Media Foundation) Annex-B H.264 decoder -> NV12.
 // Uses Windows built-in CMSH264DecoderMFT with zero external codec DLLs.
-// Handles scrcpy SPS/PPS config packets and live portrait <-> landscape stream changes.
+// When given a video-capable ID3D11Device, decodes directly on the GPU ASIC (NVDEC / QuickSync)
+// and emits zero-copy ID3D11Texture2D NV12 surfaces. Falls back seamlessly to CPU NV12 otherwise.
 class H264Decoder {
 public:
     H264Decoder();
     ~H264Decoder();
 
-    bool init(uint32_t initialW, uint32_t initialH, std::string& outError);
+    bool init(uint32_t initialW, uint32_t initialH, std::string& outError,
+              ID3D11Device* d3dDevice = nullptr);
     void shutdown();
     bool isInitialized() const { return mft_ != nullptr; }
+    bool isHardwareAccelerated() const { return dxvaActive_; }
 
     void setFrameCallback(DecodedFrameFn fn, void* ctx);
+    void setGpuFrameCallback(DecodedGpuFrameFn fn, void* ctx);
+    void setCpuViewCallback(DecodedCpuViewFn fn, void* ctx);
 
     // Feeds one framed scrcpy H.264 packet (config SPS/PPS or encoded frame).
-    // Invokes the frame callback synchronously for each decoded NV12 frame produced.
+    // Invokes the configured frame callback synchronously for each decoded frame produced.
     // Returns true if at least one frame was decoded.
     bool decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
                       bool isConfig, bool isKeyFrame);
@@ -47,9 +60,11 @@ private:
 
     IMFTransform* mft_ = nullptr;
     IMFSample* reusableOutSample_ = nullptr;
+    IMFDXGIDeviceManager* dxgiMgr_ = nullptr;
     bool mfStarted_ = false;
     bool comInitialized_ = false;
     bool mftProvidesSamples_ = false;
+    bool dxvaActive_ = false;
 
     uint32_t codedW_ = 1920;
     uint32_t codedH_ = 1080;
@@ -68,4 +83,8 @@ private:
     DecodedNV12Frame workFrame_;
     DecodedFrameFn frameCb_ = nullptr;
     void* frameCbCtx_ = nullptr;
+    DecodedGpuFrameFn gpuFrameCb_ = nullptr;
+    void* gpuFrameCbCtx_ = nullptr;
+    DecodedCpuViewFn cpuViewCb_ = nullptr;
+    void* cpuViewCbCtx_ = nullptr;
 };

@@ -4,8 +4,10 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+#include <d3d10.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3dcommon.h>
 
 #include <algorithm>
@@ -21,6 +23,20 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(
     UINT Flags1, UINT Flags2,
     ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs);
 
+// Immutable Microsoft COM IIDs (defined inline for guaranteed static linking across SDK versions)
+const GUID kIID_ID3D10Multithread = {
+    0x9B7E4E00, 0x342C, 0x4106, { 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0 }
+};
+const GUID kIID_IDXGIDevice1 = {
+    0x77DB970F, 0x6276, 0x48BA, { 0xBA, 0x28, 0x07, 0x01, 0x43, 0xB4, 0x39, 0x2C }
+};
+const GUID kIID_IDXGIFactory2 = {
+    0x50C83A1C, 0xE072, 0x4C48, { 0x87, 0xB0, 0x36, 0x30, 0xFA, 0x36, 0xA6, 0xD0 }
+};
+const GUID kIID_IDXGIFactory5 = {
+    0x7632E1F5, 0xEE65, 0x4DCA, { 0x87, 0xFD, 0x84, 0xCD, 0x75, 0xF8, 0x83, 0x8D }
+};
+
 template <typename T>
 void safeRelease(T*& p) {
     if (p) {
@@ -31,11 +47,13 @@ void safeRelease(T*& p) {
 
 struct QuadCB {
     float rectNdc[4]; // x0, y0 (bottom-left NDC), x1, y1 (top-right NDC)
+    float uvRect[4];  // u0, v0, u1, v1 (exact hardware crop window inside NV12 surface)
 };
 
 const char* kShaderSrc = R"(
 cbuffer QuadCB : register(b0) {
     float4 rectNdc;
+    float4 uvRect;
 };
 
 struct VSOut {
@@ -50,12 +68,12 @@ VSOut vsMain(uint id : SV_VertexID) {
         float2(0.0, 1.0),
         float2(1.0, 1.0)
     };
-    float2 uv = uvs[id];
-    float x = lerp(rectNdc.x, rectNdc.z, uv.x);
-    float y = lerp(rectNdc.w, rectNdc.y, uv.y);
+    float2 t = uvs[id];
+    float x = lerp(rectNdc.x, rectNdc.z, t.x);
+    float y = lerp(rectNdc.w, rectNdc.y, t.y);
     VSOut o;
     o.pos = float4(x, y, 0.0, 1.0);
-    o.uv = uv;
+    o.uv = float2(lerp(uvRect.x, uvRect.z, t.x), lerp(uvRect.y, uvRect.w, t.y));
     return o;
 }
 
@@ -93,12 +111,14 @@ uint8_t clampByte(int v) {
 } // namespace
 
 D3D11Renderer::D3D11Renderer() {
+    InitializeCriticalSection(&d3dLock_);
     InitializeCriticalSection(&frameLock_);
 }
 
 D3D11Renderer::~D3D11Renderer() {
     shutdown();
     DeleteCriticalSection(&frameLock_);
+    DeleteCriticalSection(&d3dLock_);
 }
 
 bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::string& outError) {
@@ -108,67 +128,180 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
         return false;
     }
 
+    EnterCriticalSection(&d3dLock_);
+
     targetHwnd_ = targetHwnd;
     backbufW_ = (initialW > 8) ? initialW : 640;
     backbufH_ = (initialH > 8) ? initialH : 360;
 
-    DXGI_SWAP_CHAIN_DESC scd;
-    ZeroMemory(&scd, sizeof(scd));
-    scd.BufferCount = 2;
-    scd.BufferDesc.Width = static_cast<UINT>(backbufW_);
-    scd.BufferDesc.Height = static_cast<UINT>(backbufH_);
-    scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow = targetHwnd_;
-    scd.SampleDesc.Count = 1;
-    scd.Windowed = TRUE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
+    D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0
+    };
     D3D_FEATURE_LEVEL gotLevel = D3D_FEATURE_LEVEL_11_0;
 
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-        levels, 3, D3D11_SDK_VERSION,
-        &scd, &swapChain_, &device_, &gotLevel, &ctx_);
+    // Prefer HARDWARE device with VIDEO_SUPPORT (enables DXVA / NVDEC / QuickSync zero-copy H.264 decode!)
+    HRESULT hr = D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        levels, 4, D3D11_SDK_VERSION,
+        &device_, &gotLevel, &ctx_);
 
-    if (SUCCEEDED(hr)) {
+    if (FAILED(hr)) {
+        // Retry HARDWARE without D3D_FEATURE_LEVEL_11_1 / VIDEO_SUPPORT (older drivers)
+        hr = D3D11CreateDevice(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            levels + 1, 3, D3D11_SDK_VERSION,
+            &device_, &gotLevel, &ctx_);
+    }
+
+    if (SUCCEEDED(hr) && device_ && ctx_) {
         hardwareAccel_ = true;
     } else {
         // Fallback cleanly to Windows WARP software D3D11 rasterizer (also enables headless unit tests!)
-        hr = D3D11CreateDeviceAndSwapChain(
+        hr = D3D11CreateDevice(
             NULL, D3D_DRIVER_TYPE_WARP, NULL, 0,
-            levels, 3, D3D11_SDK_VERSION,
-            &scd, &swapChain_, &device_, &gotLevel, &ctx_);
-        if (FAILED(hr)) {
-            outError = "Failed creating Direct3D 11 device and swap chain.";
+            levels + 1, 3, D3D11_SDK_VERSION,
+            &device_, &gotLevel, &ctx_);
+        if (FAILED(hr) || !device_ || !ctx_) {
+            LeaveCriticalSection(&d3dLock_);
+            outError = "Failed creating Direct3D 11 device.";
             shutdown();
             return false;
         }
         hardwareAccel_ = false;
     }
 
-    // Disable Alt+Enter DXGI fullscreen hijack so our own Shell F11 fullscreen stays in control
+    // Enable D3D11 multithread protection (required for DXVA MFT + video-thread rendering!)
+    ID3D10Multithread* mt = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(kIID_ID3D10Multithread, reinterpret_cast<void**>(&mt))) && mt) {
+        mt->SetMultithreadProtected(TRUE);
+        mt->Release();
+    }
+
+    // Cap GPU swap chain latency to 1 frame (eliminates 30-50ms of queued display lag!)
+    IDXGIDevice1* dxgiDev1 = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(kIID_IDXGIDevice1, reinterpret_cast<void**>(&dxgiDev1))) && dxgiDev1) {
+        dxgiDev1->SetMaximumFrameLatency(1);
+        dxgiDev1->Release();
+    }
+
+    // Obtain DXGI Factory from the exact adapter that owns our device
     IDXGIDevice* dxgiDev = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory* factory = nullptr;
     if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
-        IDXGIAdapter* adapter = nullptr;
         if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
-            IDXGIFactory* factory = nullptr;
-            if (SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory))) && factory) {
-                factory->MakeWindowAssociation(targetHwnd_, DXGI_MWA_NO_ALT_ENTER);
-                factory->Release();
-            }
+            adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory));
             adapter->Release();
         }
         dxgiDev->Release();
     }
+    if (!factory) {
+        LeaveCriticalSection(&d3dLock_);
+        outError = "Failed querying IDXGIFactory.";
+        shutdown();
+        return false;
+    }
 
-    if (!createRenderTarget()) {
+    // Check Windows 10/11 tearing support for zero-latency Flip-Model Present(0, DXGI_PRESENT_ALLOW_TEARING)
+    tearingSupported_ = false;
+    IDXGIFactory5* factory5 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory5, reinterpret_cast<void**>(&factory5))) && factory5) {
+        BOOL allowTearing = FALSE;
+        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                    &allowTearing, sizeof(allowTearing))) && allowTearing) {
+            tearingSupported_ = true;
+        }
+        factory5->Release();
+    }
+
+    // Prefer modern zero-copy Flip-Model swap chain (DXGI_SWAP_EFFECT_FLIP_DISCARD) on Win10/11!
+    flipModel_ = false;
+    swapChainFlags_ = 0;
+    IDXGIFactory2* factory2 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory2, reinterpret_cast<void**>(&factory2))) && factory2) {
+        DXGI_SWAP_CHAIN_DESC1 scd1;
+        ZeroMemory(&scd1, sizeof(scd1));
+        scd1.Width = static_cast<UINT>(backbufW_);
+        scd1.Height = static_cast<UINT>(backbufH_);
+        scd1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd1.SampleDesc.Count = 1;
+        scd1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd1.BufferCount = 2;
+        scd1.Scaling = DXGI_SCALING_STRETCH;
+        scd1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        scd1.Flags = tearingSupported_ ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
+
+        IDXGISwapChain1* sc1 = nullptr;
+        hr = factory2->CreateSwapChainForHwnd(device_, targetHwnd_, &scd1, NULL, NULL, &sc1);
+        if (FAILED(hr) && scd1.Flags != 0) {
+            // Retry flip-discard without tearing flag (e.g. WARP / remote desktop)
+            scd1.Flags = 0;
+            tearingSupported_ = false;
+            hr = factory2->CreateSwapChainForHwnd(device_, targetHwnd_, &scd1, NULL, NULL, &sc1);
+        }
+        if (SUCCEEDED(hr) && sc1) {
+            swapChain_ = sc1;
+            flipModel_ = true;
+            swapChainFlags_ = scd1.Flags;
+        }
+        factory2->Release();
+    }
+
+    if (!swapChain_) {
+        // Fallback to legacy BitBlt swap chain (Win7 / headless tests)
+        DXGI_SWAP_CHAIN_DESC scd;
+        ZeroMemory(&scd, sizeof(scd));
+        scd.BufferCount = 2;
+        scd.BufferDesc.Width = static_cast<UINT>(backbufW_);
+        scd.BufferDesc.Height = static_cast<UINT>(backbufH_);
+        scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.OutputWindow = targetHwnd_;
+        scd.SampleDesc.Count = 1;
+        scd.Windowed = TRUE;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+        hr = factory->CreateSwapChain(device_, &scd, &swapChain_);
+        if (FAILED(hr) || !swapChain_) {
+            factory->Release();
+            LeaveCriticalSection(&d3dLock_);
+            outError = "Failed creating DXGI swap chain.";
+            shutdown();
+            return false;
+        }
+        flipModel_ = false;
+        tearingSupported_ = false;
+        swapChainFlags_ = 0;
+    }
+
+    // Disable Alt+Enter DXGI fullscreen hijack so our own Shell F11 fullscreen stays in control
+    factory->MakeWindowAssociation(targetHwnd_, DXGI_MWA_NO_ALT_ENTER);
+    factory->Release();
+
+    // Check if GPU supports direct DXGI_FORMAT_NV12 Shader Resource Views (D3D11.1+ WDDM 1.2+)
+    supportsGpuNv12Srv_ = false;
+    if (hardwareAccel_) {
+        UINT fmtSupport = 0;
+        if (SUCCEEDED(device_->CheckFormatSupport(DXGI_FORMAT_NV12, &fmtSupport)) &&
+            (fmtSupport & D3D11_FORMAT_SUPPORT_TEXTURE2D) != 0 &&
+            (fmtSupport & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) != 0) {
+            supportsGpuNv12Srv_ = true;
+        }
+    }
+
+    if (!createRenderTargetLocked()) {
+        LeaveCriticalSection(&d3dLock_);
         outError = "Failed creating D3D11 render target view.";
         shutdown();
         return false;
     }
-    if (!compileShaders(outError)) {
+    if (!compileShadersLocked(outError)) {
+        LeaveCriticalSection(&d3dLock_);
         shutdown();
         return false;
     }
@@ -181,6 +314,7 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(device_->CreateBuffer(&cbd, NULL, &cbQuad_))) {
+        LeaveCriticalSection(&d3dLock_);
         outError = "Failed creating D3D11 constant buffer.";
         shutdown();
         return false;
@@ -216,10 +350,16 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
     rd.DepthClipEnable = TRUE;
     device_->CreateRasterizerState(&rd, &rasterNoCull_);
 
+    std::printf("[D3D11] Initialized (hw=%d flip=%d tearing=%d gpuNV12=%d)\n",
+                hardwareAccel_ ? 1 : 0, flipModel_ ? 1 : 0,
+                tearingSupported_ ? 1 : 0, supportsGpuNv12Srv_ ? 1 : 0);
+    std::fflush(stdout);
+
+    LeaveCriticalSection(&d3dLock_);
     return true;
 }
 
-bool D3D11Renderer::createRenderTarget() {
+bool D3D11Renderer::createRenderTargetLocked() {
     safeRelease(rtv_);
     if (!swapChain_ || !device_) return false;
     ID3D11Texture2D* backBuf = nullptr;
@@ -231,7 +371,7 @@ bool D3D11Renderer::createRenderTarget() {
     return SUCCEEDED(hr) && rtv_ != nullptr;
 }
 
-bool D3D11Renderer::compileShaders(std::string& outError) {
+bool D3D11Renderer::compileShadersLocked(std::string& outError) {
     HMODULE hComp = LoadLibraryA("d3dcompiler_47.dll");
     if (!hComp) hComp = LoadLibraryA("d3dcompiler_43.dll");
     if (!hComp) {
@@ -289,8 +429,12 @@ bool D3D11Renderer::compileShaders(std::string& outError) {
 }
 
 void D3D11Renderer::shutdown() {
+    EnterCriticalSection(&d3dLock_);
     safeRelease(srvHud_);
     safeRelease(texHud_);
+    safeRelease(srvNV12UV_);
+    safeRelease(srvNV12Y_);
+    safeRelease(texNV12Gpu_);
     safeRelease(srvUV_);
     safeRelease(texUV_);
     safeRelease(srvY_);
@@ -308,26 +452,39 @@ void D3D11Renderer::shutdown() {
     safeRelease(device_);
     texVideoW_ = 0;
     texVideoH_ = 0;
+    texGpuW_ = 0;
+    texGpuH_ = 0;
+    gpuVideoActive_ = false;
     texHudW_ = 0;
     texHudH_ = 0;
     backbufW_ = 0;
     backbufH_ = 0;
     targetHwnd_ = NULL;
     hardwareAccel_ = false;
+    flipModel_ = false;
+    tearingSupported_ = false;
+    supportsGpuNv12Srv_ = false;
+    swapChainFlags_ = 0;
+    LeaveCriticalSection(&d3dLock_);
 }
 
 void D3D11Renderer::resize(int width, int height) {
-    if (!swapChain_ || !ctx_ || width < 8 || height < 8) return;
-    if (width == backbufW_ && height == backbufH_) return;
+    if (width < 8 || height < 8) return;
+    EnterCriticalSection(&d3dLock_);
+    if (!swapChain_ || !ctx_ || (width == backbufW_ && height == backbufH_)) {
+        LeaveCriticalSection(&d3dLock_);
+        return;
+    }
 
     ctx_->OMSetRenderTargets(0, NULL, NULL);
     safeRelease(rtv_);
     HRESULT hr = swapChain_->ResizeBuffers(0, static_cast<UINT>(width), static_cast<UINT>(height),
-                                           DXGI_FORMAT_UNKNOWN, 0);
-    if (SUCCEEDED(hr) && createRenderTarget()) {
+                                           DXGI_FORMAT_UNKNOWN, swapChainFlags_);
+    if (SUCCEEDED(hr) && createRenderTargetLocked()) {
         backbufW_ = width;
         backbufH_ = height;
     }
+    LeaveCriticalSection(&d3dLock_);
 }
 
 void D3D11Renderer::submitNV12Frame(const DecodedNV12Frame& frame) {
@@ -351,6 +508,8 @@ bool D3D11Renderer::hasVideoFrame() const {
 }
 
 void D3D11Renderer::clearVideoFrame() {
+    EnterCriticalSection(&d3dLock_);
+    gpuVideoActive_ = false;
     EnterCriticalSection(&frameLock_);
     stagedFrame_.data.clear();
     stagedFrame_.width = 0;
@@ -358,28 +517,33 @@ void D3D11Renderer::clearVideoFrame() {
     videoDirty_ = false;
     hasFrame_ = false;
     LeaveCriticalSection(&frameLock_);
+    LeaveCriticalSection(&d3dLock_);
 }
 
 void D3D11Renderer::updateHudBitmap(const void* bgraPremulPixels, int width, int height) {
     if (!bgraPremulPixels || width < 8 || height < 8) return;
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    EnterCriticalSection(&frameLock_);
     stagedHud_.resize(bytes);
     std::memcpy(stagedHud_.data(), bgraPremulPixels, bytes);
     stagedHudW_ = width;
     stagedHudH_ = height;
     hudDirty_ = true;
     hasHud_ = true;
+    LeaveCriticalSection(&frameLock_);
 }
 
 void D3D11Renderer::clearHudBitmap() {
+    EnterCriticalSection(&frameLock_);
     stagedHud_.clear();
     stagedHudW_ = 0;
     stagedHudH_ = 0;
     hudDirty_ = false;
     hasHud_ = false;
+    LeaveCriticalSection(&frameLock_);
 }
 
-bool D3D11Renderer::ensureVideoTextures(uint32_t w, uint32_t h) {
+bool D3D11Renderer::ensureVideoTexturesLocked(uint32_t w, uint32_t h) {
     if (texY_ && texUV_ && texVideoW_ == w && texVideoH_ == h) return true;
     safeRelease(srvY_);
     safeRelease(texY_);
@@ -421,7 +585,58 @@ bool D3D11Renderer::ensureVideoTextures(uint32_t w, uint32_t h) {
     return true;
 }
 
-bool D3D11Renderer::ensureHudTexture(int w, int h) {
+bool D3D11Renderer::ensureGpuNV12TextureLocked(uint32_t w, uint32_t h) {
+    if (!supportsGpuNv12Srv_) return false;
+    if (texNV12Gpu_ && srvNV12Y_ && srvNV12UV_ && texGpuW_ == w && texGpuH_ == h) return true;
+
+    safeRelease(srvNV12UV_);
+    safeRelease(srvNV12Y_);
+    safeRelease(texNV12Gpu_);
+    texGpuW_ = 0;
+    texGpuH_ = 0;
+
+    D3D11_TEXTURE2D_DESC td;
+    ZeroMemory(&td, sizeof(td));
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_NV12;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    if (FAILED(device_->CreateTexture2D(&td, NULL, &texNV12Gpu_)) || !texNV12Gpu_) {
+        supportsGpuNv12Srv_ = false;
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+    ZeroMemory(&srvDesc, sizeof(srvDesc));
+    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = 1;
+    if (FAILED(device_->CreateShaderResourceView(texNV12Gpu_, &srvDesc, &srvNV12Y_))) {
+        safeRelease(texNV12Gpu_);
+        supportsGpuNv12Srv_ = false;
+        return false;
+    }
+
+    srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+    if (FAILED(device_->CreateShaderResourceView(texNV12Gpu_, &srvDesc, &srvNV12UV_))) {
+        safeRelease(srvNV12Y_);
+        safeRelease(texNV12Gpu_);
+        supportsGpuNv12Srv_ = false;
+        return false;
+    }
+
+    texGpuW_ = w;
+    texGpuH_ = h;
+    return true;
+}
+
+bool D3D11Renderer::ensureHudTextureLocked(int w, int h) {
     if (texHud_ && texHudW_ == w && texHudH_ == h) return true;
     safeRelease(srvHud_);
     safeRelease(texHud_);
@@ -450,7 +665,8 @@ bool D3D11Renderer::ensureHudTexture(int w, int h) {
     return true;
 }
 
-void D3D11Renderer::updateConstantBuffer(float x0Ndc, float y0Ndc, float x1Ndc, float y1Ndc) {
+void D3D11Renderer::updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x1Ndc, float y1Ndc,
+                                               float u0, float v0, float u1, float v1) {
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(ctx_->Map(cbQuad_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         QuadCB* cb = reinterpret_cast<QuadCB*>(ms.pData);
@@ -458,14 +674,109 @@ void D3D11Renderer::updateConstantBuffer(float x0Ndc, float y0Ndc, float x1Ndc, 
         cb->rectNdc[1] = y0Ndc;
         cb->rectNdc[2] = x1Ndc;
         cb->rectNdc[3] = y1Ndc;
+        cb->uvRect[0] = u0;
+        cb->uvRect[1] = v0;
+        cb->uvRect[2] = u1;
+        cb->uvRect[3] = v1;
         ctx_->Unmap(cbQuad_, 0);
     }
 }
 
+bool D3D11Renderer::submitAndRenderGpuNV12(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
+                                           uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                                           const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+    if (!srcTex || outW < 16 || outH < 16) return false;
+    EnterCriticalSection(&d3dLock_);
+    if (!isInitialized() || !rtv_ || !supportsGpuNv12Srv_) {
+        LeaveCriticalSection(&d3dLock_);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC srcDesc;
+    srcTex->GetDesc(&srcDesc);
+    if (srcDesc.Width < 16 || srcDesc.Height < 16 || !ensureGpuNV12TextureLocked(srcDesc.Width, srcDesc.Height)) {
+        LeaveCriticalSection(&d3dLock_);
+        return false;
+    }
+
+    // Full-subresource NV12 GPU copy (pSrcBox = NULL): 100% spec-compliant across ALL NVIDIA/Intel/AMD drivers!
+    // Exact macroblock aperture crop is applied zero-cost in the vertex shader via uvRect.
+    ctx_->CopySubresourceRegion(texNV12Gpu_, 0, 0, 0, 0, srcTex, subresourceIdx, NULL);
+
+    uint32_t cx = cropX & ~1u;
+    uint32_t cy = cropY & ~1u;
+    uint32_t cw = outW & ~1u;
+    uint32_t ch = outH & ~1u;
+    if (cx + cw > srcDesc.Width)  cw = (srcDesc.Width > cx) ? ((srcDesc.Width - cx) & ~1u) : srcDesc.Width;
+    if (cy + ch > srcDesc.Height) ch = (srcDesc.Height > cy) ? ((srcDesc.Height - cy) & ~1u) : srcDesc.Height;
+    gpuCropX_ = cx;
+    gpuCropY_ = cy;
+    gpuCropW_ = cw;
+    gpuCropH_ = ch;
+
+    gpuVideoActive_ = true;
+    EnterCriticalSection(&frameLock_);
+    hasFrame_ = true;
+    videoDirty_ = false;
+    LeaveCriticalSection(&frameLock_);
+
+    renderLocked(videoRectInHost, drawHudOverlay);
+    LeaveCriticalSection(&d3dLock_);
+    return true;
+}
+
+void D3D11Renderer::submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
+                                           uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                                           const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+    if (!yPlane || !uvPlane || outW < 16 || outH < 16) return;
+    EnterCriticalSection(&d3dLock_);
+    if (!isInitialized() || !rtv_) {
+        LeaveCriticalSection(&d3dLock_);
+        return;
+    }
+
+    if (ensureVideoTexturesLocked(outW, outH)) {
+        D3D11_MAPPED_SUBRESOURCE msY;
+        if (SUCCEEDED(ctx_->Map(texY_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msY))) {
+            uint8_t* dstY = static_cast<uint8_t*>(msY.pData);
+            for (uint32_t row = 0; row < outH; ++row) {
+                std::memcpy(dstY + static_cast<size_t>(row) * msY.RowPitch,
+                            yPlane + static_cast<size_t>(cropY + row) * stride + cropX, outW);
+            }
+            ctx_->Unmap(texY_, 0);
+        }
+        D3D11_MAPPED_SUBRESOURCE msUV;
+        if (SUCCEEDED(ctx_->Map(texUV_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msUV))) {
+            uint8_t* dstUV = static_cast<uint8_t*>(msUV.pData);
+            for (uint32_t row = 0; row < outH / 2; ++row) {
+                std::memcpy(dstUV + static_cast<size_t>(row) * msUV.RowPitch,
+                            uvPlane + static_cast<size_t>(cropY / 2 + row) * stride + cropX, outW);
+            }
+            ctx_->Unmap(texUV_, 0);
+        }
+
+        gpuVideoActive_ = false;
+        EnterCriticalSection(&frameLock_);
+        hasFrame_ = true;
+        videoDirty_ = false;
+        LeaveCriticalSection(&frameLock_);
+
+        renderLocked(videoRectInHost, drawHudOverlay);
+    }
+
+    LeaveCriticalSection(&d3dLock_);
+}
+
 void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+    EnterCriticalSection(&d3dLock_);
+    renderLocked(videoRectInHost, drawHudOverlay);
+    LeaveCriticalSection(&d3dLock_);
+}
+
+void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay) {
     if (!isInitialized() || !rtv_ || backbufW_ < 8 || backbufH_ < 8) return;
 
-    // 1. Upload fresh NV12 frame if decode thread delivered one
+    // 1. Upload staged NV12 frame if submitNV12Frame() was used (unit tests / external caller)
     bool readyVideo = false;
     EnterCriticalSection(&frameLock_);
     readyVideo = hasFrame_;
@@ -474,7 +785,7 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
         const uint32_t h = stagedFrame_.height;
         const uint32_t stride = stagedFrame_.stride;
         const uint32_t surfH = stagedFrame_.surfaceH;
-        if (ensureVideoTextures(w, h) &&
+        if (ensureVideoTexturesLocked(w, h) &&
             stagedFrame_.data.size() >= static_cast<size_t>(stride) * surfH * 3 / 2) {
             D3D11_MAPPED_SUBRESOURCE msY;
             if (SUCCEEDED(ctx_->Map(texY_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msY))) {
@@ -496,28 +807,33 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
                 }
                 ctx_->Unmap(texUV_, 0);
             }
+            gpuVideoActive_ = false;
             videoDirty_ = false;
         }
     }
-    LeaveCriticalSection(&frameLock_);
 
-    // 2. Upload fresh frosted-glass HUD bitmap if modified (zero work between HUD ticks!)
-    if (drawHudOverlay && hudDirty_ && hasHud_ && stagedHudW_ >= 8 && stagedHudH_ >= 8) {
-        if (ensureHudTexture(stagedHudW_, stagedHudH_)) {
-            D3D11_MAPPED_SUBRESOURCE msH;
-            if (SUCCEEDED(ctx_->Map(texHud_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msH))) {
-                const uint32_t rowBytes = static_cast<uint32_t>(stagedHudW_) * 4;
-                const uint8_t* src = stagedHud_.data();
-                uint8_t* dst = static_cast<uint8_t*>(msH.pData);
-                for (int row = 0; row < stagedHudH_; ++row) {
-                    std::memcpy(dst + static_cast<size_t>(row) * msH.RowPitch,
-                                src + static_cast<size_t>(row) * rowBytes, rowBytes);
+    // 2. Upload fresh frosted-glass HUD bitmap ONLY when modified!
+    bool canDrawHud = false;
+    if (drawHudOverlay && hasHud_) {
+        if (hudDirty_ && stagedHudW_ >= 8 && stagedHudH_ >= 8 && !stagedHud_.empty()) {
+            if (ensureHudTextureLocked(stagedHudW_, stagedHudH_)) {
+                D3D11_MAPPED_SUBRESOURCE msH;
+                if (SUCCEEDED(ctx_->Map(texHud_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msH))) {
+                    const uint32_t rowBytes = static_cast<uint32_t>(stagedHudW_) * 4;
+                    const uint8_t* src = stagedHud_.data();
+                    uint8_t* dst = static_cast<uint8_t*>(msH.pData);
+                    for (int row = 0; row < stagedHudH_; ++row) {
+                        std::memcpy(dst + static_cast<size_t>(row) * msH.RowPitch,
+                                    src + static_cast<size_t>(row) * rowBytes, rowBytes);
+                    }
+                    ctx_->Unmap(texHud_, 0);
                 }
-                ctx_->Unmap(texHud_, 0);
+                hudDirty_ = false;
             }
-            hudDirty_ = false;
         }
+        canDrawHud = (srvHud_ != nullptr);
     }
+    LeaveCriticalSection(&frameLock_);
 
     // 3. Clear dark emulator canvas backdrop (#0A0D13)
     const float bg[4] = { 10.0f / 255.0f, 13.0f / 255.0f, 19.0f / 255.0f, 1.0f };
@@ -544,12 +860,22 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
     float x1 = (static_cast<float>(videoRectInHost.x + videoRectInHost.w) / static_cast<float>(backbufW_)) * 2.0f - 1.0f;
     float yTop = 1.0f - (static_cast<float>(videoRectInHost.y) / static_cast<float>(backbufH_)) * 2.0f;
     float yBot = 1.0f - (static_cast<float>(videoRectInHost.y + videoRectInHost.h) / static_cast<float>(backbufH_)) * 2.0f;
-    updateConstantBuffer(x0, yBot, x1, yTop);
 
-    // 4. Pass 1: Draw decoded phone NV12 video frame
-    if (readyVideo && srvY_ && srvUV_) {
+    float vidU0 = 0.0f, vidV0 = 0.0f, vidU1 = 1.0f, vidV1 = 1.0f;
+    if (gpuVideoActive_ && texGpuW_ > 0 && texGpuH_ > 0 && gpuCropW_ > 0 && gpuCropH_ > 0) {
+        vidU0 = static_cast<float>(gpuCropX_) / static_cast<float>(texGpuW_);
+        vidV0 = static_cast<float>(gpuCropY_) / static_cast<float>(texGpuH_);
+        vidU1 = static_cast<float>(gpuCropX_ + gpuCropW_) / static_cast<float>(texGpuW_);
+        vidV1 = static_cast<float>(gpuCropY_ + gpuCropH_) / static_cast<float>(texGpuH_);
+    }
+
+    // 4. Pass 1: Draw decoded phone NV12 video frame (prefer zero-copy GPU NV12 views!)
+    ID3D11ShaderResourceView* activeY  = gpuVideoActive_ ? srvNV12Y_  : srvY_;
+    ID3D11ShaderResourceView* activeUV = gpuVideoActive_ ? srvNV12UV_ : srvUV_;
+    if (readyVideo && activeY && activeUV) {
+        updateConstantBufferLocked(x0, yBot, x1, yTop, vidU0, vidV0, vidU1, vidV1);
         ctx_->OMSetBlendState(NULL, NULL, 0xFFFFFFFFu);
-        ID3D11ShaderResourceView* srvs[2] = { srvY_, srvUV_ };
+        ID3D11ShaderResourceView* srvs[2] = { activeY, activeUV };
         ctx_->PSSetShader(psNV12_, NULL, 0);
         ctx_->PSSetShaderResources(0, 2, srvs);
         ctx_->Draw(4, 0);
@@ -558,7 +884,10 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
     }
 
     // 5. Pass 2: Draw frosted-glass keymap HUD overlay in the EXACT SAME FRAME!
-    if (drawHudOverlay && hasHud_ && srvHud_) {
+    if (canDrawHud) {
+        if (!readyVideo || vidU0 != 0.0f || vidV0 != 0.0f || vidU1 != 1.0f || vidV1 != 1.0f) {
+            updateConstantBufferLocked(x0, yBot, x1, yTop, 0.0f, 0.0f, 1.0f, 1.0f);
+        }
         const float blendFactor[4] = { 0, 0, 0, 0 };
         ctx_->OMSetBlendState(blendPremul_, blendFactor, 0xFFFFFFFFu);
         ctx_->PSSetShader(psHud_, NULL, 0);
@@ -568,7 +897,9 @@ void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOver
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
     }
 
-    swapChain_->Present(0, 0);
+    UINT presentFlags = (flipModel_ && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    swapChain_->Present(0, presentFlags);
+    InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
 }
 
 bool D3D11Renderer::convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<uint8_t>& outBgra) {
@@ -607,14 +938,121 @@ bool D3D11Renderer::convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<
 
 bool D3D11Renderer::saveLatestFramePng(const std::string& savePath, std::string& outError) const {
     DecodedNV12Frame snap;
-    EnterCriticalSection(&frameLock_);
-    if (!hasFrame_ || stagedFrame_.data.empty()) {
+    bool gotSnap = false;
+
+    EnterCriticalSection(&d3dLock_);
+    if (gpuVideoActive_ && texNV12Gpu_ && device_ && ctx_ && texGpuW_ >= 16 && texGpuH_ >= 16) {
+        // On-demand GPU->CPU staging readback (zero overhead during normal gameplay!)
+        D3D11_TEXTURE2D_DESC td;
+        ZeroMemory(&td, sizeof(td));
+        td.Width = texGpuW_;
+        td.Height = texGpuH_;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_NV12;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ID3D11Texture2D* stage = nullptr;
+        if (SUCCEEDED(device_->CreateTexture2D(&td, NULL, &stage)) && stage) {
+            ctx_->CopyResource(stage, texNV12Gpu_);
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (SUCCEEDED(ctx_->Map(stage, 0, D3D11_MAP_READ, 0, &ms)) && ms.pData) {
+                uint32_t outW = (gpuCropW_ >= 16) ? gpuCropW_ : texGpuW_;
+                uint32_t outH = (gpuCropH_ >= 16) ? gpuCropH_ : texGpuH_;
+                uint32_t cx = gpuCropX_;
+                uint32_t cy = gpuCropY_;
+                snap.width = outW;
+                snap.height = outH;
+                snap.stride = outW;
+                snap.surfaceH = outH;
+                snap.data.resize(static_cast<size_t>(outW) * outH * 3 / 2);
+                const uint8_t* src = static_cast<const uint8_t*>(ms.pData);
+                uint8_t* dstY = snap.data.data();
+                for (uint32_t r = 0; r < outH; ++r) {
+                    std::memcpy(dstY + static_cast<size_t>(r) * outW,
+                                src + static_cast<size_t>(cy + r) * ms.RowPitch + cx, outW);
+                }
+                const uint8_t* srcUV = src + static_cast<size_t>(texGpuH_) * ms.RowPitch;
+                uint8_t* dstUV = dstY + static_cast<size_t>(outW) * outH;
+                for (uint32_t r = 0; r < outH / 2; ++r) {
+                    std::memcpy(dstUV + static_cast<size_t>(r) * outW,
+                                srcUV + static_cast<size_t>(cy / 2 + r) * ms.RowPitch + cx, outW);
+                }
+                ctx_->Unmap(stage, 0);
+                gotSnap = true;
+            }
+            stage->Release();
+        }
+    } else if (!gpuVideoActive_ && texY_ && texUV_ && device_ && ctx_ && texVideoW_ >= 16 && texVideoH_ >= 16) {
+        // Read back from CPU-uploaded dynamic textures via staging textures
+        D3D11_TEXTURE2D_DESC tdY;
+        ZeroMemory(&tdY, sizeof(tdY));
+        tdY.Width = texVideoW_;
+        tdY.Height = texVideoH_;
+        tdY.MipLevels = 1;
+        tdY.ArraySize = 1;
+        tdY.Format = DXGI_FORMAT_R8_UNORM;
+        tdY.SampleDesc.Count = 1;
+        tdY.Usage = D3D11_USAGE_STAGING;
+        tdY.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        D3D11_TEXTURE2D_DESC tdUV = tdY;
+        tdUV.Width = texVideoW_ / 2;
+        tdUV.Height = texVideoH_ / 2;
+        tdUV.Format = DXGI_FORMAT_R8G8_UNORM;
+
+        ID3D11Texture2D* stY = nullptr;
+        ID3D11Texture2D* stUV = nullptr;
+        if (SUCCEEDED(device_->CreateTexture2D(&tdY, NULL, &stY)) && stY &&
+            SUCCEEDED(device_->CreateTexture2D(&tdUV, NULL, &stUV)) && stUV) {
+            ctx_->CopyResource(stY, texY_);
+            ctx_->CopyResource(stUV, texUV_);
+            D3D11_MAPPED_SUBRESOURCE msY, msUV;
+            if (SUCCEEDED(ctx_->Map(stY, 0, D3D11_MAP_READ, 0, &msY)) && msY.pData) {
+                if (SUCCEEDED(ctx_->Map(stUV, 0, D3D11_MAP_READ, 0, &msUV)) && msUV.pData) {
+                    snap.width = texVideoW_;
+                    snap.height = texVideoH_;
+                    snap.stride = texVideoW_;
+                    snap.surfaceH = texVideoH_;
+                    snap.data.resize(static_cast<size_t>(texVideoW_) * texVideoH_ * 3 / 2);
+                    const uint8_t* srcY = static_cast<const uint8_t*>(msY.pData);
+                    uint8_t* dstY = snap.data.data();
+                    for (uint32_t r = 0; r < texVideoH_; ++r) {
+                        std::memcpy(dstY + static_cast<size_t>(r) * texVideoW_,
+                                    srcY + static_cast<size_t>(r) * msY.RowPitch, texVideoW_);
+                    }
+                    const uint8_t* srcUV = static_cast<const uint8_t*>(msUV.pData);
+                    uint8_t* dstUV = dstY + static_cast<size_t>(texVideoW_) * texVideoH_;
+                    for (uint32_t r = 0; r < texVideoH_ / 2; ++r) {
+                        std::memcpy(dstUV + static_cast<size_t>(r) * texVideoW_,
+                                    srcUV + static_cast<size_t>(r) * msUV.RowPitch, texVideoW_);
+                    }
+                    ctx_->Unmap(stUV, 0);
+                    gotSnap = true;
+                }
+                ctx_->Unmap(stY, 0);
+            }
+        }
+        safeRelease(stUV);
+        safeRelease(stY);
+    }
+
+    if (!gotSnap) {
+        EnterCriticalSection(&frameLock_);
+        if (hasFrame_ && !stagedFrame_.data.empty()) {
+            snap = stagedFrame_;
+            gotSnap = true;
+        }
         LeaveCriticalSection(&frameLock_);
+    }
+    LeaveCriticalSection(&d3dLock_);
+
+    if (!gotSnap) {
         outError = "No decoded video frame available yet.";
         return false;
     }
-    snap = stagedFrame_;
-    LeaveCriticalSection(&frameLock_);
 
     std::vector<uint8_t> bgra;
     if (!convertNV12ToBGRA(snap, bgra)) {

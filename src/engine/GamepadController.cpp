@@ -173,9 +173,9 @@ void GamepadController::pollAndProcess(const Profile& profile, uint32_t screenW,
             found = true;
         }
     }
-    // Avoid spamming disconnected slots at 250 Hz: scan slots 0..3 every ~450 ms when idle
+    // Avoid spamming disconnected slots: scan slots 0..3 every ~1200 ms when idle
     if (!found && (connected_ || elapsedMs_ >= nextScanAtMs_)) {
-        nextScanAtMs_ = elapsedMs_ + 450.0;
+        nextScanAtMs_ = elapsedMs_ + 1200.0;
         for (int slot = 0; slot < 4; ++slot) {
             if (fnGet(static_cast<DWORD>(slot), &st) == ERROR_SUCCESS) {
                 activeSlot_ = slot;

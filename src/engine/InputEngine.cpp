@@ -25,6 +25,26 @@ double clampd(double v, double lo, double hi) {
     return v;
 }
 
+typedef HANDLE (WINAPI *PFN_CreateWaitableTimerExW)(
+    LPSECURITY_ATTRIBUTES lpTimerAttributes,
+    LPCWSTR lpTimerName,
+    DWORD dwFlags,
+    DWORD dwDesiredAccess);
+
+HANDLE createHighResTimer() {
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        PFN_CreateWaitableTimerExW fn = reinterpret_cast<PFN_CreateWaitableTimerExW>(
+            reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerExW")));
+        if (fn) {
+            // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002 (Win10 1803+)
+            HANDLE h = fn(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
+            if (h) return h;
+        }
+    }
+    return CreateWaitableTimerW(NULL, TRUE, NULL);
+}
+
 } // namespace
 
 void InputEngine::emitTouchToBridge(void* ctx, TouchAction action, uint64_t pointerId,
@@ -55,11 +75,13 @@ InputEngine::InputEngine(ScrcpyBridge* bridge)
     InitializeCriticalSection(&lock_);
     InitializeCriticalSection(&inputLock_);
     wakeEvent_ = CreateEventA(NULL, FALSE, FALSE, NULL);
+    hiResTimer_ = createHighResTimer();
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
 
     rawProfile_ = ProfileDefaults::createFreeFire();
     profile_ = rawProfile_;
+    InterlockedExchange(&pollHzAtomic_, profile_.pollHz);
 
     fingerPool_.setDownstreamSink(emitTouchToBridge, bridge_);
     viewStack_.setTouchSink(emitTouchThroughPool, this);
@@ -79,6 +101,10 @@ InputEngine::InputEngine(ScrcpyBridge* bridge)
 
 InputEngine::~InputEngine() {
     stop();
+    if (hiResTimer_) {
+        CloseHandle(hiResTimer_);
+        hiResTimer_ = NULL;
+    }
     if (wakeEvent_) {
         CloseHandle(wakeEvent_);
         wakeEvent_ = NULL;
@@ -161,7 +187,7 @@ void InputEngine::start() {
     InterlockedExchange(&stopFlag_, 0);
     thread_ = CreateThread(NULL, 0, tickThreadProc, this, 0, NULL);
     if (thread_) {
-        SetThreadPriority(thread_, THREAD_PRIORITY_HIGHEST);
+        SetThreadPriority(thread_, THREAD_PRIORITY_ABOVE_NORMAL);
     }
 }
 
@@ -180,6 +206,7 @@ void InputEngine::setProfile(const Profile& profile) {
     releaseAllLocked();
     rawProfile_ = profile;
     profile_ = profile;
+    InterlockedExchange(&pollHzAtomic_, profile_.pollHz);
     actions_.resetForProfile(profile_.buttons.size());
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
@@ -240,11 +267,15 @@ void InputEngine::setAimMode(bool enabled) {
 }
 
 void InputEngine::onRawMouseDelta(int dx, int dy) {
-    if (!aimMode_) return;
+    if (!aimMode_ || (dx == 0 && dy == 0)) return;
+    bool shouldWake = false;
     EnterCriticalSection(&inputLock_);
+    bool wasZero = (std::fabs(accumRawDx_) < 0.0001 && std::fabs(accumRawDy_) < 0.0001);
     accumRawDx_ += static_cast<double>(dx);
     accumRawDy_ += static_cast<double>(dy);
+    shouldWake = wasZero || (pollHzAtomic_ == 0);
     LeaveCriticalSection(&inputLock_);
+    if (shouldWake && wakeEvent_) SetEvent(wakeEvent_);
 }
 
 void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float normY) {
@@ -800,7 +831,7 @@ void InputEngine::resetAimView() {
     LeaveCriticalSection(&lock_);
 }
 
-void InputEngine::processTick(double nowMs) {
+bool InputEngine::processTick(double nowMs) {
     std::vector<QueuedKeyEvent> localKeys;
     std::vector<QueuedCursorTouch> localCursor;
     std::vector<QueuedCursorScroll> localScroll;
@@ -875,9 +906,19 @@ void InputEngine::processTick(double nowMs) {
         aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
     }
 
+    auto computeNeedsFastTicks = [&]() -> bool {
+        return joystick_.isDown() || gamepad_.isConnected() ||
+               fireDown_ || fireHeld_ || pendingFireDown_ ||
+               directCursorDown_ || cursorScrollDown_ || cursorPinchDown_ ||
+               viewStack_.mainView().isFingerPlaced() || viewStack_.isOverlayActive() ||
+               actions_.hasActiveTasks() ||
+               std::fabs(smoothDx_) > 0.01 || std::fabs(smoothDy_) > 0.01;
+    };
+
     if ((!aimMode_ && !hasGpLook && !viewStack_.mainView().isFingerPlaced()) || pendingFireDown_) {
+        bool fast = computeNeedsFastTicks();
         LeaveCriticalSection(&lock_);
-        return;
+        return fast;
     }
 
     double rawDx = gpOut.lookDx;
@@ -939,7 +980,7 @@ void InputEngine::processTick(double nowMs) {
         }
         viewStack_.tick(nowMs, true, packetsThisSec_);
         LeaveCriticalSection(&lock_);
-        return;
+        return true;
     }
 
     auto moveFireFinger = [&]() {
@@ -994,7 +1035,9 @@ void InputEngine::processTick(double nowMs) {
         moveMainCamera();
     }
 
+    bool fast = hasFeed || computeNeedsFastTicks();
     LeaveCriticalSection(&lock_);
+    return fast;
 }
 
 DWORD WINAPI InputEngine::tickThreadProc(LPVOID param) {
@@ -1007,28 +1050,56 @@ void InputEngine::runLoop() {
     double nextTickMs = getTimeMs();
 
     while (!stopFlag_) {
-        int hz = 250;
-        EnterCriticalSection(&lock_);
-        hz = profile_.pollHz;
-        LeaveCriticalSection(&lock_);
-        if (hz <= 0) hz = 1000;
+        int hz = static_cast<int>(pollHzAtomic_);
+        if (hz <= 0) hz = 500; // Event-driven wakeEvent_ still processes 1000+ Hz raw mouse/key bursts immediately!
         if (hz < 60) hz = 60;
-        if (hz > 1000) hz = 1000;
+        if (hz > 500) hz = 500;
         double periodMs = 1000.0 / static_cast<double>(hz);
 
         double nowMs = getTimeMs();
-        if (nowMs >= nextTickMs) {
-            processTick(nowMs);
-            nextTickMs += periodMs;
-            if (nextTickMs < nowMs - periodMs * 2.0) {
-                nextTickMs = nowMs + periodMs;
-            }
-        } else {
-            double waitMs = nextTickMs - nowMs;
-            if (waitMs > 1.5) {
-                Sleep(1);
+        bool active = processTick(nowMs);
+
+        // Drain immediately if fresh key/cursor/raw-mouse input arrived while we were processing
+        bool hasQueued = false;
+        EnterCriticalSection(&inputLock_);
+        hasQueued = !pendingKeys_.empty() || !pendingCursor_.empty() || !pendingScroll_.empty() ||
+                    ((pollHzAtomic_ == 0) && (std::fabs(accumRawDx_) > 0.0001 || std::fabs(accumRawDy_) > 0.0001));
+        LeaveCriticalSection(&inputLock_);
+        if (hasQueued) {
+            continue;
+        }
+
+        if (!active) {
+            // Idle (0.0% CPU): wakes instantaneously (<0.1ms) on ANY key, click, scroll, or first raw-mouse pixel!
+            WaitForSingleObject(wakeEvent_, 20);
+            nextTickMs = getTimeMs();
+            continue;
+        }
+
+        nextTickMs += periodMs;
+        double afterMs = getTimeMs();
+        if (nextTickMs <= afterMs) {
+            nextTickMs = afterMs + periodMs;
+        }
+        double waitMs = nextTickMs - afterMs;
+        if (waitMs >= 0.5) {
+            if (hiResTimer_) {
+                LARGE_INTEGER due;
+                due.QuadPart = -static_cast<LONGLONG>(waitMs * 10000.0);
+                if (due.QuadPart >= 0) due.QuadPart = -5000;
+                SetWaitableTimer(hiResTimer_, &due, 0, NULL, NULL, FALSE);
+                HANDLE handles[2] = { wakeEvent_, hiResTimer_ };
+                DWORD res = WaitForMultipleObjects(2, handles, FALSE, 20);
+                if (res == WAIT_OBJECT_0) {
+                    nextTickMs = getTimeMs();
+                }
             } else {
-                Sleep(0);
+                DWORD sleepMs = static_cast<DWORD>(waitMs);
+                if (sleepMs < 1) sleepMs = 1;
+                DWORD res = WaitForSingleObject(wakeEvent_, sleepMs);
+                if (res == WAIT_OBJECT_0) {
+                    nextTickMs = getTimeMs();
+                }
             }
         }
     }

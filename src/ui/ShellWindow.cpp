@@ -33,7 +33,6 @@ static const UINT MSG_DEVICE_CLIPBOARD   = WM_APP + 15;
 static const UINT MSG_FOREGROUND_APP     = WM_APP + 16;
 static const UINT MSG_DROP_TOAST         = WM_APP + 17;
 static const UINT MSG_ANDROID_BACK       = WM_APP + 18;
-static const UINT MSG_VIDEO_FRAME_READY  = WM_APP + 19;
 static const UINT MSG_QR_PAIR_UPDATE     = WM_APP + 20;
 
 LRESULT CALLBACK shellMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -123,6 +122,8 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
         }
     }
     lastAppliedScreenOff_ = settings_.turnScreenOff;
+    InterlockedExchange(&autoSwitchAtomic_, settings_.autoSwitchProfiles ? 1 : 0);
+    InterlockedExchange(&gameProfileAtomic_, profile_.keymapEnabled ? 1 : 0);
     engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
@@ -215,7 +216,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
 
     registerRawInput();
     installHooks();
-    SetTimer(hwnd_, TIMER_TICK, 16, NULL);
+    SetTimer(hwnd_, TIMER_TICK, 50, NULL);
     InterlockedExchange(&stopAuxThreads_, 0);
     appWatcherThread_ = CreateThread(NULL, 0, appWatcherThreadProc, this, 0, NULL);
 
@@ -407,7 +408,14 @@ void ShellWindow::syncHudAndVideo() {
     RECT vidScr = viewportHost_.activeVideoScreenRect();
     hudOverlay_.syncBounds(vidScr, showHud);
     if (aimMode_ && showHud) {
-        updateClipCursor();
+        int cx = (vidScr.left + vidScr.right) / 2;
+        int cy = (vidScr.top + vidScr.bottom) / 2;
+        RECT curClip;
+        if (!GetClipCursor(&curClip) ||
+            curClip.left != cx || curClip.top != cy ||
+            curClip.right != cx + 1 || curClip.bottom != cy + 1) {
+            updateClipCursor();
+        }
     }
 }
 
@@ -466,31 +474,51 @@ void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
     if (!self->h264Decoder_.isInitialized()) {
         uint32_t pw = 1920, ph = 1080;
         self->bridge_->getScreenSize(pw, ph);
+        ID3D11Device* gpuDev = self->viewportHost_.supportsGpuNv12()
+            ? self->viewportHost_.d3dDevice()
+            : nullptr;
         std::string err;
-        if (!self->h264Decoder_.init(pw, ph, err)) {
+        if (!self->h264Decoder_.init(pw, ph, err, gpuDev)) {
             self->bridge_->appendLog("[Video] H.264 MFT init failed: " + err);
             self->nativeVideoSession_ = false;
             return;
         }
-        self->h264Decoder_.setFrameCallback(ShellWindow::onDecodedFrame, self);
+        self->h264Decoder_.setGpuFrameCallback(ShellWindow::onDecodedGpuFrame, self);
+        self->h264Decoder_.setCpuViewCallback(ShellWindow::onDecodedCpuView, self);
+        self->bridge_->appendLog(self->h264Decoder_.isHardwareAccelerated()
+            ? "[Video] DXVA GPU hardware H.264 decoder active (zero-copy VRAM -> D3D11)"
+            : "[Video] Software H.264 decoder active (direct upload -> D3D11)");
     }
     self->h264Decoder_.decodePacket(data, size, ptsUs, isConfig, isKeyFrame);
 }
 
-void ShellWindow::onDecodedFrame(void* ctx, const DecodedNV12Frame& frame) {
+void ShellWindow::onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
+                                    uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
-    if (!self) return;
-    self->viewportHost_.submitDecodedFrame(frame);
-    if (self->hwnd_ && InterlockedCompareExchange(&self->videoFramePending_, 1, 0) == 0) {
-        PostMessageA(self->hwnd_, MSG_VIDEO_FRAME_READY, 0, 0);
-    }
+    if (!self || !self->nativeVideoSession_) return;
+    // Present directly from video thread so the Win32 UI / input-hook thread stays <1% CPU!
+    self->viewportHost_.presentGpuNV12Frame(nv12Tex, subresourceIdx, cropX, cropY, outW, outH, true);
+}
+
+void ShellWindow::onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
+                                   uint32_t stride, uint32_t cropX, uint32_t cropY,
+                                   uint32_t outW, uint32_t outH) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || !self->nativeVideoSession_) return;
+    // Direct upload + Present on video thread (0 intermediate copies, 0 UI-thread stall!)
+    self->viewportHost_.presentCpuNV12Frame(yPlane, uvPlane, stride, cropX, cropY, outW, outH, true);
 }
 
 void ShellWindow::onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->viewportHost_.isNativeVideoActive()) return;
     self->viewportHost_.updateEmbeddedHud(bgraPremulPixels, w, h);
-    self->viewportHost_.renderNativeFrame(true);
+    // In Play Mode with live video streaming, the video thread composites this updated HUD on
+    // the very next frame (<16ms). Only force an immediate Present in Edit Mode or when stream is idle.
+    DWORD sincePresent = GetTickCount() - self->viewportHost_.lastPresentTick();
+    if (self->editMode_ || sincePresent >= 45) {
+        self->viewportHost_.renderNativeFrame(true);
+    }
 }
 
 bool ShellWindow::mapShellClientToVideoLocal(int mx, int my, int& outVx, int& outVy, bool requireInside) const {
@@ -592,14 +620,23 @@ void ShellWindow::startAsyncConnect(const std::string& serial) {
     }
     setAimMode(false);
     hudOverlay_.setEmbeddedD3DMode(false);
-    viewportHost_.detachMirror();
     bridge_->setVideoPacketCallback(nullptr, nullptr);
     bridge_->disconnect();
     h264Decoder_.shutdown();
+    viewportHost_.detachMirror();
     demoMode_ = false;
     sawEmbeddedMirror_ = false;
     nativeVideoSession_ = false;
     pendingSerial_ = serial;
+
+    // Pre-initialize D3D11 GPU device BEFORE connectThreadProc starts video streaming so
+    // H264Decoder receives the shared video-capable ID3D11Device on the very first frame!
+    if (settings_.useNativeVideo && !noMirror_) {
+        std::string d3dInitErr;
+        if (!viewportHost_.ensureNativeDeviceInitialized(d3dInitErr)) {
+            bridge_->appendLog("[D3D11] Pre-init skipped: " + d3dInitErr);
+        }
+    }
     hubStatusMsg_ = settings_.virtualDisplayMode
         ? "Launching Second-Phone Virtual Display stream..."
         : "Connecting single-stream D3D11 phone viewport...";
@@ -727,10 +764,10 @@ void ShellWindow::disconnectDevice(bool returnToHub) {
     setAimMode(false);
     engine_->releaseAllTouches();
     hudOverlay_.setEmbeddedD3DMode(false);
-    viewportHost_.detachMirror();
     bridge_->setVideoPacketCallback(nullptr, nullptr);
     bridge_->disconnect();
     h264Decoder_.shutdown();
+    viewportHost_.detachMirror();
     sawEmbeddedMirror_ = false;
     nativeVideoSession_ = false;
     d3dHudDragging_ = false;
@@ -830,7 +867,10 @@ DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
     ShellWindow* self = static_cast<ShellWindow*>(param);
     std::string lastPkg;
     while (!self->stopAuxThreads_) {
-        if (self->bridge_->isConnected()) {
+        bool connected = self->bridge_->isConnected();
+        bool autoSw = (self->autoSwitchAtomic_ != 0);
+        bool inAim = (self->aimModeAtomic_ != 0);
+        if (connected && autoSw && !inAim) {
             std::string pkg = self->bridge_->queryForegroundPackage();
             if (!pkg.empty() && pkg != lastPkg) {
                 lastPkg = pkg;
@@ -841,10 +881,12 @@ DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
                     PostMessageA(self->hwnd_, MSG_FOREGROUND_APP, 0, 0);
                 }
             }
-        } else {
+        } else if (!connected) {
             lastPkg.clear();
         }
-        for (int i = 0; i < 16 && !self->stopAuxThreads_; ++i) {
+        // Poll less often while in a game profile (4.0s vs 2.0s) so adb dumpsys never stutters Android system_server!
+        int ticks = (self->gameProfileAtomic_ != 0) ? 40 : 20;
+        for (int i = 0; i < ticks && !self->stopAuxThreads_; ++i) {
             Sleep(100);
         }
     }
@@ -875,6 +917,9 @@ bool ShellWindow::switchProfilePath(const std::string& targetPath, bool showAuto
     profilePath_ = targetPath;
     profile_ = loaded;
     profileDirty_ = false;
+    InterlockedExchange(&gameProfileAtomic_, profile_.keymapEnabled ? 1 : 0);
+    lastHudSig_.valid = false;
+    lastTopBarSig_.valid = false;
     if (profile_.keymapEnabled) {
         lastGameProfilePath_ = profilePath_;
         if (settings_.lastGameProfile != profilePath_) {
@@ -1110,6 +1155,9 @@ void ShellWindow::setAimMode(bool enabled) {
     if (aimMode_ == enabled) return;
 
     aimMode_ = enabled;
+    InterlockedExchange(&aimModeAtomic_, enabled ? 1 : 0);
+    lastHudSig_.valid = false;
+    lastTopBarSig_.valid = false;
     engine_->setAimMode(enabled);
     cursorDirectDragging_ = false;
 
@@ -1296,6 +1344,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
     if (res.settingsModified) {
         saveSettings();
+        InterlockedExchange(&autoSwitchAtomic_, settings_.autoSwitchProfiles ? 1 : 0);
         engine_->setGamepadEnabled(settings_.gamepadEnabled);
         // Apply Turn Phone Screen Off only when that toggle actually changed (never spam on bitrate/FPS edits!)
         if (settings_.turnScreenOff != lastAppliedScreenOff_) {
@@ -1816,13 +1865,6 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             invalidateShell();
             return 0;
         }
-        case MSG_VIDEO_FRAME_READY: {
-            InterlockedExchange(&videoFramePending_, 0);
-            if (viewportHost_.isNativeVideoActive()) {
-                viewportHost_.renderNativeFrame(true);
-            }
-            return 0;
-        }
         case MSG_QR_PAIR_UPDATE: {
             std::string autoAddr;
             EnterCriticalSection(&auxLock_);
@@ -1934,13 +1976,69 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 hudOverlay_.checkToastExpired();
 
                 DWORD nowTick = GetTickCount();
+                bool connected = bridge_->isConnected();
                 if ((nowTick - lastTelemetryPaintTick_) >= 150) {
                     lastTelemetryPaintTick_ = nowTick;
-                    if (!editMode_ && (bridge_->isConnected() || demoMode_)) {
-                        hudOverlay_.invalidate();
+                    if (!editMode_ && (connected || demoMode_)) {
+                        // Dirty-check visual HUD state: ZERO GDI+ bitmap redraws when nothing changed!
+                        bool hudUsesTelemetry = profile_.keymapEnabled &&
+                                                (profile_.showHudInPlay || demoMode_ || (fullscreen_ && !aimMode_));
+                        if (hudUsesTelemetry) {
+                            EngineTelemetry tel = engine_->getTelemetry();
+                            HudVisualSig cur;
+                            cur.valid = true;
+                            cur.aimMode = aimMode_;
+                            cur.aimFingerDown = tel.aimFingerDown;
+                            cur.fireHeld = tel.fireHeld;
+                            cur.scopeActive = tel.scopeActive;
+                            cur.holdViewActive = tel.holdViewActive;
+                            cur.joyDown = tel.joyDown;
+                            cur.showHud = profile_.showHudInPlay;
+                            cur.fullscreen = fullscreen_;
+                            cur.aimQx = tel.aimFingerDown ? static_cast<int>(tel.aimFingerNormX * 64.0f) : -1;
+                            cur.aimQy = tel.aimFingerDown ? static_cast<int>(tel.aimFingerNormY * 64.0f) : -1;
+                            cur.fsRate = (fullscreen_ && !aimMode_) ? tel.touchRateHz : 0;
+
+                            bool changed = !lastHudSig_.valid ||
+                                cur.aimMode != lastHudSig_.aimMode ||
+                                cur.aimFingerDown != lastHudSig_.aimFingerDown ||
+                                cur.fireHeld != lastHudSig_.fireHeld ||
+                                cur.scopeActive != lastHudSig_.scopeActive ||
+                                cur.holdViewActive != lastHudSig_.holdViewActive ||
+                                cur.joyDown != lastHudSig_.joyDown ||
+                                cur.showHud != lastHudSig_.showHud ||
+                                cur.fullscreen != lastHudSig_.fullscreen ||
+                                cur.aimQx != lastHudSig_.aimQx ||
+                                cur.aimQy != lastHudSig_.aimQy ||
+                                cur.fsRate != lastHudSig_.fsRate;
+                            if (changed) {
+                                lastHudSig_ = cur;
+                                hudOverlay_.invalidate();
+                            }
+                        }
                     }
-                    // Lightweight refresh of TopBar live telemetry pill
-                    if (!fullscreen_) {
+                }
+
+                // Dirty-checked TopBar telemetry refresh (max 2.5 Hz, and 0 Hz when nothing changed!)
+                if (!fullscreen_ && (nowTick - lastTopBarPaintTick_) >= 400) {
+                    lastTopBarPaintTick_ = nowTick;
+                    EngineTelemetry tel = engine_->getTelemetry();
+                    TopBarVisualSig cur;
+                    cur.valid = true;
+                    cur.connected = connected;
+                    cur.aimMode = aimMode_;
+                    cur.keymapEnabled = profile_.keymapEnabled;
+                    cur.fireMode = profile_.fireMode;
+                    cur.touchRateHz = tel.touchRateHz;
+
+                    bool tbChanged = !lastTopBarSig_.valid ||
+                        cur.connected != lastTopBarSig_.connected ||
+                        cur.aimMode != lastTopBarSig_.aimMode ||
+                        cur.keymapEnabled != lastTopBarSig_.keymapEnabled ||
+                        cur.fireMode != lastTopBarSig_.fireMode ||
+                        cur.touchRateHz != lastTopBarSig_.touchRateHz;
+                    if (tbChanged) {
+                        lastTopBarSig_ = cur;
                         InvalidateRect(hwnd, &topBarRc_, FALSE);
                     }
                 }
@@ -1952,17 +2050,13 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             int my = static_cast<short>(HIWORD(lParam));
             hoverX_ = mx;
             hoverY_ = my;
-            TRACKMOUSEEVENT tme;
-            ZeroMemory(&tme, sizeof(tme));
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_LEAVE;
-            tme.hwndTrack = hwnd;
-            TrackMouseEvent(&tme);
             if (drawerOpen_ && drawerPanel_.isDraggingSlider()) {
                 DrawerActionResult res;
                 if (drawerPanel_.onMouseMove(mx, my, profile_, hudOverlay_.selectedBtnIndex(), res)) {
                     handleDrawerResult(res);
                 }
+                InvalidateRect(hwnd, &drawerRc_, FALSE);
+                return 0;
             } else if (cursorDirectDragging_ && !editMode_ && !aimMode_ && bridge_->isConnected()) {
                 float nx = 0.0f, ny = 0.0f;
                 if (mapShellClientToVideoNorm(mx, my, nx, ny, false)) {
@@ -1979,7 +2073,23 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     hudOverlay_.dispatchMouseLeave();
                 }
             }
-            invalidateShell();
+
+            // ONLY repaint ShellWindow chrome when hovering TopBar / SideRail / Drawer / disconnected Hub!
+            // Moving the cursor over the live phone game viewport must trigger ZERO GDI+ Shell repaints!
+            bool inChrome = (!fullscreen_ && (ptIn(topBarRc_, mx, my) ||
+                                              ptIn(railRc_, mx, my) ||
+                                              (drawerOpen_ && ptIn(drawerRc_, mx, my)))) ||
+                            (!bridge_->isConnected() && !demoMode_);
+            if (inChrome || hoveringChrome_) {
+                TRACKMOUSEEVENT tme;
+                ZeroMemory(&tme, sizeof(tme));
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+                hoveringChrome_ = inChrome;
+                invalidateShell();
+            }
             return 0;
         }
 
@@ -1989,7 +2099,10 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (editMode_ && viewportHost_.isNativeVideoActive() && !d3dHudDragging_) {
                 hudOverlay_.dispatchMouseLeave();
             }
-            invalidateShell();
+            if (hoveringChrome_) {
+                hoveringChrome_ = false;
+                invalidateShell();
+            }
             return 0;
 
         case WM_CAPTURECHANGED:
@@ -2298,7 +2411,7 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            onPaint(hdc);
+            onPaint(hdc, ps.rcPaint);
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -2322,12 +2435,17 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
-void ShellWindow::onPaint(HDC hdc) {
+void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
     RECT rc;
     GetClientRect(hwnd_, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
+
+    RECT paintRc = dirtyRc;
+    if (paintRc.right <= paintRc.left || paintRc.bottom <= paintRc.top) {
+        paintRc = rc;
+    }
 
     if (!cacheDC_ || w != cacheW_ || h != cacheH_) {
         if (cacheDC_) {
@@ -2340,42 +2458,59 @@ void ShellWindow::onPaint(HDC hdc) {
         cacheOldBmp_ = SelectObject(cacheDC_, cacheBmp_);
         cacheW_ = w;
         cacheH_ = h;
+        paintRc = rc;
     }
+
+    auto hitsDirty = [&](const RECT& r) -> bool {
+        RECT inter;
+        return IntersectRect(&inter, &paintRc, &r) != FALSE;
+    };
 
     {
         Gdiplus::Graphics g(cacheDC_);
+        g.SetClip(Gdiplus::Rect(paintRc.left, paintRc.top,
+                                paintRc.right - paintRc.left, paintRc.bottom - paintRc.top));
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
         bool connected = bridge_->isConnected();
-        std::string devLabel = bridge_->deviceName();
-        if (connected) {
-            char dbuf[112];
-            std::snprintf(dbuf, sizeof(dbuf), "%s%s · %ux%u",
-                          devLabel.empty() ? "Android" : devLabel.c_str(),
-                          bridge_->isVirtualDisplayActive() ? " [2ND]" : "",
-                          lastPhoneW_, lastPhoneH_);
-            devLabel = dbuf;
+        bool childCoversViewport = viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded();
+        std::string devLabel;
+        bool needDevLabel = (!fullscreen_ && (hitsDirty(topBarRc_) || (drawerOpen_ && hitsDirty(drawerRc_))));
+        if (needDevLabel) {
+            devLabel = bridge_->deviceName();
+            if (connected) {
+                char dbuf[112];
+                std::snprintf(dbuf, sizeof(dbuf), "%s%s · %ux%u",
+                              devLabel.empty() ? "Android" : devLabel.c_str(),
+                              bridge_->isVirtualDisplayActive() ? " [2ND]" : "",
+                              lastPhoneW_, lastPhoneH_);
+                devLabel = dbuf;
+            }
         }
 
-        // 1. Center Viewport backdrop / Device Hub (with Android 11+ QR Wireless Pairing)
-        std::string qrSt;
-        EnterCriticalSection(&auxLock_);
-        qrSt = qrPairStatus_;
-        LeaveCriticalSection(&auxLock_);
-        viewportHost_.paint(g, viewportRc_, connected, demoMode_, (connecting_ != 0),
-                            hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
-                            editingHubWireless_, showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
+        // 1. Center Viewport backdrop / Device Hub (skip completely when D3D11 child HWND owns viewportRc_!)
+        if (!childCoversViewport && hitsDirty(viewportRc_)) {
+            std::string qrSt;
+            EnterCriticalSection(&auxLock_);
+            qrSt = qrPairStatus_;
+            LeaveCriticalSection(&auxLock_);
+            viewportHost_.paint(g, viewportRc_, connected, demoMode_, (connecting_ != 0),
+                                hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
+                                editingHubWireless_, showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
+        }
 
         if (!fullscreen_) {
-            // 2. TopBar
-            EngineTelemetry tel = engine_->getTelemetry();
-            topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
-                          profile_, tel, settings_.alwaysOnTop,
-                          (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_);
+            // 2. TopBar (only when TopBar region is dirty)
+            if (hitsDirty(topBarRc_)) {
+                EngineTelemetry tel = engine_->getTelemetry();
+                topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
+                              profile_, tel, settings_.alwaysOnTop,
+                              (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_);
+            }
 
-            // 3. Docked Outside-Viewport DrawerPanel (when open)
-            if (drawerOpen_) {
+            // 3. Docked Outside-Viewport DrawerPanel (only when open and dirty)
+            if (drawerOpen_ && hitsDirty(drawerRc_)) {
                 std::vector<std::string> logs = bridge_->getRecentLogs();
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),
@@ -2383,30 +2518,34 @@ void ShellWindow::onPaint(HDC hdc) {
                                    connected, devLabel, activeAppPackage_, logs, hoverX_, hoverY_);
             }
 
-            // 4. Right Emulator SideRail
-            SideRailState st;
-            st.aimMode = aimMode_;
-            st.drawerOpen = drawerOpen_;
-            st.activeDrawerTab = drawerPanel_.activeTab();
-            st.showHud = profile_.showHudInPlay;
-            st.fullscreen = fullscreen_;
-            st.connected = connected;
-            sideRail_.paint(g, railRc_, st, hoverX_, hoverY_);
+            // 4. Right Emulator SideRail (only when dirty)
+            if (hitsDirty(railRc_)) {
+                SideRailState st;
+                st.aimMode = aimMode_;
+                st.drawerOpen = drawerOpen_;
+                st.activeDrawerTab = drawerPanel_.activeTab();
+                st.showHud = profile_.showHudInPlay;
+                st.fullscreen = fullscreen_;
+                st.connected = connected;
+                sideRail_.paint(g, railRc_, st, hoverX_, hoverY_);
+            }
 
-            // Subtle hover tooltip left of SideRail
-            std::string tip = sideRail_.tooltipAt(hoverX_, hoverY_);
-            if (!tip.empty() && ptIn(railRc_, hoverX_, hoverY_)) {
-                int tw = 22 + static_cast<int>(tip.size()) * 7;
-                if (tw < 96) tw = 96;
-                if (tw > 230) tw = 230;
-                int ty = hoverY_ - 13;
-                if (ty < topBarRc_.bottom + 4) ty = topBarRc_.bottom + 4;
-                if (ty + 26 > h - 4) ty = h - 30;
-                RECT tr = { railRc_.left - tw - 8, ty, railRc_.left - 8, ty + 26 };
-                GdiPlusDraw::roundedCard(g, tr, 6.0f, Theme::BG_SHELL, Theme::ACCENT_CYAN, 1.0f);
-                GdiPlusDraw::textCenter(g, tip, static_cast<float>(tr.left + tr.right) * 0.5f,
-                                        static_cast<float>(tr.top + tr.bottom) * 0.5f,
-                                        11.0f, true, Theme::TEXT_PRIMARY);
+            // Subtle hover tooltip left of SideRail (only when actually hovering SideRail)
+            if (!childCoversViewport && ptIn(railRc_, hoverX_, hoverY_)) {
+                std::string tip = sideRail_.tooltipAt(hoverX_, hoverY_);
+                if (!tip.empty()) {
+                    int tw = 22 + static_cast<int>(tip.size()) * 7;
+                    if (tw < 96) tw = 96;
+                    if (tw > 230) tw = 230;
+                    int ty = hoverY_ - 13;
+                    if (ty < topBarRc_.bottom + 4) ty = topBarRc_.bottom + 4;
+                    if (ty + 26 > h - 4) ty = h - 30;
+                    RECT tr = { railRc_.left - tw - 8, ty, railRc_.left - 8, ty + 26 };
+                    GdiPlusDraw::roundedCard(g, tr, 6.0f, Theme::BG_SHELL, Theme::ACCENT_CYAN, 1.0f);
+                    GdiPlusDraw::textCenter(g, tip, static_cast<float>(tr.left + tr.right) * 0.5f,
+                                            static_cast<float>(tr.top + tr.bottom) * 0.5f,
+                                            11.0f, true, Theme::TEXT_PRIMARY);
+                }
             }
 
             // Crisp outer 1px window border when restored
@@ -2416,5 +2555,9 @@ void ShellWindow::onPaint(HDC hdc) {
         }
     }
 
-    BitBlt(hdc, 0, 0, w, h, cacheDC_, 0, 0, SRCCOPY);
+    int bx = paintRc.left;
+    int by = paintRc.top;
+    int bw = paintRc.right - paintRc.left;
+    int bh = paintRc.bottom - paintRc.top;
+    BitBlt(hdc, bx, by, bw, bh, cacheDC_, bx, by, SRCCOPY);
 }

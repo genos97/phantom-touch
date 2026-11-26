@@ -40,6 +40,15 @@ public:
     // Releases held touches (mouseOnly = true preserves keyboard buttons when unlocking cursor)
     void releaseButtons(const Profile& profile, bool mouseOnly, uint32_t& outPacketsSent);
 
+    bool hasActiveTasks() const {
+        for (size_t i = 0; i < states_.size(); ++i) {
+            if (states_[i].touchDown || states_[i].swiping || states_[i].autoReleaseAtMs > 0.0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     struct ButtonRuntime {
         bool keyHeld = false;

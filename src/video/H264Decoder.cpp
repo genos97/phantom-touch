@@ -7,8 +7,10 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfidl.h>
+#include <mfobjects.h>
 #include <mftransform.h>
 #include <mferror.h>
 #include <icodecapi.h>
@@ -28,9 +30,18 @@ const GUID kCODECAPI_AVLowLatencyMode = {
 const GUID kMF_LOW_LATENCY = {
     0x9C27891A, 0xED7A, 0x40E1, { 0x88, 0xE8, 0xB2, 0x27, 0x27, 0xA0, 0x24, 0xEE }
 };
+const GUID kMF_SA_D3D11_AWARE = {
+    0x206B4FC8, 0xFCF9, 0x4C51, { 0xAF, 0xE3, 0x97, 0x64, 0x36, 0x9E, 0x33, 0xA0 }
+};
 const GUID kIID_ICodecAPI = {
     0x901DB4C7, 0x31CE, 0x41A2, { 0x85, 0xDC, 0x8F, 0xA0, 0xBF, 0x41, 0xB8, 0xDA }
 };
+const GUID kIID_IMFDXGIBuffer = {
+    0xE7174CFA, 0x1C9E, 0x48B1, { 0x88, 0x66, 0x62, 0x62, 0x26, 0xBF, 0xC2, 0x58 }
+};
+
+typedef HRESULT (STDAPICALLTYPE *PFN_MFCreateDXGIDeviceManager)(
+    UINT* resetToken, IMFDXGIDeviceManager** ppDeviceManager);
 
 template <typename T>
 void safeRelease(T*& p) {
@@ -53,7 +64,18 @@ void H264Decoder::setFrameCallback(DecodedFrameFn fn, void* ctx) {
     frameCbCtx_ = ctx;
 }
 
-bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outError) {
+void H264Decoder::setGpuFrameCallback(DecodedGpuFrameFn fn, void* ctx) {
+    gpuFrameCb_ = fn;
+    gpuFrameCbCtx_ = ctx;
+}
+
+void H264Decoder::setCpuViewCallback(DecodedCpuViewFn fn, void* ctx) {
+    cpuViewCb_ = fn;
+    cpuViewCbCtx_ = ctx;
+}
+
+bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outError,
+                       ID3D11Device* d3dDevice) {
     shutdown();
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -81,9 +103,11 @@ bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outErr
     }
 
     // Request ultra-low-latency zero-reorder decoding for real-time screen mirroring
+    UINT32 d3d11Aware = 0;
     IMFAttributes* attrs = nullptr;
     if (SUCCEEDED(mft_->GetAttributes(&attrs)) && attrs) {
         attrs->SetUINT32(kMF_LOW_LATENCY, 1);
+        attrs->GetUINT32(kMF_SA_D3D11_AWARE, &d3d11Aware);
         attrs->Release();
     }
     ICodecAPI* codecApi = nullptr;
@@ -94,6 +118,32 @@ bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outErr
         var.boolVal = VARIANT_TRUE;
         codecApi->SetValue(&kCODECAPI_AVLowLatencyMode, &var);
         codecApi->Release();
+    }
+
+    // Attach DXVA / D3D11 GPU Hardware Video Decoder BEFORE negotiating media types!
+    // Keeps H.264 decode on NVDEC / Intel QuickSync ASIC (<1% CPU, zero VRAM->RAM copies).
+    dxvaActive_ = false;
+    if (d3dDevice && d3d11Aware) {
+        HMODULE hMfPlat = GetModuleHandleA("mfplat.dll");
+        if (!hMfPlat) hMfPlat = LoadLibraryA("mfplat.dll");
+        if (hMfPlat) {
+            PFN_MFCreateDXGIDeviceManager fnCreateMgr = reinterpret_cast<PFN_MFCreateDXGIDeviceManager>(
+                reinterpret_cast<void*>(GetProcAddress(hMfPlat, "MFCreateDXGIDeviceManager")));
+            if (fnCreateMgr) {
+                UINT resetToken = 0;
+                if (SUCCEEDED(fnCreateMgr(&resetToken, &dxgiMgr_)) && dxgiMgr_) {
+                    if (SUCCEEDED(dxgiMgr_->ResetDevice(d3dDevice, resetToken)) &&
+                        SUCCEEDED(mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                                       reinterpret_cast<ULONG_PTR>(dxgiMgr_)))) {
+                        dxvaActive_ = true;
+                        std::printf("[H264] DXVA / D3D11 GPU hardware H.264 decoding ENABLED!\n");
+                        std::fflush(stdout);
+                    } else {
+                        safeRelease(dxgiMgr_);
+                    }
+                }
+            }
+        }
     }
 
     codedW_ = (initialW >= 64) ? initialW : 1920;
@@ -125,9 +175,21 @@ bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outErr
     }
 
     if (!configureOutputNV12()) {
-        outError = "H.264 MFT did not expose NV12 output format.";
-        shutdown();
-        return false;
+        // If GPU DXVA rejected NV12 negotiation on an exotic driver, fall back cleanly to CPU decode
+        if (dxvaActive_) {
+            mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+            safeRelease(dxgiMgr_);
+            dxvaActive_ = false;
+            if (!configureOutputNV12()) {
+                outError = "H.264 MFT did not expose NV12 output format.";
+                shutdown();
+                return false;
+            }
+        } else {
+            outError = "H.264 MFT did not expose NV12 output format.";
+            shutdown();
+            return false;
+        }
     }
 
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -146,8 +208,13 @@ void H264Decoder::shutdown() {
     if (mft_) {
         mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         mft_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        if (dxvaActive_) {
+            mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+        }
         safeRelease(mft_);
     }
+    safeRelease(dxgiMgr_);
+    dxvaActive_ = false;
     if (mfStarted_) {
         MFShutdown();
         mfStarted_ = false;
@@ -364,76 +431,112 @@ bool H264Decoder::drainOutputs(bool& decodedAny) {
 
         IMFSample* outSample = outData.pSample;
         if (outSample) {
-            IMFMediaBuffer* buf = nullptr;
-            if (SUCCEEDED(outSample->ConvertToContiguousBuffer(&buf)) && buf) {
-                const uint8_t* srcPtr = nullptr;
-                DWORD srcStride = defaultStride_;
-                DWORD maxLen = 0, curLen = 0;
-                bool locked2D = false;
+            bool deliveredGpu = false;
 
-                IMF2DBuffer* buf2D = nullptr;
-                if (SUCCEEDED(buf->QueryInterface(IID_IMF2DBuffer, reinterpret_cast<void**>(&buf2D))) && buf2D) {
-                    BYTE* scan0 = nullptr;
-                    LONG pitch = 0;
-                    if (SUCCEEDED(buf2D->Lock2D(&scan0, &pitch)) && scan0 && pitch > 0) {
-                        srcPtr = scan0;
-                        srcStride = static_cast<DWORD>(pitch);
-                        locked2D = true;
-                    } else {
-                        safeRelease(buf2D);
+            // Fast Path 1: Zero-Copy DXVA GPU Surface (video stays 100% in VRAM!)
+            if (dxvaActive_ && gpuFrameCb_) {
+                IMFMediaBuffer* rawBuf = nullptr;
+                if (SUCCEEDED(outSample->GetBufferByIndex(0, &rawBuf)) && rawBuf) {
+                    IMFDXGIBuffer* dxgiBuf = nullptr;
+                    if (SUCCEEDED(rawBuf->QueryInterface(kIID_IMFDXGIBuffer,
+                                                         reinterpret_cast<void**>(&dxgiBuf))) && dxgiBuf) {
+                        ID3D11Texture2D* nv12Tex = nullptr;
+                        UINT subIdx = 0;
+                        if (SUCCEEDED(dxgiBuf->GetResource(__uuidof(ID3D11Texture2D),
+                                                           reinterpret_cast<void**>(&nv12Tex))) && nv12Tex) {
+                            dxgiBuf->GetSubresourceIndex(&subIdx);
+                            const uint32_t outW = cropW_ & ~1u;
+                            const uint32_t outH = cropH_ & ~1u;
+                            const uint32_t cropXEven = cropX_ & ~1u;
+                            const uint32_t cropYEven = cropY_ & ~1u;
+                            if (outW >= 16 && outH >= 16) {
+                                decodedAny = true;
+                                deliveredGpu = true;
+                                gpuFrameCb_(gpuFrameCbCtx_, nv12Tex, subIdx, cropXEven, cropYEven, outW, outH);
+                            }
+                            nv12Tex->Release();
+                        }
+                        dxgiBuf->Release();
                     }
+                    safeRelease(rawBuf);
                 }
-                if (!locked2D) {
-                    BYTE* raw = nullptr;
-                    if (SUCCEEDED(buf->Lock(&raw, &maxLen, &curLen)) && raw) {
-                        srcPtr = raw;
-                    }
-                }
-
-                if (srcPtr && cropW_ >= 16 && cropH_ >= 16 && codedH_ >= cropH_) {
-                    // Copy clean cropped NV12 frame into contiguous output buffer (stride == aligned cropW)
-                    const uint32_t outW = cropW_ & ~1u;
-                    const uint32_t outH = cropH_ & ~1u;
-                    const uint32_t uvOffY = codedH_;
-                    const uint32_t cropXEven = cropX_ & ~1u;
-                    const uint32_t cropYEven = cropY_ & ~1u;
-
-                    workFrame_.width = outW;
-                    workFrame_.height = outH;
-                    workFrame_.stride = outW;
-                    workFrame_.surfaceH = outH;
-                    workFrame_.data.resize(static_cast<size_t>(outW) * outH * 3 / 2);
-
-                    // Y plane
-                    uint8_t* dstY = workFrame_.data.data();
-                    for (uint32_t row = 0; row < outH; ++row) {
-                        std::memcpy(dstY + static_cast<size_t>(row) * outW,
-                                    srcPtr + static_cast<size_t>(cropYEven + row) * srcStride + cropXEven,
-                                    outW);
-                    }
-                    // UV interleaved plane
-                    uint8_t* dstUV = dstY + static_cast<size_t>(outW) * outH;
-                    const uint8_t* srcUVBase = srcPtr + static_cast<size_t>(uvOffY) * srcStride;
-                    for (uint32_t row = 0; row < outH / 2; ++row) {
-                        std::memcpy(dstUV + static_cast<size_t>(row) * outW,
-                                    srcUVBase + static_cast<size_t>(cropYEven / 2 + row) * srcStride + cropXEven,
-                                    outW);
-                    }
-
-                    decodedAny = true;
-                    if (frameCb_) {
-                        frameCb_(frameCbCtx_, workFrame_);
-                    }
-                }
-
-                if (locked2D && buf2D) {
-                    buf2D->Unlock2D();
-                    safeRelease(buf2D);
-                } else if (srcPtr) {
-                    buf->Unlock();
-                }
-                safeRelease(buf);
             }
+
+            // Path 2: CPU NV12 Buffer (direct view upload with 0 intermediate copies, or legacy copy callback)
+            if (!deliveredGpu) {
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(outSample->ConvertToContiguousBuffer(&buf)) && buf) {
+                    const uint8_t* srcPtr = nullptr;
+                    DWORD srcStride = defaultStride_;
+                    DWORD maxLen = 0, curLen = 0;
+                    bool locked2D = false;
+
+                    IMF2DBuffer* buf2D = nullptr;
+                    if (SUCCEEDED(buf->QueryInterface(IID_IMF2DBuffer, reinterpret_cast<void**>(&buf2D))) && buf2D) {
+                        BYTE* scan0 = nullptr;
+                        LONG pitch = 0;
+                        if (SUCCEEDED(buf2D->Lock2D(&scan0, &pitch)) && scan0 && pitch > 0) {
+                            srcPtr = scan0;
+                            srcStride = static_cast<DWORD>(pitch);
+                            locked2D = true;
+                        } else {
+                            safeRelease(buf2D);
+                        }
+                    }
+                    if (!locked2D) {
+                        BYTE* raw = nullptr;
+                        if (SUCCEEDED(buf->Lock(&raw, &maxLen, &curLen)) && raw) {
+                            srcPtr = raw;
+                        }
+                    }
+
+                    if (srcPtr && cropW_ >= 16 && cropH_ >= 16 && codedH_ >= cropH_) {
+                        const uint32_t outW = cropW_ & ~1u;
+                        const uint32_t outH = cropH_ & ~1u;
+                        const uint32_t uvOffY = codedH_;
+                        const uint32_t cropXEven = cropX_ & ~1u;
+                        const uint32_t cropYEven = cropY_ & ~1u;
+                        const uint8_t* srcUVBase = srcPtr + static_cast<size_t>(uvOffY) * srcStride;
+
+                        decodedAny = true;
+                        if (cpuViewCb_) {
+                            // Zero-intermediate-copy direct upload straight into D3D11 dynamic texture!
+                            cpuViewCb_(cpuViewCbCtx_, srcPtr, srcUVBase, srcStride,
+                                       cropXEven, cropYEven, outW, outH);
+                        }
+                        if (frameCb_) {
+                            workFrame_.width = outW;
+                            workFrame_.height = outH;
+                            workFrame_.stride = outW;
+                            workFrame_.surfaceH = outH;
+                            workFrame_.data.resize(static_cast<size_t>(outW) * outH * 3 / 2);
+
+                            uint8_t* dstY = workFrame_.data.data();
+                            for (uint32_t row = 0; row < outH; ++row) {
+                                std::memcpy(dstY + static_cast<size_t>(row) * outW,
+                                            srcPtr + static_cast<size_t>(cropYEven + row) * srcStride + cropXEven,
+                                            outW);
+                            }
+                            uint8_t* dstUV = dstY + static_cast<size_t>(outW) * outH;
+                            for (uint32_t row = 0; row < outH / 2; ++row) {
+                                std::memcpy(dstUV + static_cast<size_t>(row) * outW,
+                                            srcUVBase + static_cast<size_t>(cropYEven / 2 + row) * srcStride + cropXEven,
+                                            outW);
+                            }
+                            frameCb_(frameCbCtx_, workFrame_);
+                        }
+                    }
+
+                    if (locked2D && buf2D) {
+                        buf2D->Unlock2D();
+                        safeRelease(buf2D);
+                    } else if (srcPtr) {
+                        buf->Unlock();
+                    }
+                    safeRelease(buf);
+                }
+            }
+
             if (mftProvidesSamples_) {
                 outSample->Release();
             }

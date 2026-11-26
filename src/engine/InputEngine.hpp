@@ -97,7 +97,7 @@ private:
                                      int32_t px, int32_t py, bool clampToScreen);
 
     void runLoop();
-    void processTick(double nowMs);
+    bool processTick(double nowMs);
     void rebuildKeyRouteCacheLocked();
     void syncFpsViewConfigLocked(uint32_t w, uint32_t h);
     bool classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim);
@@ -122,8 +122,10 @@ private:
 
     HANDLE thread_ = NULL;
     HANDLE wakeEvent_ = NULL;
+    HANDLE hiResTimer_ = NULL;
     volatile LONG stopFlag_ = 0;
     volatile LONG aimMode_ = 0;
+    volatile LONG pollHzAtomic_ = 250;
 
     // Non-blocking hook input queues & route cache (protected by inputLock_)
     std::vector<QueuedKeyEvent> pendingKeys_;
