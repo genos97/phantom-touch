@@ -97,7 +97,7 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
         uint32_t fg = Theme::ACCENT_AMBER;
 
         if (!profile.keymapEnabled) {
-            std::snprintf(telBuf, sizeof(telBuf), "TYPING MODE  |  Ctrl+V / Pinch");
+            std::snprintf(telBuf, sizeof(telBuf), "TYPING MODE  |  F1: Game");
             bg = Theme::ACCENT_CYAN_BG;
             bd = Theme::ACCENT_CYAN;
             fg = Theme::ACCENT_CYAN;

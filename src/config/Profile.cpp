@@ -53,6 +53,7 @@ KeyActionType ProfileDefaults::nameToActionType(const std::string& raw) {
 Profile ProfileDefaults::createFreeFire() {
     Profile p;
     p.name = "Free Fire MAX (S21 FE)";
+    p.appPackage = "com.dts.freefiremax,com.dts.freefireth,com.dts.freefireind";
     p.scrcpyArgs = "--max-fps=90 --video-bit-rate=16M";
     p.controlMaxSize = 0;
     p.pollHz = 250;

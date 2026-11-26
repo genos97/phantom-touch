@@ -91,8 +91,37 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     mirrorTitle_ = tbuf;
 
     profile_ = engine_->getProfileCopy();
-    if (profile_.keymapEnabled) lastGameProfilePath_ = profilePath_;
     AppSettingsStore::load(settingsPath_, settings_);
+    if (profile_.keymapEnabled) {
+        lastGameProfilePath_ = profilePath_;
+        settings_.lastGameProfile = profilePath_;
+    } else {
+        // Restore remembered game profile (e.g. my_custom.cfg) if app launched while on desktop.cfg
+        if (!settings_.lastGameProfile.empty()) {
+            Profile cand;
+            if (ProfileStore::load(settings_.lastGameProfile, cand) && cand.keymapEnabled) {
+                lastGameProfilePath_ = settings_.lastGameProfile;
+            }
+        }
+        if (lastGameProfilePath_.empty()) {
+            std::vector<std::string> files = ProfileStore::listProfiles(profilesDir_);
+            std::string fallbackDefault;
+            for (size_t i = 0; i < files.size(); ++i) {
+                Profile cand;
+                if (ProfileStore::load(files[i], cand) && cand.keymapEnabled) {
+                    size_t sl = files[i].find_last_of("\\/");
+                    std::string base = (sl == std::string::npos) ? files[i] : files[i].substr(sl + 1);
+                    if (lstrcmpiA(base.c_str(), "freefire.cfg") == 0) {
+                        fallbackDefault = files[i];
+                    } else {
+                        lastGameProfilePath_ = files[i];
+                        break;
+                    }
+                }
+            }
+            if (lastGameProfilePath_.empty()) lastGameProfilePath_ = fallbackDefault;
+        }
+    }
     lastAppliedScreenOff_ = settings_.turnScreenOff;
     engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
@@ -360,6 +389,7 @@ void ShellWindow::syncHudAndVideo() {
             lastPhoneW_ = pw;
             lastPhoneH_ = ph;
             viewportHost_.updateVideoLayout(pw, ph);
+            viewportHost_.renderNativeFrame(true);
             invalidateShell();
         }
         if (!nativeVideoSession_ && !noMirror_ && !viewportHost_.isMirrorEmbedded() && bridge_->isMirrorRunning()) {
@@ -847,6 +877,10 @@ bool ShellWindow::switchProfilePath(const std::string& targetPath, bool showAuto
     profileDirty_ = false;
     if (profile_.keymapEnabled) {
         lastGameProfilePath_ = profilePath_;
+        if (settings_.lastGameProfile != profilePath_) {
+            settings_.lastGameProfile = profilePath_;
+            AppSettingsStore::save(settingsPath_, settings_);
+        }
     }
     hudOverlay_.setSelectedBtnIndex(-1);
     hudOverlay_.cancelRebind();
@@ -873,11 +907,17 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
     if (pkg.empty()) return;
     std::string prevPkg = activeAppPackage_;
     activeAppPackage_ = pkg;
+    if (!manualOverridePkg_.empty() && pkg != manualOverridePkg_) {
+        manualOverridePkg_.clear();
+    }
 
     if (drawerOpen_ && drawerPanel_.activeTab() == 2) {
         invalidateShell();
     }
     if (!settings_.autoSwitchProfiles || drawerOpen_ || editMode_ || demoMode_) {
+        return;
+    }
+    if (!manualOverridePkg_.empty() && pkg == manualOverridePkg_) {
         return;
     }
 
@@ -893,11 +933,15 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
 
     // Search for a saved profile linked to pkg (prefer lastGameProfilePath_ first!)
     std::string matchedPath;
+    bool lastGameUnlinked = false;
     if (!lastGameProfilePath_.empty()) {
         Profile cand;
-        if (ProfileStore::load(lastGameProfilePath_, cand) &&
-            ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
-            matchedPath = lastGameProfilePath_;
+        if (ProfileStore::load(lastGameProfilePath_, cand) && cand.keymapEnabled) {
+            if (ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
+                matchedPath = lastGameProfilePath_;
+            } else if (cand.appPackage.empty()) {
+                lastGameUnlinked = true;
+            }
         }
     }
     if (matchedPath.empty()) {
@@ -910,6 +954,13 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
                 break;
             }
         }
+    }
+
+    // If user cloned freefire.cfg into a custom unlinked profile (e.g. my_custom.cfg),
+    // automatically restore THEIR custom profile when launching Free Fire instead of generic freefire.cfg!
+    if (lastGameUnlinked && !lastGameProfilePath_.empty() &&
+        ProfileDefaults::matchesPackage("com.dts.freefiremax,com.dts.freefireth,com.dts.freefireind", pkg)) {
+        matchedPath = lastGameProfilePath_;
     }
 
     if (!matchedPath.empty()) {
@@ -1046,7 +1097,13 @@ bool ShellWindow::handleDesktopChar(wchar_t ch) {
 void ShellWindow::setAimMode(bool enabled) {
     if (enabled && !bridge_->isConnected() && !demoMode_) return;
     if (enabled && !profile_.keymapEnabled) {
-        hudOverlay_.showToast("Desktop Typing Mode active · Switch to a Game profile for Aim Lock", 1800);
+        if (!lastGameProfilePath_.empty() && switchProfilePath(lastGameProfilePath_, false)) {
+            manualOverridePkg_ = activeAppPackage_;
+            hudOverlay_.showToast("Game Profile Active: " + profile_.name + " · Press " +
+                                  KeyCodes::toName(profile_.toggleAimVk) + " / F1 for Aim Lock", 2400);
+            return;
+        }
+        hudOverlay_.showToast("Desktop Typing Mode active · Pick a Game profile in CFG", 1800);
         return;
     }
     if (enabled && editMode_) setEditMode(false);
@@ -1253,6 +1310,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
     if (res.requestSwitchProfile && !res.switchProfilePath.empty()) {
         if (switchProfilePath(res.switchProfilePath, false)) {
+            manualOverridePkg_ = activeAppPackage_;
             hudOverlay_.showToast("Loaded config: " + profile_.name, 2000);
         }
     }
@@ -1511,7 +1569,7 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
     if (up && (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1)) {
         bool wasDown = toggleAimKeyDown_;
         toggleAimKeyDown_ = false;
-        if (wasDown && !editMode_ && (aimMode_ || (profile_.keymapEnabled && isAppForeground()))) return 1;
+        if (wasDown && !editMode_ && (aimMode_ || vk == VK_F1 || (profile_.keymapEnabled && isAppForeground()))) return 1;
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
     if (up && holdUnlockedAim_ && KeyCodes::matches(vk, profile_.holdUnlockVk)) {
@@ -1568,6 +1626,13 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
                 return 1;
             }
         }
+    } else if (vk == VK_F1 && down) {
+        // Quick 1-key recovery from Desktop Typing Mode back to last Game Profile
+        if (!isRepeat && !toggleAimKeyDown_) {
+            toggleAimKeyDown_ = true;
+            PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+        }
+        return 1;
     }
 
     if (down && isRepeat) {
@@ -1901,6 +1966,8 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             } else if (cursorDirectDragging_ && !editMode_ && !aimMode_ && bridge_->isConnected()) {
                 float nx = 0.0f, ny = 0.0f;
                 if (mapShellClientToVideoNorm(mx, my, nx, ny, false)) {
+                    lastCursorNormX_ = nx;
+                    lastCursorNormY_ = ny;
                     engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
                 }
                 return 0;
@@ -1926,11 +1993,16 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
 
         case WM_CAPTURECHANGED:
+            // Only fires when capture is genuinely lost externally (e.g. Alt-Tab mid-drag).
+            // Release at the finger's ACTUAL last position — never teleport to screen center (0.5, 0.5)!
             if (cursorDirectDragging_) {
                 cursorDirectDragging_ = false;
-                engine_->onDirectCursorTouch(TOUCH_UP, 0.5f, 0.5f);
+                engine_->onDirectCursorTouch(TOUCH_UP, lastCursorNormX_, lastCursorNormY_);
             }
-            d3dHudDragging_ = false;
+            if (d3dHudDragging_) {
+                d3dHudDragging_ = false;
+                hudOverlay_.dispatchMouseUp();
+            }
             return 0;
 
         case WM_LBUTTONDBLCLK: {
@@ -1949,6 +2021,8 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     drawerPanel_.clearFocus();
                     editingHubWireless_ = false;
                     cursorDirectDragging_ = true;
+                    lastCursorNormX_ = nx;
+                    lastCursorNormY_ = ny;
                     SetCapture(hwnd);
                     engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
                     return 0;
@@ -2004,6 +2078,8 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 float nx = 0.0f, ny = 0.0f;
                 if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
                     cursorDirectDragging_ = true;
+                    lastCursorNormX_ = nx;
+                    lastCursorNormY_ = ny;
                     SetCapture(hwnd);
                     engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
                     return 0;
@@ -2039,19 +2115,25 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_LBUTTONUP: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
-            if (GetCapture() == hwnd) ReleaseCapture();
+            // CRITICAL: Complete drag/touch state BEFORE calling ReleaseCapture(), because
+            // ReleaseCapture() synchronously dispatches WM_CAPTURECHANGED!
             if (cursorDirectDragging_) {
                 cursorDirectDragging_ = false;
-                float nx = 0.5f, ny = 0.5f;
+                float nx = lastCursorNormX_, ny = lastCursorNormY_;
                 mapShellClientToVideoNorm(mx, my, nx, ny, false);
+                lastCursorNormX_ = nx;
+                lastCursorNormY_ = ny;
                 engine_->onDirectCursorTouch(TOUCH_UP, nx, ny);
+                if (GetCapture() == hwnd) ReleaseCapture();
                 return 0;
             }
             if (d3dHudDragging_) {
                 d3dHudDragging_ = false;
                 hudOverlay_.dispatchMouseUp();
+                if (GetCapture() == hwnd) ReleaseCapture();
                 return 0;
             }
+            if (GetCapture() == hwnd) ReleaseCapture();
             if (drawerOpen_ && drawerPanel_.onMouseUp()) {
                 applyProfileToEngine(true);
             }

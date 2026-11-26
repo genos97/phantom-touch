@@ -162,6 +162,7 @@ private:
     std::string activeAppPackage_;
     std::string pendingForegroundPkg_;
     std::string lastGameProfilePath_;
+    std::string manualOverridePkg_;
     std::string pendingDeviceClip_;
     std::string lastSyncedClip_;
     std::vector<std::string> pendingDropFiles_;
@@ -198,6 +199,8 @@ private:
     bool hadForeground_ = false;
     bool cursorHidden_ = false;
     bool cursorDirectDragging_ = false;
+    float lastCursorNormX_ = 0.5f;
+    float lastCursorNormY_ = 0.5f;
     POINT lastUnlockedCursorPt_;
     bool hasLastUnlockedCursorPt_ = false;
 

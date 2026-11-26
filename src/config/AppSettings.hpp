@@ -26,6 +26,7 @@ struct AppSettings {
     std::string virtualDisplaySpec = "1920x1080/320"; // WxH/DPI or "auto"
     bool gamepadEnabled = true;     // Stage 3: XInput gamepad-to-touch controller
     std::string lastWirelessAddr = "192.168.1.100:5555";
+    std::string lastGameProfile;    // Remembers preferred game profile across Desktop auto-switch & restarts
 
     std::string buildScrcpyArgs() const;
 };

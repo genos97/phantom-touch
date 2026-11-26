@@ -635,6 +635,7 @@ static void testStage1EmulatorFeatures() {
 
     Profile game = ProfileDefaults::createFreeFire();
     assert(game.keymapEnabled && ProfileDefaults::matchesPackage(game.appPackage, "com.dts.freefiremax"));
+    assert(ProfileDefaults::matchesPackage(game.appPackage, "com.dts.freefireind"));
     game.appPackage = "com.supercell.clashofclans,com.supercell.brawlstars";
     const std::string tmpGame = "profiles\\_test_app_link_stage1.cfg";
     assert(ProfileStore::save(tmpGame, game));
@@ -643,15 +644,17 @@ static void testStage1EmulatorFeatures() {
     assert(gameLoaded.keymapEnabled && ProfileDefaults::matchesPackage(gameLoaded.appPackage, "com.supercell.brawlstars"));
     std::remove(tmpGame.c_str());
 
-    // 3. AppSettings Stage 1 flags round-trip
+    // 3. AppSettings Stage 1 flags & lastGameProfile round-trip
     AppSettings s;
     s.autoSwitchProfiles = false;
     s.rightClickBack = false;
+    s.lastGameProfile = "profiles\\my_custom.cfg";
     const std::string tmpSet = "profiles\\_test_stage1_settings.cfg";
     assert(AppSettingsStore::save(tmpSet, s));
     AppSettings sLoad;
     assert(AppSettingsStore::load(tmpSet, sLoad));
     assert(!sLoad.autoSwitchProfiles && !sLoad.rightClickBack);
+    assert(sLoad.lastGameProfile == "profiles\\my_custom.cfg");
     std::remove(tmpSet.c_str());
 
     // 4. KeyCodes Win32 VK -> Android keycode mapping
@@ -677,6 +680,16 @@ static void testStage1EmulatorFeatures() {
     assert(!engine.onKeyEvent('Q', true, reqToggle));
     assert(!engine.onKeyEvent(VK_SPACE, true, reqToggle));
     assert(!engine.isKeyMapped('W', false));
+
+    // Direct off-center cursor tap must emit TOUCH_DOWN and TOUCH_UP at the exact same coordinates
+    engine.onDirectCursorTouch(TOUCH_DOWN, 0.25f, 0.75f);
+    engine.onDirectCursorTouch(TOUCH_UP, 0.25f, 0.75f);
+    Sleep(20);
+    assert(log.size() >= 2);
+    assert(log[0].action == TOUCH_DOWN && log[1].action == TOUCH_UP);
+    assert(log[0].px == log[1].px && log[0].py == log[1].py);
+    assert(log[0].px == 480 && log[0].py == 810); // 1920x1080 * (0.25, 0.75)
+    log.clear();
 
     // Ctrl+Wheel pinch zoom: must plant 2 distinct fingers strictly in 0..9, expand them, and auto-release after 140ms
     engine.onDirectCursorPinch(0.50f, 0.50f, 1);
