@@ -51,12 +51,18 @@ public:
     void setGamepadEnabled(bool enabled);
     void setAppFocused(bool focused);
     void setEditMode(bool editing);
+    void setShellMenuOpen(bool open);
+
+    typedef void (*PadNavCallbackFn)(void* ctx, uint8_t navMask);
+    void setPadNavCallback(PadNavCallbackFn fn, void* ctx);
 
     // Non-blocking raw mouse & hook entry points (safe from WM_INPUT / WH_*_LL)
     void onRawMouseDelta(int dx, int dy);
     bool onKeyEvent(int vk, bool down, bool& outRequestToggleAim);
     bool isKeyMapped(int vk, bool aimModeActive) const;
+    void onCursorHoverNorm(float normX, float normY);
     void onDirectCursorTouch(TouchAction action, float normX, float normY);
+    void onDirectCursorTwoFingerPan(TouchAction action, float normX, float normY);
     void onDirectCursorScroll(float normX, float normY, int wheelNotches);
     void onDirectCursorPinch(float normX, float normY, int wheelNotches);
 
@@ -79,6 +85,7 @@ private:
         TouchAction action;
         float normX;
         float normY;
+        bool twoFingerPan;
     };
 
     struct QueuedCursorScroll {
@@ -107,6 +114,8 @@ private:
     bool classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim);
     void processKeyEventLocked(int vk, bool down, double nowMs, bool fromGamepad = false);
     void processDirectCursorLocked(TouchAction action, float normX, float normY);
+    void processDirectCursorTwoFingerPanLocked(TouchAction action, float normX, float normY);
+    void releaseCursorTwoFingerPanLocked();
     void processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs);
     void releaseCursorScrollLocked();
     void processDirectCursorPinchLocked(float normX, float normY, int wheelNotches, double nowMs);
@@ -132,6 +141,7 @@ private:
     volatile LONG pollHzAtomic_ = 250;
     volatile LONG appFocused_ = 1;
     volatile LONG editMode_ = 0;
+    volatile LONG shellMenuOpen_ = 0;
 
     enum JoyOwner {
         JOY_NONE = 0,
@@ -149,7 +159,11 @@ private:
     bool routeKeymapEnabled_ = true;
     int routeVkUp_ = 'W', routeVkDown_ = 'S', routeVkLeft_ = 'A', routeVkRight_ = 'D';
     int routeVkSprint_ = 0xA0, routeVkWalk_ = 0xA2, routeFireVk_ = 0x01;
+    int routeCastCancelVk_ = 0;
+    bool routeHasSkillCast_ = false;
     std::vector<KeyRouteEntry> routeButtons_;
+    float cursorHoverNormX_ = 0.5f;
+    float cursorHoverNormY_ = 0.5f;
     double accumRawDx_ = 0.0;
     double accumRawDy_ = 0.0;
     bool hasPendingAimDelta_ = false;
@@ -176,6 +190,14 @@ private:
     double pinchCenterY_ = 0.0;
     double pinchRadius_ = 0.0;
     double pinchReleaseAtMs_ = 0.0;
+
+    // Unlocked cursor middle-drag 2-finger pan (Strategy/RTS F5)
+    bool twoFingerPanDown_ = false;
+    int32_t twoFingerPanLastX_ = 0;
+    int32_t twoFingerPanLastY_ = 0;
+
+    PadNavCallbackFn padNavCb_ = nullptr;
+    void* padNavCtx_ = nullptr;
 
     // Modular sub-controllers & bounded 0..9 Android virtual finger pool
     TouchFingerPool fingerPool_;

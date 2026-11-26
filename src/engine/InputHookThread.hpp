@@ -44,7 +44,8 @@ enum ShellAppMsg {
     MSG_CONNECT_STEP       = WM_APP + 32,
     MSG_REPAIR_TOOLS_DONE  = WM_APP + 33,
     MSG_TOGGLE_CMD_PALETTE = WM_APP + 34,
-    MSG_TOGGLE_CHEAT_SHEET = WM_APP + 35
+    MSG_TOGGLE_CHEAT_SHEET = WM_APP + 35,
+    MSG_PAD_NAV            = WM_APP + 36
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread
@@ -113,4 +114,7 @@ private:
     bool holdUnlockedAim_ = false;
     bool cursorDirectDragging_ = false;
     bool rightClickBackSwallowUp_ = false;
+    bool middlePanDragging_ = false;
+    int wheelDeltaAccum_ = 0;
+    DWORD lastWheelTick_ = 0;
 };

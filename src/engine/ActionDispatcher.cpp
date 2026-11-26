@@ -16,6 +16,85 @@ void ActionDispatcher::resetForProfile(size_t buttonCount) {
     states_.assign(buttonCount, ButtonRuntime());
 }
 
+void ActionDispatcher::setCursorNorm(float nx, float ny) {
+    if (nx < 0.0f) nx = 0.0f;
+    if (nx > 1.0f) nx = 1.0f;
+    if (ny < 0.0f) ny = 0.0f;
+    if (ny > 1.0f) ny = 1.0f;
+    cursorNormX_ = nx;
+    cursorNormY_ = ny;
+}
+
+bool ActionDispatcher::hasActiveSkillCast() const {
+    for (size_t i = 0; i < states_.size(); ++i) {
+        if (states_[i].skillCasting && states_[i].touchDown) return true;
+    }
+    return false;
+}
+
+bool ActionDispatcher::cancelActiveSkillCasts(const Profile& profile, uint32_t screenW, uint32_t screenH,
+                                              uint32_t& outPacketsSent) {
+    bool cancelled = false;
+    double dw = static_cast<double>(screenW > 10 ? screenW : 1920);
+    double dh = static_cast<double>(screenH > 10 ? screenH : 1080);
+    int32_t maxX = static_cast<int32_t>(dw) - 3;
+    int32_t maxY = static_cast<int32_t>(dh) - 3;
+    for (size_t i = 0; i < states_.size() && i < profile.buttons.size(); ++i) {
+        ButtonRuntime& st = states_[i];
+        if (!st.skillCasting || !st.touchDown) continue;
+        const KeyNode& b = profile.buttons[i];
+        const uint64_t ptrId = PointerId::BTN_BASE + i;
+        int32_t cx = static_cast<int32_t>(std::floor(static_cast<double>(b.x2) * dw + 0.5));
+        int32_t cy = static_cast<int32_t>(std::floor(static_cast<double>(b.y2) * dh + 0.5));
+        if (cx < 2) cx = 2;
+        if (cx > maxX) cx = maxX;
+        if (cy < 2) cy = 2;
+        if (cy > maxY) cy = maxY;
+        if (cx != st.lastPx || cy != st.lastPy) {
+            emitTouch(TOUCH_MOVE, ptrId, cx, cy, outPacketsSent);
+            st.lastPx = cx;
+            st.lastPy = cy;
+        }
+        emitTouch(TOUCH_UP, ptrId, st.lastPx, st.lastPy, outPacketsSent);
+        st.touchDown = false;
+        st.skillCasting = false;
+        st.skillCancelled = true;
+        st.autoReleaseAtMs = 0.0;
+        cancelled = true;
+    }
+    return cancelled;
+}
+
+void ActionDispatcher::computeSkillTargetPx(const KeyNode& b, const Profile& profile,
+                                            uint32_t screenW, uint32_t screenH,
+                                            int32_t& outPx, int32_t& outPy) const {
+    double dw = static_cast<double>(screenW > 10 ? screenW : 1920);
+    double dh = static_cast<double>(screenH > 10 ? screenH : 1080);
+    double minDim = (dw < dh) ? dw : dh;
+    double dx = (static_cast<double>(cursorNormX_) - static_cast<double>(profile.castCenterX)) * dw;
+    double dy = (static_cast<double>(cursorNormY_) - static_cast<double>(profile.castCenterY)) * dh;
+    double dist = std::sqrt(dx * dx + dy * dy);
+    double radPx = static_cast<double>(b.radius > 0.01f ? b.radius : 0.110f) * minDim;
+    double bxPx = static_cast<double>(b.x) * dw;
+    double byPx = static_cast<double>(b.y) * dh;
+    double tx = bxPx;
+    double ty = byPx;
+    if (dist > 1.0) {
+        tx = bxPx + (dx / dist) * radPx;
+        ty = byPx + (dy / dist) * radPx;
+    }
+    int32_t ix = static_cast<int32_t>(std::floor(tx + 0.5));
+    int32_t iy = static_cast<int32_t>(std::floor(ty + 0.5));
+    int32_t maxX = static_cast<int32_t>(dw) - 3;
+    int32_t maxY = static_cast<int32_t>(dh) - 3;
+    if (ix < 2) ix = 2;
+    if (ix > maxX) ix = maxX;
+    if (iy < 2) iy = 2;
+    if (iy > maxY) iy = maxY;
+    outPx = ix;
+    outPy = iy;
+}
+
 void ActionDispatcher::emitTouch(TouchAction action, uint64_t ptrId,
                                  int32_t px, int32_t py, uint32_t& outPacketsSent) {
     if (emitFn_) {
@@ -49,6 +128,8 @@ void ActionDispatcher::triggerStart(size_t idx, bool isAimMode, const Profile& p
                                     bool& ioScopeSensActive, ActionEffects& outEffects,
                                     uint32_t& outPacketsSent) {
     if (idx >= profile.buttons.size() || idx >= states_.size()) return;
+    lastScreenW_ = screenW;
+    lastScreenH_ = screenH;
     const KeyNode& b = profile.buttons[idx];
     ButtonRuntime& st = states_[idx];
     if (st.keyHeld) return;
@@ -140,6 +221,31 @@ void ActionDispatcher::triggerStart(size_t idx, bool isAimMode, const Profile& p
             outEffects.reactivateJoystick = true;
             break;
         }
+        case NODE_SKILL_CAST: {
+            if (st.touchDown) {
+                emitTouch(TOUCH_UP, ptrId, st.lastPx, st.lastPy, outPacketsSent);
+            }
+            int32_t sx = static_cast<int32_t>(std::floor(static_cast<double>(b.x) * static_cast<double>(screenW) + 0.5));
+            int32_t sy = static_cast<int32_t>(std::floor(static_cast<double>(b.y) * static_cast<double>(screenH) + 0.5));
+            emitTouch(TOUCH_DOWN, ptrId, sx, sy, outPacketsSent);
+            st.lastPx = sx;
+            st.lastPy = sy;
+            st.touchDown = true;
+            st.skillCasting = true;
+            st.skillCancelled = false;
+
+            int32_t tx = sx, ty = sy;
+            computeSkillTargetPx(b, profile, screenW, screenH, tx, ty);
+            if (tx != st.lastPx || ty != st.lastPy) {
+                emitTouch(TOUCH_MOVE, ptrId, tx, ty, outPacketsSent);
+                st.lastPx = tx;
+                st.lastPy = ty;
+            }
+            if (b.quickCast) {
+                st.autoReleaseAtMs = nowMs + 25.0;
+            }
+            break;
+        }
         default:
             break;
     }
@@ -158,6 +264,8 @@ void ActionDispatcher::triggerStop(size_t idx, const Profile& profile,
                                    bool& ioScopeSensActive, ActionEffects& outEffects,
                                    uint32_t& outPacketsSent) {
     if (idx >= profile.buttons.size() || idx >= states_.size()) return;
+    lastScreenW_ = screenW;
+    lastScreenH_ = screenH;
     const KeyNode& b = profile.buttons[idx];
     ButtonRuntime& st = states_[idx];
     if (!st.keyHeld) return;
@@ -206,6 +314,15 @@ void ActionDispatcher::triggerStop(size_t idx, const Profile& profile,
             if (!b.toggleMode) {
                 ioScopeSensActive = false;
             }
+            break;
+        }
+        case NODE_SKILL_CAST: {
+            if (st.skillCasting && st.touchDown && !st.skillCancelled && st.autoReleaseAtMs == 0.0) {
+                emitTouch(TOUCH_UP, ptrId, st.lastPx, st.lastPy, outPacketsSent);
+                st.touchDown = false;
+            }
+            st.skillCasting = false;
+            st.skillCancelled = false;
             break;
         }
         default:
@@ -282,9 +399,19 @@ void ActionDispatcher::tick(const Profile& profile, double nowMs, uint32_t& outP
                     st.lastPy = cy;
                 }
             }
+        } else if (st.skillCasting && st.touchDown && !st.skillCancelled && st.autoReleaseAtMs == 0.0) {
+            int32_t tx = st.lastPx, ty = st.lastPy;
+            computeSkillTargetPx(profile.buttons[i], profile, lastScreenW_, lastScreenH_, tx, ty);
+            if (std::abs(tx - st.lastPx) >= 2 || std::abs(ty - st.lastPy) >= 2) {
+                emitTouch(TOUCH_MOVE, ptrId, tx, ty, outPacketsSent);
+                st.lastPx = tx;
+                st.lastPy = ty;
+            }
         } else if (st.touchDown && st.autoReleaseAtMs > 0.0 && nowMs >= st.autoReleaseAtMs) {
             emitTouch(TOUCH_UP, ptrId, st.lastPx, st.lastPy, outPacketsSent);
             st.touchDown = false;
+            st.skillCasting = false;
+            st.skillCancelled = false;
             st.autoReleaseAtMs = 0.0;
         }
     }
@@ -294,7 +421,11 @@ void ActionDispatcher::releaseButtons(const Profile& profile, bool mouseOnly, ui
     for (size_t i = 0; i < states_.size() && i < profile.buttons.size(); ++i) {
         if (mouseOnly && !KeyCodes::isMouseKey(profile.buttons[i].vk)) continue;
         states_[i].keyHeld = false;
-        if (!mouseOnly) states_[i].swiping = false;
+        if (!mouseOnly) {
+            states_[i].swiping = false;
+            states_[i].skillCasting = false;
+            states_[i].skillCancelled = false;
+        }
         if (states_[i].touchDown && states_[i].autoReleaseAtMs == 0.0) {
             emitTouch(TOUCH_UP, PointerId::BTN_BASE + i, states_[i].lastPx, states_[i].lastPy, outPacketsSent);
             states_[i].touchDown = false;

@@ -22,7 +22,33 @@ enum KeyActionType : int {
     NODE_CURSOR_TOGGLE  = 6, // Taps (x,y) and toggles Aim <-> Cursor mode (Bag/Map)
     NODE_RESET_VIEW     = 7, // Resets active camera finger cleanly without tapping
     NODE_SWITCH_SENS    = 8, // Switches to secondary Scope X/Y sensitivity (hold or toggle)
-    NODE_REACTIVATE_JOY = 9  // Releases and cleanly re-engages WASD joystick
+    NODE_REACTIVATE_JOY = 9, // Releases and cleanly re-engages WASD joystick
+    NODE_SKILL_CAST     = 10 // F5: MOBA directional skill cast from castCenter -> cursor
+};
+
+enum GamepadMode : int {
+    PAD_MODE_TOUCH  = 0,
+    PAD_MODE_NATIVE = 1
+};
+
+enum PadButtonId : int {
+    PAD_A = 0,
+    PAD_B = 1,
+    PAD_X = 2,
+    PAD_Y = 3,
+    PAD_LB = 4,
+    PAD_RB = 5,
+    PAD_LT = 6,
+    PAD_RT = 7,
+    PAD_BACK = 8,
+    PAD_START = 9,
+    PAD_LS = 10,
+    PAD_RS = 11,
+    PAD_DPAD_UP = 12,
+    PAD_DPAD_DOWN = 13,
+    PAD_DPAD_LEFT = 14,
+    PAD_DPAD_RIGHT = 15,
+    PAD_BUTTON_COUNT = 16
 };
 
 enum ProfileTemplateKind : int {
@@ -49,6 +75,7 @@ struct KeyNode {
     bool toggleMode = false;         // For NODE_SWITCH_SENS: false = hold, true = toggle
     bool resetView = false;          // Optional add-on: also cleanly resets main camera finger
     bool reactivateJoy = false;      // Optional add-on: cleanly lifts & re-engages WASD joystick
+    bool quickCast = false;          // F5: for NODE_SKILL_CAST, tap = cast immediately toward cursor
 };
 
 struct Profile {
@@ -72,6 +99,11 @@ struct Profile {
     float panelY = 0.100f;
     bool rememberCursorPos = false;  // false = spawn cursor at center on unlock; true = restore last position
     int cursorScrollStepPx = 95;     // Vertical touch-drag distance per wheel notch in Cursor Mode
+
+    // F5: MOBA Skill Cast & Cancel Zone
+    float castCenterX = 0.500f;      // Hero / character origin on screen (normalized)
+    float castCenterY = 0.500f;
+    int castCancelVk = 0;            // Key that drags an held skill cast to its cancel zone (x2,y2)
 
     // Aim view & Free Fire counter-acceleration physics
     float aimX = 0.620f;
@@ -121,6 +153,13 @@ struct Profile {
     int vkSprint = 0xA0;             // VK_LSHIFT
     int vkWalk = 0xA2;               // VK_LCONTROL
 
+    // F6: Per-profile Gamepad v2 configuration
+    int padMode = PAD_MODE_TOUCH;
+    float padDeadzoneL = 0.24f;
+    float padDeadzoneR = 0.27f;
+    float padLookSens = 1.00f;
+    std::string padMap[PAD_BUTTON_COUNT];
+
     std::vector<KeyNode> buttons;
 };
 
@@ -131,6 +170,8 @@ public:
     static Profile createDesktop(const std::string& name = "Desktop (Typing)");
     static Profile createTemplate(ProfileTemplateKind kind);
     static const char* templateName(ProfileTemplateKind kind);
+    static const char* padButtonConfigKey(int padBtnId);
+    static const char* padButtonDisplayName(int padBtnId);
     static bool matchesPackage(const std::string& packageList, const std::string& activePkg);
     static void mapEdgeAnchored(float nx, float ny, bool edgeAnchored,
                                 float refAspect, float liveAspect,

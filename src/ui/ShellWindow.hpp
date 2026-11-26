@@ -90,6 +90,7 @@ private:
     static DWORD WINAPI probeThreadProc(LPVOID param);
     static void onConnectStep(void* ctx, int step);
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
+    static void onPadNav(void* ctx, uint8_t navMask);
     static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
                               bool present, int64_t qpcPktRecv);
@@ -311,6 +312,9 @@ private:
 
     bool holdUnlockedAim_ = false;
     bool cursorDirectDragging_ = false;
+    bool middlePanDragging_ = false;
+    int wheelDeltaAccum_ = 0;
+    DWORD lastWheelTick_ = 0;
     float lastCursorNormX_ = 0.5f;
     float lastCursorNormY_ = 0.5f;
     POINT lastUnlockedCursorPt_;

@@ -1822,6 +1822,255 @@ static void testSprint3bPolishCommandPaletteMotionAndA11y() {
     std::printf("[Test] Sprint 3B (U5/U6/X5/X6/X7/X8/U4/U7) OK!\n");
 }
 
+static void testSprint4aMobaAndGamepadV2() {
+    std::printf("[Test] Sprint 4A (F5 MOBA/E12 + F6 Gamepad v2 UHID)...\n");
+
+    // 1. F5 + F6 Profile defaults, serialization round-trip & legacy backward-compatibility
+    Profile moba = ProfileDefaults::createTemplate(TMPL_MOBA);
+    assert(moba.castCancelVk == VK_SPACE);
+    assert(moba.buttons.size() >= 5);
+    assert(moba.buttons[1].action == NODE_SKILL_CAST);
+    assert(std::fabs(moba.buttons[1].radius - 0.110f) < 0.001f);
+    assert(std::fabs(moba.buttons[1].x2 - 0.880f) < 0.001f);
+    assert(std::fabs(moba.buttons[1].y2 - 0.180f) < 0.001f);
+    moba.buttons[1].quickCast = true;
+    moba.padMode = PAD_MODE_NATIVE;
+    moba.padDeadzoneL = 0.21f;
+    moba.padDeadzoneR = 0.29f;
+    moba.padLookSens = 1.35f;
+    moba.padMap[PAD_A] = "SKILL1";
+    moba.padMap[PAD_RT] = "FIRE";
+
+    std::string ser = ProfileStore::serializeToString(moba);
+    Profile reloaded;
+    assert(ProfileStore::parseFromString(ser, reloaded, nullptr));
+    assert(reloaded.castCancelVk == VK_SPACE);
+    assert(reloaded.buttons[1].action == NODE_SKILL_CAST);
+    assert(reloaded.buttons[1].quickCast == true);
+    assert(std::fabs(reloaded.buttons[1].radius - 0.110f) < 0.001f);
+    assert(reloaded.padMode == PAD_MODE_NATIVE);
+    assert(std::fabs(reloaded.padDeadzoneL - 0.21f) < 0.002f);
+    assert(std::fabs(reloaded.padDeadzoneR - 0.29f) < 0.002f);
+    assert(std::fabs(reloaded.padLookSens - 1.35f) < 0.002f);
+    assert(reloaded.padMap[PAD_A] == "SKILL1");
+    assert(reloaded.padMap[PAD_RT] == "FIRE");
+
+    Profile legacy;
+    assert(ProfileStore::parseFromString("name = LegacyV0\nkeymap_enabled = 1\n", legacy, nullptr));
+    assert(legacy.padMode == PAD_MODE_TOUCH);
+    assert(legacy.castCancelVk == 0);
+
+    // 2. EditorGeometry: skill cast cancel key clash flagged
+    {
+        Profile clashP = moba;
+        KeyNode bad;
+        bad.label = "BAD";
+        bad.vk = VK_SPACE;
+        bad.action = NODE_CLICK;
+        bad.x = 0.40f; bad.y = 0.80f;
+        clashP.buttons.push_back(bad);
+        std::vector<KeyConflict> conf = EditorGeometry::detectConflicts(clashP, true);
+        bool sawCancelConflict = false;
+        for (size_t i = 0; i < conf.size(); ++i) {
+            if (conf[i].reason.find("Cancel") != std::string::npos) sawCancelConflict = true;
+        }
+        assert(sawCancelConflict);
+    }
+
+    // 3. F5 ActionDispatcher MOBA skill-cast aim + tick track + cancel + quick-cast
+    {
+        std::vector<RecordedTouch> log;
+        ActionDispatcher ad;
+        ad.setTouchSink(recordTouchCb, &log);
+        Profile mp = ProfileDefaults::createTemplate(TMPL_MOBA);
+        ad.resetForProfile(mp.buttons.size());
+        bool held[512];
+        std::memset(held, 0, sizeof(held));
+        bool scp = false;
+        ActionEffects eff;
+        uint32_t pkt = 0;
+
+        // Cursor due right from castCenter (0.5, 0.5)
+        ad.setCursorNorm(0.80f, 0.50f);
+        held['Q'] = true;
+        ad.dispatchKey('Q', true, true, mp, held, 1920, 1080, 10.0, scp, eff, pkt);
+        assert(log.size() == 2);
+        assert(log[0].action == TOUCH_DOWN);
+        assert(log[1].action == TOUCH_MOVE);
+        int32_t skillX = static_cast<int32_t>(std::floor(mp.buttons[1].x * 1920.0f + 0.5f));
+        int32_t skillY = static_cast<int32_t>(std::floor(mp.buttons[1].y * 1080.0f + 0.5f));
+        assert(log[1].px > skillX);
+        assert(std::abs(log[1].py - skillY) <= 2);
+
+        // Move cursor straight up from center -> tick updates touch upward
+        ad.setCursorNorm(0.50f, 0.15f);
+        ad.tick(mp, 20.0, pkt);
+        assert(log.size() == 3 && log[2].action == TOUCH_MOVE);
+        assert(log[2].py < skillY);
+
+        // Release Q casts skill
+        held['Q'] = false;
+        ad.dispatchKey('Q', false, true, mp, held, 1920, 1080, 30.0, scp, eff, pkt);
+        assert(log.size() == 4 && log[3].action == TOUCH_UP);
+
+        // Cancel test: hold Q, cancel to (x2, y2), release Q emits no extra UP
+        ad.setCursorNorm(0.80f, 0.50f);
+        held['Q'] = true;
+        ad.dispatchKey('Q', true, true, mp, held, 1920, 1080, 40.0, scp, eff, pkt);
+        assert(ad.hasActiveSkillCast());
+        size_t beforeCancel = log.size();
+        assert(ad.cancelActiveSkillCasts(mp, 1920, 1080, pkt));
+        assert(!ad.hasActiveSkillCast());
+        assert(log.size() == beforeCancel + 2);
+        assert(log[beforeCancel].action == TOUCH_MOVE);
+        assert(std::abs(log[beforeCancel].px - static_cast<int32_t>(0.880f * 1920.0f)) <= 2);
+        assert(std::abs(log[beforeCancel].py - static_cast<int32_t>(0.180f * 1080.0f)) <= 2);
+        assert(log[beforeCancel + 1].action == TOUCH_UP);
+        size_t afterCancel = log.size();
+        held['Q'] = false;
+        ad.dispatchKey('Q', false, true, mp, held, 1920, 1080, 50.0, scp, eff, pkt);
+        assert(log.size() == afterCancel);
+
+        // Quick-cast auto-releases on tick without key release
+        mp.buttons[1].quickCast = true;
+        held['Q'] = true;
+        ad.dispatchKey('Q', true, true, mp, held, 1920, 1080, 100.0, scp, eff, pkt);
+        size_t beforeTick = log.size();
+        ad.tick(mp, 135.0, pkt);
+        assert(log.size() == beforeTick + 1 && log.back().action == TOUCH_UP);
+    }
+
+    // 4. E12 Pinch release + F5 Two-Finger Pan in InputEngine (offline headless sync)
+    {
+        std::vector<RecordedTouch> log;
+        ScrcpyBridge br;
+        InputEngine eng(&br);
+        eng.setTouchSinkForTest(recordTouchCb, &log);
+        eng.onDirectCursorPinch(0.5f, 0.5f, 1);
+        size_t nPinch = log.size();
+        assert(nPinch >= 2);
+        log.clear();
+        eng.onDirectCursorTouch(TOUCH_DOWN, 0.30f, 0.30f);
+        assert(log.size() == 3);
+        assert(log[0].action == TOUCH_UP && log[1].action == TOUCH_UP && log[2].action == TOUCH_DOWN);
+        assert(std::abs(log[2].px - static_cast<int32_t>(0.30f * 1920.0f)) <= 2);
+        assert(std::abs(log[2].py - static_cast<int32_t>(0.30f * 1080.0f)) <= 2);
+        eng.onDirectCursorTouch(TOUCH_UP, 0.30f, 0.30f);
+
+        log.clear();
+        eng.onDirectCursorTwoFingerPan(TOUCH_DOWN, 0.50f, 0.50f);
+        eng.onDirectCursorTwoFingerPan(TOUCH_MOVE, 0.60f, 0.50f);
+        eng.onDirectCursorTwoFingerPan(TOUCH_UP,   0.60f, 0.50f);
+        assert(log.size() == 6);
+        assert(log[0].action == TOUCH_DOWN && log[1].action == TOUCH_DOWN);
+        assert(log[2].action == TOUCH_MOVE && log[3].action == TOUCH_MOVE);
+        assert(log[4].action == TOUCH_UP   && log[5].action == TOUCH_UP);
+    }
+
+    // 5. F6 ScrcpyBridge UHID byte-exact serializers
+    {
+        uint16_t descSz = 0;
+        const uint8_t* desc = GamepadController::hidReportDescriptor(descSz);
+        assert(desc != nullptr && descSz == 80);
+        assert(desc[0] == 0x05 && desc[descSz - 1] == 0xC0);
+
+        uint8_t buf[256];
+        size_t cLen = ScrcpyBridge::serializeUhidCreate(buf, sizeof(buf), 3, 0x045E, 0x028E, "PTPad", desc, descSz);
+        assert(cLen == 10u + 5u + descSz);
+        assert(buf[0] == 12);
+        assert(buf[1] == 0x00 && buf[2] == 0x03);
+        assert(buf[3] == 0x04 && buf[4] == 0x5E);
+        assert(buf[5] == 0x02 && buf[6] == 0x8E);
+        assert(buf[7] == 5 && std::memcmp(buf + 8, "PTPad", 5) == 0);
+        assert(buf[13] == 0 && buf[14] == descSz);
+
+        uint8_t rep[15];
+        GamepadController::packHidReport(0, 32767, 0, 0, 0, 255, 0x1001, true, rep);
+        assert(rep[0] == 0x00 && rep[1] == 0x80); // LX center 0x8000 LE
+        assert(rep[2] == 0x01 && rep[3] == 0x00); // LY up (inverted +32767 -> 1)
+        assert(rep[10] == 0xFF && rep[11] == 0x7F); // RT full 32767
+        assert(rep[12] == 0x01 && rep[13] == 0x10); // A (0x0001) + Guide (0x1000)
+        assert(rep[14] == 1); // D-pad Up hat = 1
+
+        size_t iLen = ScrcpyBridge::serializeUhidInput(buf, sizeof(buf), 3, rep, 15);
+        assert(iLen == 20 && buf[0] == 13 && buf[3] == 0 && buf[4] == 15);
+        size_t dLen = ScrcpyBridge::serializeUhidDestroy(buf, sizeof(buf), 3);
+        assert(dLen == 3 && buf[0] == 14 && buf[1] == 0 && buf[2] == 3);
+    }
+
+    // 6. F6 GamepadController per-profile map, E11 disable key-up, UHID lifecycle & shell nav
+    {
+        Profile pNat = moba;
+        assert(GamepadController::resolvePadButtonVk(PAD_A, pNat) == 'Q');
+        assert(GamepadController::resolvePadButtonVk(PAD_RT, pNat) == pNat.fireVk);
+
+        GamepadController gp;
+        std::vector<RecordedTouch> log;
+        gp.setTouchSink(recordTouchCb, &log);
+        uint32_t pkt = 0;
+
+        GamepadSnapshot snap;
+        snap.connected = true;
+        snap.buttons = 0x1001; // A + DpadUp
+        snap.guidePressed = true;
+        snap.hasRawAxes = true;
+        snap.rawLy = 10000;
+
+        GamepadFrameOutput out;
+        gp.processSnapshot(snap, pNat, 1920, 1080, 4.0, pkt, out, false, true /*shellMenuOpen*/);
+        assert(out.uhidActive && out.uhidNeedCreate && out.uhidReportChanged);
+        assert((out.shellNavMask & PAD_NAV_GUIDE) != 0);
+        assert((out.shellNavMask & PAD_NAV_UP) != 0);
+
+        gp.suspendForFocusLoss(pkt, out);
+        assert(out.uhidReportChanged);
+        assert(out.uhidReport[2] == 0x00 && out.uhidReport[3] == 0x80); // neutral center
+
+        // Touch mode E11 test: hold A -> disable -> emits key-up
+        Profile pTch = pNat;
+        pTch.padMode = PAD_MODE_TOUCH;
+        gp.processSnapshot(snap, pTch, 1920, 1080, 4.0, pkt, out, false, false);
+        assert(out.uhidNeedDestroy);
+        assert(out.keyDeltaCount >= 1 && out.keyDeltas[0].vk == 'Q' && out.keyDeltas[0].down == true);
+        gp.setEnabled(false);
+        gp.pollAndProcess(pTch, 1920, 1080, 4.0, pkt, out, false, false);
+        bool sawUpQ = false;
+        for (int i = 0; i < out.keyDeltaCount; ++i) {
+            if (out.keyDeltas[i].vk == 'Q' && !out.keyDeltas[i].down) sawUpQ = true;
+        }
+        assert(sawUpQ);
+    }
+
+    // 7. DrawerPanel Tab 4 (PAD) + HudRenderer NODE_SKILL_CAST paint smoke
+    {
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 1100, 760);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        {
+            Gdiplus::Graphics g(mDC);
+            DrawerPanel dp;
+            dp.setActiveTab(4);
+            RECT dRc = { 680, 46, 1016, 740 };
+            AppSettings as;
+            dp.paint(g, dRc, moba, as, "moba.cfg", -1, false, true, "Phone", "com.moba",
+                     std::vector<std::string>(), 0, 0, 0);
+            RECT rMode = { 0, 0, 0, 0 }, rPadA = { 0, 0, 0, 0 };
+            assert(dp.rectForAction(DA_PAD_MODE, 1, rMode));
+            assert(dp.rectForAction(DA_PAD_BIND_BTN, PAD_A, rPadA));
+
+            EngineTelemetry tel;
+            HudRenderer::paintKeymapNodes(g, 590, 700, moba, tel, true, false, 1, -1, false, false, 1.0f);
+        }
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    std::printf("[Test] Sprint 4A (F5 MOBA/E12 + F6 Gamepad v2 UHID) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1841,6 +2090,8 @@ int main() {
     testSprint2bConnectionOnboardingAndSettings();
     testSprint3aProfileLibraryEditorAndDynamicHud();
     testSprint3bPolishCommandPaletteMotionAndA11y();
-    std::printf("ALL SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint4aMobaAndGamepadV2();
+    std::printf("ALL SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

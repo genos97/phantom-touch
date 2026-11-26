@@ -108,6 +108,13 @@ public:
     static bool isPureAscii(const std::string& utf8);
     static std::vector<std::string> splitUtf8Chunks(const std::string& utf8, size_t maxBytes);
     static std::string sanitizeServerOption(const std::string& raw);
+    static size_t serializeUhidCreate(uint8_t* buf, size_t cap,
+                                      uint16_t id, uint16_t vendorId, uint16_t productId,
+                                      const std::string& name,
+                                      const uint8_t* reportDesc, uint16_t reportDescSize);
+    static size_t serializeUhidInput(uint8_t* buf, size_t cap,
+                                     uint16_t id, const uint8_t* data, uint16_t size);
+    static size_t serializeUhidDestroy(uint8_t* buf, size_t cap, uint16_t id);
     static std::vector<VideoEncoderInfo> parseH264Encoders(const std::string& raw);
     static std::string pickBestHardwareH264Encoder(const std::vector<VideoEncoderInfo>& encoders);
     static PhoneThermalInfo parseThermalTelemetry(const std::string& combinedRaw);
@@ -152,6 +159,10 @@ public:
     bool sendStartApp(const std::string& appName);
     bool sendResetVideo();
     bool sendResizeDisplay(uint16_t width, uint16_t height);
+    bool sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,
+                        const std::string& name, const uint8_t* reportDesc, uint16_t reportDescSize);
+    bool sendUhidInput(uint16_t id, const uint8_t* data, uint16_t size);
+    bool sendUhidDestroy(uint16_t id);
     void sendAndroidNav(uint32_t androidKeycode);
     bool setDisplayPower(bool on);
 

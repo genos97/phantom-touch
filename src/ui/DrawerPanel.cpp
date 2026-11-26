@@ -31,7 +31,11 @@ enum DrawerSliderId {
     DSL_SCROLL_STEP,
     DSL_WALK_RADIUS,
     DSL_FIRE_BOX_W,
-    DSL_NODE_DUR
+    DSL_NODE_DUR,
+    DSL_NODE_RADIUS,
+    DSL_PAD_DZ_L,
+    DSL_PAD_DZ_R,
+    DSL_PAD_LOOK_SENS
 };
 
 bool ptIn(const RECT& r, int x, int y) {
@@ -74,7 +78,7 @@ DrawerPanel::DrawerPanel() {
     ZeroMemory(&bounds_, sizeof(bounds_));
     ZeroMemory(&bodyClip_, sizeof(bodyClip_));
     ZeroMemory(&activeSliderTrack_, sizeof(activeSliderTrack_));
-    for (int i = 0; i < 4; ++i) scrollY_[i] = 0;
+    for (int i = 0; i < 5; ++i) scrollY_[i] = 0;
 }
 
 void DrawerPanel::setProfilesDir(const std::string& dir, const std::string& activePath) {
@@ -99,7 +103,8 @@ void DrawerPanel::refreshProfileList() {
 
 void DrawerPanel::setActiveTab(int tab) {
     if (tab < 0) tab = 0;
-    if (tab > 3) tab = 3;
+    if (tab > 4) tab = 4;
+    if (tab != 4) selectedPadBtn_ = -1;
     activeTab_ = tab;
     clearFocus();
     if (tab == 2) refreshProfileList();
@@ -116,8 +121,20 @@ std::string DrawerPanel::specialRebindLabel() const {
         case SRB_JOY_RIGHT:   return "JOYSTICK RIGHT";
         case SRB_JOY_SPRINT:  return "JOYSTICK SPRINT";
         case SRB_JOY_WALK:    return "JOYSTICK WALK";
+        case SRB_CAST_CANCEL: return "SKILL CAST CANCEL KEY";
         default:              return "KEY";
     }
+}
+
+bool DrawerPanel::bindSelectedPadButtonToNode(Profile& profile, const std::string& label, std::string& outToast) {
+    if (activeTab_ != 4 || selectedPadBtn_ < 0 || selectedPadBtn_ >= PAD_BUTTON_COUNT || label.empty()) {
+        return false;
+    }
+    int bid = selectedPadBtn_;
+    profile.padMap[bid] = label;
+    selectedPadBtn_ = -1;
+    outToast = std::string("Pad ") + ProfileDefaults::padButtonDisplayName(bid) + " -> " + label;
+    return true;
 }
 
 bool DrawerPanel::containsPoint(int x, int y) const {
@@ -231,13 +248,14 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
     const int hdrY = bounds.top + dp(10);
 
     // 1. Drawer Header + Close button
-    static const char* kTitles[4] = {
+    static const char* kTitles[5] = {
         "KEYMAP STUDIO",
         "SENSITIVITY & PHYSICS",
         "PROFILES MANAGER",
-        "DEVICE & STREAM"
+        "DEVICE & STREAM",
+        "GAMEPAD v2"
     };
-    GdiPlusDraw::textLeft(g, kTitles[activeTab_], static_cast<float>(x0), static_cast<float>(hdrY + dp(12)), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - dp(32)));
+    GdiPlusDraw::textLeft(g, kTitles[(activeTab_ >= 0 && activeTab_ < 5) ? activeTab_ : 0], static_cast<float>(x0), static_cast<float>(hdrY + dp(12)), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - dp(32)));
 
     RECT rCls = { bounds.right - dp(34), hdrY, bounds.right - dp(12), hdrY + dp(24) };
     bool hovCls = ptIn(rCls, hoverX, hoverY);
@@ -248,11 +266,11 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
                           hovCls ? Theme::ACCENT_RED : Theme::TEXT_SECONDARY);
     hotspots_.push_back(Hotspot{ rCls, DA_CLOSE, 0 });
 
-    // 2. 4 Navigation Tabs
-    const char* tabNames[4] = { "KEYS", "SENS", "PROFILES", "DEVICE" };
+    // 2. 5 Navigation Tabs (KEYS | SENS | CFG | DEV | PAD)
+    const char* tabNames[5] = { "KEYS", "SENS", "CFG", "DEV", "PAD" };
     int tabY = hdrY + dp(32);
-    int tabW = (w - dp(12)) / 4;
-    for (int i = 0; i < 4; ++i) {
+    int tabW = (w - dp(16)) / 5;
+    for (int i = 0; i < 5; ++i) {
         RECT tr = { x0 + i * (tabW + dp(4)), tabY, x0 + i * (tabW + dp(4)) + tabW, tabY + dp(26) };
         bool active = (activeTab_ == i);
         bool hov = ptIn(tr, hoverX, hoverY);
@@ -263,7 +281,7 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
         GdiPlusDraw::textCenter(g, tabNames[i],
                                 static_cast<float>(tr.left + tr.right) * 0.5f,
                                 static_cast<float>(tr.top + tr.bottom) * 0.5f,
-                                10.5f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+                                9.8f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
         hotspots_.push_back(Hotspot{ tr, DA_TAB_0 + i, 0 });
     }
     const size_t chromeHdrHotspotsEnd = hotspots_.size();
@@ -291,8 +309,10 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
         endY = paintTabSens(g, x0, startY, w, profile, hoverX, hoverY);
     } else if (activeTab_ == 2) {
         endY = paintTabProfiles(g, x0, startY, w, profile, activeProfilePath, foregroundPkg, hoverX, hoverY);
-    } else {
+    } else if (activeTab_ == 3) {
         endY = paintTabDevice(g, x0, startY, w, settings, connected, deviceLabel, logs, hoverX, hoverY);
+    } else {
+        endY = paintTabGamepad(g, x0, startY, w, profile, settings, hoverX, hoverY);
     }
 
     int contentH = (endY - startY) + dp(20);
@@ -435,6 +455,7 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
             }
         }
         int extraH = conflictMsg.empty() ? 0 : 22;
+        if (node.action == NODE_SKILL_CAST) extraH += 94;
         RECT card = { x, y, x + w, y + 320 + extraH };
         GdiPlusDraw::roundedCard(g, card, 10.0f, Theme::BG_CARD,
                                  conflictMsg.empty() ? Theme::ACCENT_CYAN : Theme::ACCENT_AMBER, 1.4f);
@@ -532,6 +553,43 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         drawSliderRow(g, ix, cy, iw, "Tap/Swipe Dur", static_cast<float>(node.durationMs), 15.0f, 300.0f, dbuf, Theme::ACCENT_AMBER, DSL_NODE_DUR, hoverX, hoverY);
         cy += 30;
 
+        if (node.action == NODE_SKILL_CAST) {
+            drawToggleRow(g, ix, cy, iw, "Quick Cast (Tap = Cast)", node.quickCast, 0xFF38D9A9u, DA_INSP_QUICK_CAST, hoverX, hoverY);
+            cy += dp(36);
+
+            char rbuf[16];
+            std::snprintf(rbuf, sizeof(rbuf), "%.2f", node.radius);
+            drawSliderRow(g, ix, cy, iw, "Cast Radius", node.radius, 0.04f, 0.30f, rbuf, 0xFF38D9A9u, DSL_NODE_RADIUS, hoverX, hoverY);
+            cy += 30;
+
+            bool clrAvail = (p.castCancelVk != 0);
+            int cnlW = clrAvail ? (iw - 34) : iw;
+            RECT rCnl = { ix, cy, ix + cnlW, cy + 24 };
+            bool waitCnl = (specialRebind_ == SRB_CAST_CANCEL);
+            std::string cnlTxt = waitCnl
+                ? "Press Cancel Key..."
+                : (std::string("Cast Cancel: ") + (clrAvail ? KeyCodes::toName(p.castCancelVk) : std::string("None")));
+            GdiPlusDraw::roundedCard(g, rCnl, 5.0f,
+                                     waitCnl ? Theme::ACCENT_AMBER_BG : (ptIn(rCnl, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_INPUT),
+                                     waitCnl ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.0f);
+            GdiPlusDraw::textLeft(g, cnlTxt, static_cast<float>(ix + 8), static_cast<float>(cy + 12), 10.5f, true,
+                                  waitCnl ? Theme::ACCENT_AMBER : Theme::TEXT_PRIMARY, static_cast<float>(cnlW - 14));
+            if (rCnl.bottom > bodyClip_.top && rCnl.top < bodyClip_.bottom) {
+                hotspots_.push_back(Hotspot{ rCnl, DA_REBIND_CAST_CANCEL, 0 });
+            }
+            if (clrAvail) {
+                RECT rCnlClr = { rCnl.right + 4, cy, ix + iw, cy + 24 };
+                GdiPlusDraw::roundedCard(g, rCnlClr, 5.0f, ptIn(rCnlClr, hoverX, hoverY) ? Theme::ACCENT_RED_BG : Theme::BG_INPUT,
+                                         Theme::BORDER_STRONG, 1.0f);
+                GdiPlusDraw::textCenter(g, "X", static_cast<float>(rCnlClr.left + rCnlClr.right) * 0.5f,
+                                        static_cast<float>(cy + 12), 10.0f, true, Theme::ACCENT_RED);
+                if (rCnlClr.bottom > bodyClip_.top && rCnlClr.top < bodyClip_.bottom) {
+                    hotspots_.push_back(Hotspot{ rCnlClr, DA_CLEAR_CAST_CANCEL, 0 });
+                }
+            }
+            cy += 30;
+        }
+
         // Per-node add-on chips: ADS Sens | Toggle | Rst View | Fix Joy
         int tw = (iw - 12) / 4;
         RECT rScp = { ix, cy, ix + tw, cy + 24 };
@@ -596,21 +654,22 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         KeyActionType type;
         uint32_t accent;
     };
-    static const PaletteSpec items[10] = {
-        { "+ Hold Key",      "Hold touch down",     NODE_PRESS,          Theme::ACCENT_CYAN },
-        { "+ Tap",           "Fixed single tap",    NODE_CLICK,          Theme::ACCENT_CYAN },
-        { "+ Tap Down & Up", "ADS / hold-to-scope", NODE_DOWN_UP,        Theme::ACCENT_GREEN },
-        { "+ Free Look",     "Temp drag-look",      NODE_HOLD_VIEW,      0xFF00F0F0u },
-        { "+ Swipe",         "Drag A -> B",         NODE_SWIPE,          Theme::ACCENT_AMBER },
-        { "+ Cursor Toggle", "Bag / Map unlock",    NODE_CURSOR_TOGGLE,  Theme::ACCENT_PURPLE },
-        { "+ Reset Camera",  "Re-center view",      NODE_RESET_VIEW,     Theme::ACCENT_AMBER },
-        { "+ Sensitivity",   "Scope / ADS switch",  NODE_SWITCH_SENS,    Theme::ACCENT_PURPLE },
-        { "+ Reset Joy",     "Unstick WASD",        NODE_REACTIVATE_JOY, Theme::ACCENT_GREEN },
-        { "+ Release Tap",   "Tap on key release",  NODE_UP_TRIGGER,     Theme::TEXT_SECONDARY }
+    static const PaletteSpec items[11] = {
+        { "+ Hold Key",      "Hold touch down",      NODE_PRESS,          Theme::ACCENT_CYAN },
+        { "+ Tap",           "Fixed single tap",     NODE_CLICK,          Theme::ACCENT_CYAN },
+        { "+ Tap Down & Up", "ADS / hold-to-scope",  NODE_DOWN_UP,        Theme::ACCENT_GREEN },
+        { "+ Free Look",     "Temp drag-look",       NODE_HOLD_VIEW,      0xFF00F0F0u },
+        { "+ Swipe",         "Drag A -> B",          NODE_SWIPE,          Theme::ACCENT_AMBER },
+        { "+ Cursor Toggle", "Bag / Map unlock",     NODE_CURSOR_TOGGLE,  Theme::ACCENT_PURPLE },
+        { "+ Reset Camera",  "Re-center view",       NODE_RESET_VIEW,     Theme::ACCENT_AMBER },
+        { "+ Sensitivity",   "Scope / ADS switch",   NODE_SWITCH_SENS,    Theme::ACCENT_PURPLE },
+        { "+ Reset Joy",     "Unstick WASD",         NODE_REACTIVATE_JOY, Theme::ACCENT_GREEN },
+        { "+ Release Tap",   "Tap on key release",   NODE_UP_TRIGGER,     Theme::TEXT_SECONDARY },
+        { "+ Skill Cast",    "MOBA cursor aim+cnl",  NODE_SKILL_CAST,     0xFF38D9A9u }
     };
 
     std::vector<int> matched;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 11; ++i) {
         if (containsCaseInsensitive(items[i].title, paletteSearch_) ||
             containsCaseInsensitive(items[i].sub, paletteSearch_) ||
             containsCaseInsensitive(ProfileDefaults::actionTypeToHumanLabel(items[i].type), paletteSearch_)) {
@@ -1279,6 +1338,170 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     return rDZ.bottom + 10;
 }
 
+int DrawerPanel::paintTabGamepad(Gdiplus::Graphics& g, int x, int y, int w,
+                                 const Profile& p, const AppSettings& s, int hoverX, int hoverY) {
+    GdiPlusDraw::textLeft(g, "GAMEPAD v2 (F6)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
+    y += 22;
+
+    drawToggleRow(g, x, y, w, "Gamepad Enabled (XInput)", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY);
+    y += dp(38);
+
+    // Touch Map vs Native UHID Mode
+    GdiPlusDraw::textLeft(g, "CONTROLLER MODE", static_cast<float>(x), static_cast<float>(y + 7), 10.0f, true, Theme::TEXT_MUTED);
+    y += 18;
+    int mw = (w - 6) / 2;
+    RECT rTch = { x, y, x + mw, y + 30 };
+    RECT rNat = { x + mw + 6, y, x + w, y + 30 };
+    bool onTch = (p.padMode != PAD_MODE_NATIVE);
+    bool onNat = (p.padMode == PAD_MODE_NATIVE);
+    GdiPlusDraw::roundedCard(g, rTch, 6.0f, onTch ? Theme::ACCENT_CYAN_BG : (ptIn(rTch, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_INPUT),
+                             onTch ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.2f);
+    GdiPlusDraw::roundedCard(g, rNat, 6.0f, onNat ? Theme::ACCENT_GREEN_BG : (ptIn(rNat, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_INPUT),
+                             onNat ? Theme::ACCENT_GREEN : Theme::BORDER_SUBTLE, 1.2f);
+    GdiPlusDraw::textCenter(g, "TOUCH MAP", static_cast<float>(rTch.left + rTch.right) * 0.5f, static_cast<float>(y + 15),
+                            11.0f, true, onTch ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+    GdiPlusDraw::textCenter(g, "NATIVE UHID", static_cast<float>(rNat.left + rNat.right) * 0.5f, static_cast<float>(y + 15),
+                            11.0f, true, onNat ? Theme::ACCENT_GREEN : Theme::TEXT_SECONDARY);
+    if (rTch.bottom > bodyClip_.top && rTch.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rTch, DA_PAD_MODE, 0 });
+        hotspots_.push_back(Hotspot{ rNat, DA_PAD_MODE, 1 });
+    }
+    y += 34;
+
+    GdiPlusDraw::textLeft(g, "PS DualSense / DS4: enable Steam Input or DS4Windows (XInput).",
+                          static_cast<float>(x), static_cast<float>(y + 7), 9.2f, false, Theme::TEXT_MUTED, static_cast<float>(w));
+    y += 19;
+
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", p.padDeadzoneL);
+    drawSliderRow(g, x, y, w, "Left Deadzone", p.padDeadzoneL, 0.05f, 0.50f, buf, Theme::ACCENT_CYAN, DSL_PAD_DZ_L, hoverX, hoverY);
+    y += 29;
+    std::snprintf(buf, sizeof(buf), "%.2f", p.padDeadzoneR);
+    drawSliderRow(g, x, y, w, "Right Deadzone", p.padDeadzoneR, 0.05f, 0.50f, buf, Theme::ACCENT_CYAN, DSL_PAD_DZ_R, hoverX, hoverY);
+    y += 29;
+    std::snprintf(buf, sizeof(buf), "%.2fx", p.padLookSens);
+    drawSliderRow(g, x, y, w, "R-Stick Look", p.padLookSens, 0.25f, 3.00f, buf, Theme::ACCENT_AMBER, DSL_PAD_LOOK_SENS, hoverX, hoverY);
+    y += 32;
+
+    // Interactive Controller Diagram Card (all 16 XInput controls clickable)
+    const int diagH = 216;
+    RECT rDiag = { x, y, x + w, y + diagH };
+    GdiPlusDraw::roundedCard(g, rDiag, 9.0f, Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textLeft(g, onNat ? "CONTROLLER DIAGRAM (NATIVE HID ACTIVE)" : "CONTROLLER DIAGRAM (CLICK TO MAP)",
+                          static_cast<float>(x + 10), static_cast<float>(y + 12), 9.5f, true, Theme::TEXT_MUTED, static_cast<float>(w - 20));
+
+    auto drawPadBtn = [&](int bx, int by, int bw, int bh, int padId, const char* shortNm) {
+        RECT rb = { bx, by, bx + bw, by + bh };
+        bool sel = (selectedPadBtn_ == padId);
+        bool hov = ptIn(rb, hoverX, hoverY);
+        bool mapped = (padId >= 0 && padId < PAD_BUTTON_COUNT && !p.padMap[padId].empty());
+        uint32_t bg = sel ? Theme::ACCENT_CYAN_BG : (mapped ? Theme::ACCENT_GREEN_BG : (hov ? Theme::BG_CARD_HOVER : Theme::BG_INPUT));
+        uint32_t bd = sel ? Theme::ACCENT_CYAN : (mapped ? Theme::ACCENT_GREEN : Theme::BORDER_STRONG);
+        GdiPlusDraw::roundedCard(g, rb, 5.0f, bg, bd, sel ? 1.5f : 1.0f);
+        std::string txt = shortNm;
+        if (mapped) {
+            std::string t = p.padMap[padId];
+            if (t.size() > 4) t = t.substr(0, 4);
+            txt += ":" + t;
+        }
+        GdiPlusDraw::textCenter(g, txt, static_cast<float>(rb.left + rb.right) * 0.5f,
+                                static_cast<float>(rb.top + rb.bottom) * 0.5f, 8.6f, true,
+                                sel ? Theme::ACCENT_CYAN : (mapped ? Theme::ACCENT_GREEN : Theme::TEXT_PRIMARY));
+        if (rb.bottom > bodyClip_.top && rb.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rb, DA_PAD_BIND_BTN, padId });
+        }
+    };
+
+    int innerX = x + 10;
+    int innerW = w - 20;
+    int row1Y = y + 26;
+    int bwTop = (innerW - 18) / 4;
+    drawPadBtn(innerX, row1Y, bwTop, 22, PAD_LT, "LT");
+    drawPadBtn(innerX + bwTop + 6, row1Y, bwTop, 22, PAD_LB, "LB");
+    drawPadBtn(innerX + 2 * (bwTop + 6), row1Y, bwTop, 22, PAD_RB, "RB");
+    drawPadBtn(innerX + 3 * (bwTop + 6), row1Y, bwTop, 22, PAD_RT, "RT");
+
+    // Left D-Pad + LS, Center Back/Start, Right Face Diamond + RS
+    int dpadCx = innerX + 46;
+    int dpadCy = y + 92;
+    drawPadBtn(dpadCx - 17, dpadCy - 30, 34, 20, PAD_DPAD_UP, "UP");
+    drawPadBtn(dpadCx - 43, dpadCy - 10, 30, 20, PAD_DPAD_LEFT, "LT");
+    drawPadBtn(dpadCx + 13, dpadCy - 10, 30, 20, PAD_DPAD_RIGHT, "RT");
+    drawPadBtn(dpadCx - 17, dpadCy + 10, 34, 20, PAD_DPAD_DOWN, "DN");
+
+    int midCx = innerX + innerW / 2;
+    drawPadBtn(midCx - 46, y + 66, 42, 22, PAD_BACK, "BACK");
+    drawPadBtn(midCx + 4,  y + 66, 42, 22, PAD_START, "STRT");
+    drawPadBtn(dpadCx - 22, y + 146, 44, 24, PAD_LS, "LS");
+    int faceCx = innerX + innerW - 46;
+    int faceCy = y + 92;
+    drawPadBtn(faceCx - 17, faceCy - 30, 34, 20, PAD_Y, "Y");
+    drawPadBtn(faceCx - 43, faceCy - 10, 30, 20, PAD_X, "X");
+    drawPadBtn(faceCx + 13, faceCy - 10, 30, 20, PAD_B, "B");
+    drawPadBtn(faceCx - 17, faceCy + 10, 34, 20, PAD_A, "A");
+    drawPadBtn(faceCx - 22, y + 146, 44, 24, PAD_RS, "RS");
+
+    GdiPlusDraw::textCenter(g, "Tip: click a button, then click any node on phone",
+                            static_cast<float>(x + w / 2), static_cast<float>(y + 194),
+                            9.2f, false, Theme::TEXT_MUTED);
+    y += diagH + 10;
+
+    // Picker card when a gamepad button is selected
+    if (selectedPadBtn_ >= 0 && selectedPadBtn_ < PAD_BUTTON_COUNT) {
+        std::string hdr = std::string("MAP PAD '") + ProfileDefaults::padButtonDisplayName(selectedPadBtn_) + "' TO NODE:";
+        GdiPlusDraw::textLeft(g, hdr, static_cast<float>(x), static_cast<float>(y + 7), 10.0f, true, Theme::ACCENT_CYAN);
+        y += 20;
+
+        int cw3 = (w - 8) / 3;
+        RECT rClr = { x, y, x + cw3, y + 24 };
+        RECT rFir = { x + cw3 + 4, y, x + 2 * cw3 + 4, y + 24 };
+        RECT rScp = { x + 2 * cw3 + 8, y, x + w, y + 24 };
+        GdiPlusDraw::roundedCard(g, rClr, 5.0f, Theme::BG_INPUT, Theme::BORDER_STRONG, 1.0f);
+        GdiPlusDraw::roundedCard(g, rFir, 5.0f, Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
+        GdiPlusDraw::roundedCard(g, rScp, 5.0f, Theme::ACCENT_PURPLE_BG, Theme::ACCENT_PURPLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Auto", static_cast<float>(rClr.left + rClr.right) * 0.5f, static_cast<float>(y + 12), 10.0f, true, Theme::TEXT_SECONDARY);
+        GdiPlusDraw::textCenter(g, "FIRE", static_cast<float>(rFir.left + rFir.right) * 0.5f, static_cast<float>(y + 12), 10.0f, true, Theme::ACCENT_RED);
+        GdiPlusDraw::textCenter(g, "SCOPE", static_cast<float>(rScp.left + rScp.right) * 0.5f, static_cast<float>(y + 12), 10.0f, true, Theme::ACCENT_PURPLE);
+        if (rClr.bottom > bodyClip_.top && rClr.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rClr, DA_PAD_ASSIGN_TARGET, -1 });
+            hotspots_.push_back(Hotspot{ rFir, DA_PAD_ASSIGN_TARGET, -2 });
+            hotspots_.push_back(Hotspot{ rScp, DA_PAD_ASSIGN_TARGET, -3 });
+        }
+        y += 28;
+
+        int btnColW = (w - 8) / 3;
+        int shown = static_cast<int>(p.buttons.size());
+        if (shown > 12) shown = 12;
+        for (int bi = 0; bi < shown; ++bi) {
+            int col = bi % 3;
+            int row = bi / 3;
+            RECT rN = { x + col * (btnColW + 4), y + row * 26, x + col * (btnColW + 4) + btnColW, y + row * 26 + 22 };
+            bool cur = (!p.padMap[selectedPadBtn_].empty() &&
+                        lstrcmpiA(p.padMap[selectedPadBtn_].c_str(), p.buttons[bi].label.c_str()) == 0);
+            GdiPlusDraw::roundedCard(g, rN, 5.0f, cur ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD,
+                                     cur ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
+            GdiPlusDraw::textCenter(g, p.buttons[bi].label.empty() ? KeyCodes::toName(p.buttons[bi].vk) : p.buttons[bi].label,
+                                    static_cast<float>(rN.left + rN.right) * 0.5f,
+                                    static_cast<float>(rN.top + rN.bottom) * 0.5f, 9.5f, true,
+                                    cur ? Theme::ACCENT_CYAN : Theme::TEXT_PRIMARY);
+            if (rN.bottom > bodyClip_.top && rN.top < bodyClip_.bottom) {
+                hotspots_.push_back(Hotspot{ rN, DA_PAD_ASSIGN_TARGET, bi });
+            }
+        }
+        if (shown > 0) y += ((shown + 2) / 3) * 26 + 4;
+    }
+
+    RECT rRstPad = { x, y, x + w, y + 28 };
+    bool hovRst = ptIn(rRstPad, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rRstPad, 7.0f, hovRst ? Theme::ACCENT_RED_BG : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "Reset Default Pad Mapping", static_cast<float>(x + w / 2), static_cast<float>(y + 14),
+                            10.5f, true, Theme::TEXT_SECONDARY);
+    if (rRstPad.bottom > bodyClip_.top && rRstPad.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rRstPad, DA_PAD_RESET_MAP, 0 });
+    }
+    return rRstPad.bottom + 12;
+}
+
 void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
     normT = clampf(normT, 0.0f, 1.0f);
     for (size_t i = 0; i < sliders_.size(); ++i) {
@@ -1309,6 +1532,14 @@ void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int se
                     p.buttons[selectedBtnIndex].durationMs = static_cast<int>(std::floor(v / 5.0f + 0.5f)) * 5;
                 }
                 break;
+            case DSL_NODE_RADIUS:
+                if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(p.buttons.size())) {
+                    p.buttons[selectedBtnIndex].radius = std::floor(v * 100.0f + 0.5f) / 100.0f;
+                }
+                break;
+            case DSL_PAD_DZ_L:      p.padDeadzoneL = std::floor(v * 100.0f + 0.5f) / 100.0f; break;
+            case DSL_PAD_DZ_R:      p.padDeadzoneR = std::floor(v * 100.0f + 0.5f) / 100.0f; break;
+            case DSL_PAD_LOOK_SENS: p.padLookSens = std::floor(v * 20.0f + 0.5f) / 20.0f; break;
             default: break;
         }
         return;
@@ -1341,6 +1572,14 @@ float DrawerPanel::currentSliderValue(int sliderId, const Profile& p, int select
                 return static_cast<float>(p.buttons[selectedBtnIndex].durationMs);
             }
             return 35.0f;
+        case DSL_NODE_RADIUS:
+            if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(p.buttons.size())) {
+                return p.buttons[selectedBtnIndex].radius;
+            }
+            return 0.11f;
+        case DSL_PAD_DZ_L:      return p.padDeadzoneL;
+        case DSL_PAD_DZ_R:      return p.padDeadzoneR;
+        case DSL_PAD_LOOK_SENS: return p.padLookSens;
         default: return 0.0f;
     }
 }
@@ -1360,8 +1599,8 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
             float w = static_cast<float>(activeSliderTrack_.right - activeSliderTrack_.left);
             float t = (w > 1.0f) ? (static_cast<float>(x - activeSliderTrack_.left) / w) : 0.0f;
             applySliderValue(activeSliderId_, t, profile, selectedBtnIndex);
-            if (activeSliderId_ == DSL_NODE_DUR) out.profileModified = true;
-            else                               out.tuningOnlyModified = true;
+            if (activeSliderId_ == DSL_NODE_DUR || activeSliderId_ == DSL_NODE_RADIUS) out.profileModified = true;
+            else                                                                       out.tuningOnlyModified = true;
             clearFocus();
             return true;
         }
@@ -1383,7 +1622,7 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
     }
 
     switch (hs.id) {
-            case DA_TAB_0: case DA_TAB_1: case DA_TAB_2: case DA_TAB_3:
+            case DA_TAB_0: case DA_TAB_1: case DA_TAB_2: case DA_TAB_3: case DA_TAB_4:
                 setActiveTab(hs.id - DA_TAB_0);
                 return true;
             case DA_CLOSE: out.requestCloseDrawer = true; return true;
@@ -1416,18 +1655,43 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
             case DA_INSP_ACT_PREV:
                 if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
                     KeyNode& b = profile.buttons[selectedBtnIndex];
-                    b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 9) % 10);
+                    b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 10) % 11);
                     if (b.action == NODE_SWIPE && b.x2 == b.x && b.y2 == b.y) { b.x2 = clampf(b.x + 0.12f, 0.02f, 0.98f); b.durationMs = 120; }
+                    if (b.action == NODE_SKILL_CAST) {
+                        if (b.x2 == b.x && b.y2 == b.y) { b.x2 = 0.880f; b.y2 = 0.180f; }
+                        if (b.radius < 0.04f) b.radius = 0.110f;
+                    }
                     out.profileModified = true;
                 }
                 return true;
             case DA_INSP_ACT_NEXT:
                 if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
                     KeyNode& b = profile.buttons[selectedBtnIndex];
-                    b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 1) % 10);
+                    b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 1) % 11);
                     if (b.action == NODE_SWIPE && b.x2 == b.x && b.y2 == b.y) { b.x2 = clampf(b.x + 0.12f, 0.02f, 0.98f); b.durationMs = 120; }
+                    if (b.action == NODE_SKILL_CAST) {
+                        if (b.x2 == b.x && b.y2 == b.y) { b.x2 = 0.880f; b.y2 = 0.180f; }
+                        if (b.radius < 0.04f) b.radius = 0.110f;
+                    }
                     out.profileModified = true;
                 }
+                return true;
+            case DA_INSP_QUICK_CAST:
+                if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
+                    profile.buttons[selectedBtnIndex].quickCast = !profile.buttons[selectedBtnIndex].quickCast;
+                    out.profileModified = true;
+                    out.toastMessage = profile.buttons[selectedBtnIndex].quickCast ? "Quick Cast: ON" : "Quick Cast: OFF (Aim while held)";
+                }
+                return true;
+            case DA_REBIND_CAST_CANCEL:
+                specialRebind_ = SRB_CAST_CANCEL;
+                out.toastMessage = "Press key to cancel held skill casts (e.g. Space)...";
+                return true;
+            case DA_CLEAR_CAST_CANCEL:
+                profile.castCancelVk = 0;
+                out.profileModified = true;
+                out.toastMessage = "Skill Cast Cancel key cleared";
+                return true;
                 return true;
             case DA_INSP_SCOPE:
                 if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
@@ -1680,6 +1944,51 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
             case DA_OPEN_ONBOARDING:
                 out.requestOpenOnboarding = true;
                 return true;
+            case DA_PAD_MODE:
+                profile.padMode = (hs.extra == 1) ? PAD_MODE_NATIVE : PAD_MODE_TOUCH;
+                out.profileModified = true;
+                out.toastMessage = (profile.padMode == PAD_MODE_NATIVE)
+                    ? "Controller: NATIVE UHID passthrough"
+                    : "Controller: Per-Profile TOUCH MAP";
+                return true;
+            case DA_PAD_BIND_BTN:
+                selectedPadBtn_ = (selectedPadBtn_ == hs.extra) ? -1 : hs.extra;
+                if (selectedPadBtn_ >= 0 && selectedPadBtn_ < PAD_BUTTON_COUNT) {
+                    out.toastMessage = std::string("Click a node on phone or pick target for Pad ") +
+                                       ProfileDefaults::padButtonDisplayName(selectedPadBtn_);
+                }
+                return true;
+            case DA_PAD_ASSIGN_TARGET:
+                if (selectedPadBtn_ >= 0 && selectedPadBtn_ < PAD_BUTTON_COUNT) {
+                    int bid = selectedPadBtn_;
+                    if (hs.extra == -1) {
+                        profile.padMap[bid].clear();
+                        out.toastMessage = std::string("Pad ") + ProfileDefaults::padButtonDisplayName(bid) + " -> Auto";
+                    } else if (hs.extra == -2) {
+                        profile.padMap[bid] = "FIRE";
+                        out.toastMessage = std::string("Pad ") + ProfileDefaults::padButtonDisplayName(bid) + " -> FIRE";
+                    } else if (hs.extra == -3) {
+                        profile.padMap[bid] = "SCOPE";
+                        out.toastMessage = std::string("Pad ") + ProfileDefaults::padButtonDisplayName(bid) + " -> SCOPE";
+                    } else if (hs.extra >= 0 && hs.extra < static_cast<int>(profile.buttons.size())) {
+                        std::string tgt = profile.buttons[hs.extra].label;
+                        if (tgt.empty()) tgt = KeyCodes::toName(profile.buttons[hs.extra].vk);
+                        profile.padMap[bid] = tgt;
+                        out.toastMessage = std::string("Pad ") + ProfileDefaults::padButtonDisplayName(bid) + " -> " + tgt;
+                    }
+                    selectedPadBtn_ = -1;
+                    out.profileModified = true;
+                }
+                return true;
+            case DA_PAD_RESET_MAP:
+                for (int pi = 0; pi < PAD_BUTTON_COUNT; ++pi) profile.padMap[pi].clear();
+                profile.padDeadzoneL = 0.24f;
+                profile.padDeadzoneR = 0.27f;
+                profile.padLookSens = 1.00f;
+                selectedPadBtn_ = -1;
+                out.profileModified = true;
+                out.toastMessage = "Reset controller mapping to defaults";
+                return true;
             default:
                 break;
     }
@@ -1692,8 +2001,8 @@ bool DrawerPanel::onMouseMove(int x, int y, Profile& profile, int selectedBtnInd
         float w = static_cast<float>(activeSliderTrack_.right - activeSliderTrack_.left);
         float t = (w > 1.0f) ? (static_cast<float>(x - activeSliderTrack_.left) / w) : 0.0f;
         applySliderValue(activeSliderId_, t, profile, selectedBtnIndex);
-        if (activeSliderId_ == DSL_NODE_DUR) out.profileModified = true;
-        else                               out.tuningOnlyModified = true;
+        if (activeSliderId_ == DSL_NODE_DUR || activeSliderId_ == DSL_NODE_RADIUS) out.profileModified = true;
+        else                                                                       out.tuningOnlyModified = true;
         return true;
     }
     return false;
@@ -1731,6 +2040,7 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
                 case SRB_JOY_RIGHT:   profile.vkRight = vk; break;
                 case SRB_JOY_SPRINT:  profile.vkSprint = vk; break;
                 case SRB_JOY_WALK:    profile.vkWalk = vk; break;
+                case SRB_CAST_CANCEL: profile.castCancelVk = vk; break;
                 default: break;
             }
             out.profileModified = true;
@@ -1803,16 +2113,17 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
                 float cur = currentSliderValue(fi.id, profile, selectedBtnIndex);
                 float norm = (span > 0.0f) ? clampf((cur - fi.minVal) / span, 0.0f, 1.0f) : 0.0f;
                 applySliderValue(fi.id, clampf(norm + dir * 0.05f, 0.0f, 1.0f), profile, selectedBtnIndex);
-                if (fi.id == DSL_NODE_DUR) out.profileModified = true;
-                else                       out.tuningOnlyModified = true;
+                if (fi.id == DSL_NODE_DUR || fi.id == DSL_NODE_RADIUS) out.profileModified = true;
+                else                                                   out.tuningOnlyModified = true;
                 return true;
             }
             auto segGroup = [](int id) -> int {
-                if (id >= DA_TAB_0 && id <= DA_TAB_3) return 1;
+                if (id >= DA_TAB_0 && id <= DA_TAB_4) return 1;
                 if (id == DA_FIRE_CLAW || id == DA_FIRE_DRAG || id == DA_FIRE_DUAL) return 2;
                 if (id == DA_BOUNDS_UNBOUNDED || id == DA_BOUNDS_BOXED) return 3;
                 if (id >= DA_POLL_125 && id <= DA_POLL_MAX) return 4;
                 if (id == DA_JOY_GLIDE || id == DA_JOY_FAST) return 5;
+                if (id == DA_PAD_MODE) return 6;
                 if (id == DA_STREAM_PRESET || id == DA_STREAM_FPS || id == DA_STREAM_BITRATE ||
                     id == DA_STREAM_MAXSIZE || id == DA_CODEC_OPTS || id == DA_VD_PRESET ||
                     id == DA_AUDIO_BUFFER || id == DA_INSP_MOUSE_VK) {

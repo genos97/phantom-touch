@@ -484,6 +484,51 @@ size_t ScrcpyBridge::serializeResizeDisplay(uint8_t* buf, uint16_t width, uint16
     return 5;
 }
 
+size_t ScrcpyBridge::serializeUhidCreate(uint8_t* buf, size_t cap,
+                                         uint16_t id, uint16_t vendorId, uint16_t productId,
+                                         const std::string& name,
+                                         const uint8_t* reportDesc, uint16_t reportDescSize) {
+    if (!buf || (reportDescSize > 0 && !reportDesc)) return 0;
+    size_t nameLen = name.size();
+    if (nameLen > 127) {
+        nameLen = 127;
+        while (nameLen > 0 && (static_cast<unsigned char>(name[nameLen]) & 0xC0u) == 0x80u) {
+            --nameLen;
+        }
+    }
+    const size_t total = 10 + nameLen + static_cast<size_t>(reportDescSize);
+    if (cap < total) return 0;
+
+    buf[0] = 12; // SC_CONTROL_MSG_TYPE_UHID_CREATE
+    writeU16BE(buf + 1, id);
+    writeU16BE(buf + 3, vendorId);
+    writeU16BE(buf + 5, productId);
+    buf[7] = static_cast<uint8_t>(nameLen);
+    if (nameLen > 0) std::memcpy(buf + 8, name.data(), nameLen);
+    writeU16BE(buf + 8 + nameLen, reportDescSize);
+    if (reportDescSize > 0) std::memcpy(buf + 10 + nameLen, reportDesc, reportDescSize);
+    return total;
+}
+
+size_t ScrcpyBridge::serializeUhidInput(uint8_t* buf, size_t cap,
+                                        uint16_t id, const uint8_t* data, uint16_t size) {
+    if (!buf || (size > 0 && !data)) return 0;
+    const size_t total = 5 + static_cast<size_t>(size);
+    if (cap < total) return 0;
+    buf[0] = 13; // SC_CONTROL_MSG_TYPE_UHID_INPUT
+    writeU16BE(buf + 1, id);
+    writeU16BE(buf + 3, size);
+    if (size > 0) std::memcpy(buf + 5, data, size);
+    return total;
+}
+
+size_t ScrcpyBridge::serializeUhidDestroy(uint8_t* buf, size_t cap, uint16_t id) {
+    if (!buf || cap < 3) return 0;
+    buf[0] = 14; // SC_CONTROL_MSG_TYPE_UHID_DESTROY
+    writeU16BE(buf + 1, id);
+    return 3;
+}
+
 bool ScrcpyBridge::isPureAscii(const std::string& utf8) {
     for (size_t i = 0; i < utf8.size(); ++i) {
         if (static_cast<unsigned char>(utf8[i]) >= 0x80u) return false;
@@ -1428,6 +1473,36 @@ bool ScrcpyBridge::sendResizeDisplay(uint16_t width, uint16_t height) {
     if (!connected_) return false;
     std::vector<uint8_t> msg(5);
     size_t len = serializeResizeDisplay(msg.data(), width, height);
+    msg.resize(len);
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,
+                                  const std::string& name, const uint8_t* reportDesc,
+                                  uint16_t reportDescSize) {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(10 + 127 + static_cast<size_t>(reportDescSize));
+    size_t len = serializeUhidCreate(msg.data(), msg.size(), id, vendorId, productId,
+                                     name, reportDesc, reportDescSize);
+    if (len == 0) return false;
+    msg.resize(len);
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendUhidInput(uint16_t id, const uint8_t* data, uint16_t size) {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(5 + static_cast<size_t>(size));
+    size_t len = serializeUhidInput(msg.data(), msg.size(), id, data, size);
+    if (len == 0) return false;
+    msg.resize(len);
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendUhidDestroy(uint16_t id) {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(3);
+    size_t len = serializeUhidDestroy(msg.data(), msg.size(), id);
+    if (len == 0) return false;
     msg.resize(len);
     return enqueueControlPacket(std::move(msg), true);
 }

@@ -15,6 +15,7 @@ enum DrawerActionId {
     DA_TAB_1,
     DA_TAB_2,
     DA_TAB_3,
+    DA_TAB_4,
     DA_CLOSE,
     DA_SAVE,
 
@@ -32,6 +33,9 @@ enum DrawerActionId {
     DA_INSP_TOGGLE_MODE,
     DA_INSP_RSTVIEW,
     DA_INSP_REJOY,
+    DA_INSP_QUICK_CAST,
+    DA_REBIND_CAST_CANCEL,
+    DA_CLEAR_CAST_CANCEL,
     DA_INSP_DELETE,
 
     // Sens & Physics tab
@@ -104,7 +108,13 @@ enum DrawerActionId {
     DA_RUN_LATENCY_PROBE,
     DA_FOCUS_WIRELESS,
     DA_CONNECT_WIRELESS,
-    DA_OPEN_ONBOARDING
+    DA_OPEN_ONBOARDING,
+
+    // Gamepad v2 tab (F6)
+    DA_PAD_MODE,          // extra = 0 (TOUCH) / 1 (NATIVE)
+    DA_PAD_BIND_BTN,      // extra = PadButtonId (0..15)
+    DA_PAD_ASSIGN_TARGET, // extra = -1 (Clear), -2 (FIRE), -3 (SCOPE), >=0 (button idx)
+    DA_PAD_RESET_MAP
 };
 
 struct DrawerActionResult {
@@ -187,6 +197,8 @@ public:
     bool isAdvancedExpanded() const { return advancedExpanded_; }
     bool hasKeyboardFocus() const { return focusedIdx_ >= 0; }
     int focusedIndex() const { return focusedIdx_; }
+    bool hasSelectedPadButton() const { return activeTab_ == 4 && selectedPadBtn_ >= 0 && selectedPadBtn_ < PAD_BUTTON_COUNT; }
+    bool bindSelectedPadButtonToNode(Profile& profile, const std::string& label, std::string& outToast);
 
     void clearFocus() {
         editingNewProfileName_ = false;
@@ -282,11 +294,13 @@ private:
     int paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
                        const AppSettings& s, bool connected, const std::string& deviceLabel,
                        const std::vector<std::string>& logs, int hoverX, int hoverY);
+    int paintTabGamepad(Gdiplus::Graphics& g, int x, int y, int w,
+                        const Profile& p, const AppSettings& s, int hoverX, int hoverY);
 
     RECT bounds_;
     RECT bodyClip_;
     int activeTab_ = 0;
-    int scrollY_[4];
+    int scrollY_[5];
     int maxScrollY_ = 0;
 
     std::vector<Hotspot> hotspots_;
@@ -312,7 +326,8 @@ private:
         SRB_JOY_LEFT,
         SRB_JOY_RIGHT,
         SRB_JOY_SPRINT,
-        SRB_JOY_WALK
+        SRB_JOY_WALK,
+        SRB_CAST_CANCEL
     };
 
     bool editingNewProfileName_ = false;
@@ -325,6 +340,7 @@ private:
     bool devAdvancedExpanded_ = false;
     bool pendingStreamChanges_ = false;
     int pendingStreamChangeCount_ = 0;
+    int selectedPadBtn_ = -1;
     SpecialRebindTarget specialRebind_ = SRB_NONE;
 
     TelemetrySummary vidTelemetry_;

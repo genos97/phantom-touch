@@ -273,6 +273,14 @@ bool ProfileStore::parseFromString(const std::string& text, Profile& outProfile,
         else if (key == "panel_y") p.panelY = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.80f);
         else if (key == "cursor_remember_pos") p.rememberCursorPos = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "cursor_scroll_step_px") p.cursorScrollStepPx = clampi(std::atoi(val.c_str()), 20, 400);
+        else if (key == "cast_center_x") { p.castCenterX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f); sawKnownKey = true; }
+        else if (key == "cast_center_y") { p.castCenterY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f); sawKnownKey = true; }
+        else if (key == "cast_cancel_key") { p.castCancelVk = KeyCodes::fromName(val); sawKnownKey = true; }
+
+        else if (key == "pad_mode") { p.padMode = (toUpper(val) == "NATIVE" || val == "1") ? PAD_MODE_NATIVE : PAD_MODE_TOUCH; sawKnownKey = true; }
+        else if (key == "pad_deadzone_l") { p.padDeadzoneL = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.55f); sawKnownKey = true; }
+        else if (key == "pad_deadzone_r") { p.padDeadzoneR = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.55f); sawKnownKey = true; }
+        else if (key == "pad_look_sens") { p.padLookSens = clampf(static_cast<float>(std::atof(val.c_str())), 0.10f, 4.00f); sawKnownKey = true; }
 
         else if (key == "aim_x") { p.aimX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f); sawKnownKey = true; }
         else if (key == "aim_y") p.aimY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
@@ -345,12 +353,14 @@ bool ProfileStore::parseFromString(const std::string& text, Profile& outProfile,
                 if (parts.size() >= 5) {
                     n.action = ProfileDefaults::nameToActionType(parts[4]);
                 }
+                if (n.action == NODE_SKILL_CAST) n.radius = 0.110f;
                 if (parts.size() >= 6) {
                     std::string sf = toUpper(parts[5]);
                     n.switchScopeSens = (sf == "1" || sf == "TRUE" || sf.find("SCOPE") != std::string::npos);
                     n.toggleMode      = (sf.find("TOGGLE") != std::string::npos);
                     n.resetView       = (sf.find("RSTVIEW") != std::string::npos);
                     n.reactivateJoy   = (sf.find("REJOY") != std::string::npos);
+                    n.quickCast       = (sf.find("QUICKCAST") != std::string::npos);
                 }
                 if (parts.size() >= 7) {
                     n.durationMs = clampi(std::atoi(parts[6].c_str()), 10, 2000);
@@ -359,8 +369,20 @@ bool ProfileStore::parseFromString(const std::string& text, Profile& outProfile,
                     n.x2 = clampf(static_cast<float>(std::atof(parts[7].c_str())), 0.01f, 0.99f);
                     n.y2 = clampf(static_cast<float>(std::atof(parts[8].c_str())), 0.01f, 0.99f);
                 }
+                if (parts.size() >= 10) {
+                    n.radius = clampf(static_cast<float>(std::atof(parts[9].c_str())), 0.015f, 0.35f);
+                }
                 if (n.vk != 0) {
                     p.buttons.push_back(n);
+                }
+            }
+        }
+        else {
+            for (int pi = 0; pi < PAD_BUTTON_COUNT; ++pi) {
+                if (key == ProfileDefaults::padButtonConfigKey(pi)) {
+                    p.padMap[pi] = unescapeCfgField(val);
+                    sawKnownKey = true;
+                    break;
                 }
             }
         }
@@ -401,7 +423,11 @@ std::string ProfileStore::serializeToString(const Profile& p) {
                   p.hudOpacity, p.floatBtnX, p.floatBtnY, p.panelX, p.panelY);
     out << buf;
     out << "cursor_remember_pos = " << (p.rememberCursorPos ? 1 : 0) << "\n";
-    out << "cursor_scroll_step_px = " << p.cursorScrollStepPx << "\n\n";
+    out << "cursor_scroll_step_px = " << p.cursorScrollStepPx << "\n";
+    std::snprintf(buf, sizeof(buf), "cast_center_x = %.4f\ncast_center_y = %.4f\n",
+                  p.castCenterX, p.castCenterY);
+    out << buf;
+    out << "cast_cancel_key = " << KeyCodes::toName(p.castCancelVk) << "\n\n";
 
     out << "# --- Aim, View Stack & Counter-Acceleration Physics ---\n";
     std::snprintf(buf, sizeof(buf), "aim_x = %.4f\naim_y = %.4f\naim_half_w = %.4f\naim_half_h = %.4f\n",
@@ -443,6 +469,18 @@ std::string ProfileStore::serializeToString(const Profile& p) {
     out << "joy_sprint = " << KeyCodes::toName(p.vkSprint) << "\n";
     out << "joy_walk = " << KeyCodes::toName(p.vkWalk) << "\n\n";
 
+    out << "# --- Gamepad v2 ---\n";
+    out << "pad_mode = " << (p.padMode == PAD_MODE_NATIVE ? "native" : "touch") << "\n";
+    std::snprintf(buf, sizeof(buf), "pad_deadzone_l = %.3f\npad_deadzone_r = %.3f\npad_look_sens = %.3f\n",
+                  p.padDeadzoneL, p.padDeadzoneR, p.padLookSens);
+    out << buf;
+    for (int pi = 0; pi < PAD_BUTTON_COUNT; ++pi) {
+        if (!p.padMap[pi].empty()) {
+            out << ProfileDefaults::padButtonConfigKey(pi) << " = " << escapeCfgField(p.padMap[pi]) << "\n";
+        }
+    }
+    out << "\n";
+
     out << "# --- Action Nodes ---\n";
     out << "buttons_explicit = 1\n";
     for (size_t i = 0; i < p.buttons.size(); ++i) {
@@ -450,15 +488,21 @@ std::string ProfileStore::serializeToString(const Profile& p) {
         std::string escLabel = escapeCfgField(b.label);
         std::string keySpec = KeyCodes::comboToName(b.comboVk, b.vk);
         std::string flagsStr;
-        if (b.toggleMode || b.resetView || b.reactivateJoy) {
+        if (b.toggleMode || b.resetView || b.reactivateJoy || b.quickCast) {
             if (b.switchScopeSens) flagsStr += (flagsStr.empty() ? "" : "|") + std::string("SCOPE");
             if (b.toggleMode)      flagsStr += (flagsStr.empty() ? "" : "|") + std::string("TOGGLE");
             if (b.resetView)       flagsStr += (flagsStr.empty() ? "" : "|") + std::string("RSTVIEW");
             if (b.reactivateJoy)   flagsStr += (flagsStr.empty() ? "" : "|") + std::string("REJOY");
+            if (b.quickCast)       flagsStr += (flagsStr.empty() ? "" : "|") + std::string("QUICKCAST");
         } else {
             flagsStr = b.switchScopeSens ? "1" : "0";
         }
-        if (b.action == NODE_SWIPE) {
+        if (b.action == NODE_SKILL_CAST) {
+            std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d, %.4f, %.4f, %.4f\n",
+                          escLabel.c_str(), keySpec.c_str(), b.x, b.y,
+                          ProfileDefaults::actionTypeToName(b.action).c_str(),
+                          flagsStr.c_str(), b.durationMs, b.x2, b.y2, b.radius);
+        } else if (b.action == NODE_SWIPE) {
             std::snprintf(buf, sizeof(buf), "button = %s, %s, %.4f, %.4f, %s, %s, %d, %.4f, %.4f\n",
                           escLabel.c_str(), keySpec.c_str(), b.x, b.y,
                           ProfileDefaults::actionTypeToName(b.action).c_str(),

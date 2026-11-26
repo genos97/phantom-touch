@@ -36,6 +36,7 @@ std::string ProfileDefaults::actionTypeToName(KeyActionType a) {
         case NODE_RESET_VIEW:     return "RESET_VIEW";
         case NODE_SWITCH_SENS:    return "SWITCH_SENS";
         case NODE_REACTIVATE_JOY: return "REACTIVATE_JOY";
+        case NODE_SKILL_CAST:     return "SKILL_CAST";
         default:                  return "PRESS";
     }
 }
@@ -52,6 +53,7 @@ std::string ProfileDefaults::actionTypeToHumanLabel(KeyActionType a) {
         case NODE_RESET_VIEW:     return "Reset Camera";
         case NODE_SWITCH_SENS:    return "Sensitivity Switch";
         case NODE_REACTIVATE_JOY: return "Reset Joystick";
+        case NODE_SKILL_CAST:     return "Skill Cast";
         default:                  return "Hold";
     }
 }
@@ -67,7 +69,28 @@ KeyActionType ProfileDefaults::nameToActionType(const std::string& raw) {
     if (s == "RESET_VIEW")                   return NODE_RESET_VIEW;
     if (s == "SWITCH_SENS")                  return NODE_SWITCH_SENS;
     if (s == "REACTIVATE_JOY")               return NODE_REACTIVATE_JOY;
+    if (s == "SKILL_CAST" || s == "MOBA_CAST") return NODE_SKILL_CAST;
     return NODE_PRESS;
+}
+
+const char* ProfileDefaults::padButtonConfigKey(int padBtnId) {
+    static const char* kKeys[PAD_BUTTON_COUNT] = {
+        "pad_a", "pad_b", "pad_x", "pad_y",
+        "pad_lb", "pad_rb", "pad_lt", "pad_rt",
+        "pad_back", "pad_start", "pad_ls", "pad_rs",
+        "pad_up", "pad_down", "pad_left", "pad_right"
+    };
+    if (padBtnId < 0 || padBtnId >= PAD_BUTTON_COUNT) return "";
+    return kKeys[padBtnId];
+}
+
+const char* ProfileDefaults::padButtonDisplayName(int padBtnId) {
+    static const char* kNames[PAD_BUTTON_COUNT] = {
+        "A", "B", "X", "Y", "LB", "RB", "LT", "RT",
+        "Back", "Start", "LS", "RS", "D-Up", "D-Dn", "D-Lt", "D-Rt"
+    };
+    if (padBtnId < 0 || padBtnId >= PAD_BUTTON_COUNT) return "";
+    return kNames[padBtnId];
 }
 
 Profile ProfileDefaults::createFreeFire() {
@@ -198,7 +221,7 @@ const char* ProfileDefaults::templateName(ProfileTemplateKind kind) {
 
 Profile ProfileDefaults::createTemplate(ProfileTemplateKind kind) {
     auto makeNode = [](const char* label, int vk, KeyActionType act, float x, float y,
-                       float x2 = -1.0f, float y2 = -1.0f, int durMs = 35) {
+                       float x2 = -1.0f, float y2 = -1.0f, int durMs = 35, float radius = -1.0f) {
         KeyNode n;
         n.label = label;
         n.comboVk = 0;
@@ -209,7 +232,7 @@ Profile ProfileDefaults::createTemplate(ProfileTemplateKind kind) {
         n.x2 = (x2 >= 0.0f) ? x2 : x;
         n.y2 = (y2 >= 0.0f) ? y2 : y;
         n.durationMs = durMs;
-        n.radius = 0.030f;
+        n.radius = (radius > 0.0f) ? radius : ((act == NODE_SKILL_CAST) ? 0.110f : 0.030f);
         return n;
     };
 
@@ -220,6 +243,7 @@ Profile ProfileDefaults::createTemplate(ProfileTemplateKind kind) {
             Profile p = createBlank("Controller Basic");
             p.keymapEnabled = false;
             p.showHudInPlay = false;
+            p.padMode = PAD_MODE_NATIVE;
             return p;
         }
         case TMPL_MOBA: {
@@ -230,11 +254,14 @@ Profile ProfileDefaults::createTemplate(ProfileTemplateKind kind) {
             p.joyX = 0.145f;
             p.joyY = 0.760f;
             p.joyRadius = 0.090f;
-            p.buttons.push_back(makeNode("ATTACK", VK_SPACE, NODE_CLICK,         0.895f, 0.840f));
-            p.buttons.push_back(makeNode("SKILL1", 'Q',      NODE_CLICK,         0.775f, 0.815f));
-            p.buttons.push_back(makeNode("SKILL2", 'W',      NODE_CLICK,         0.820f, 0.675f));
-            p.buttons.push_back(makeNode("SKILL3", 'E',      NODE_CLICK,         0.895f, 0.565f));
-            p.buttons.push_back(makeNode("ULT",    'R',      NODE_CLICK,         0.935f, 0.435f));
+            p.castCenterX = 0.500f;
+            p.castCenterY = 0.500f;
+            p.castCancelVk = VK_SPACE;
+            p.buttons.push_back(makeNode("ATTACK", 'C',      NODE_CLICK,         0.895f, 0.840f));
+            p.buttons.push_back(makeNode("SKILL1", 'Q',      NODE_SKILL_CAST,    0.775f, 0.815f, 0.880f, 0.180f, 35, 0.110f));
+            p.buttons.push_back(makeNode("SKILL2", 'W',      NODE_SKILL_CAST,    0.820f, 0.675f, 0.880f, 0.180f, 35, 0.110f));
+            p.buttons.push_back(makeNode("SKILL3", 'E',      NODE_SKILL_CAST,    0.895f, 0.565f, 0.880f, 0.180f, 35, 0.110f));
+            p.buttons.push_back(makeNode("ULT",    'R',      NODE_SKILL_CAST,    0.935f, 0.435f, 0.880f, 0.180f, 35, 0.110f));
             p.buttons.push_back(makeNode("SPELL",  'F',      NODE_CLICK,         0.700f, 0.860f));
             p.buttons.push_back(makeNode("RECALL", 'B',      NODE_CLICK,         0.605f, 0.880f));
             p.buttons.push_back(makeNode("SHOP",   'G',      NODE_CURSOR_TOGGLE, 0.145f, 0.215f));
@@ -381,6 +408,7 @@ Profile ProfileDefaults::resolveLayout(const Profile& src, uint32_t screenW, uin
     mapEdgeAnchored(src.fireX, src.fireY, true, src.refAspect, liveAspect, out.fireX, out.fireY);
     mapEdgeAnchored(src.leftFireX, src.leftFireY, true, src.refAspect, liveAspect, out.leftFireX, out.leftFireY);
     mapEdgeAnchored(src.joyX, src.joyY, true, src.refAspect, liveAspect, out.joyX, out.joyY);
+    mapEdgeAnchored(src.castCenterX, src.castCenterY, true, src.refAspect, liveAspect, out.castCenterX, out.castCenterY);
     for (size_t i = 0; i < out.buttons.size(); ++i) {
         mapEdgeAnchored(src.buttons[i].x, src.buttons[i].y, true, src.refAspect, liveAspect,
                         out.buttons[i].x, out.buttons[i].y);

@@ -603,12 +603,20 @@ HudOverlay::DragTarget HudOverlay::hitTestNode(int px, int py, int& outBtnIdx) c
     float fh = static_cast<float>(h);
 
     Profile p = ProfileDefaults::resolveLayout(host_->hudProfile(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    bool hasSkillCast = false;
     for (int i = static_cast<int>(p.buttons.size()) - 1; i >= 0; --i) {
-        if (p.buttons[i].action != NODE_SWIPE) continue;
+        if (p.buttons[i].action == NODE_SKILL_CAST) hasSkillCast = true;
+        if (p.buttons[i].action != NODE_SWIPE && p.buttons[i].action != NODE_SKILL_CAST) continue;
         float ex = p.buttons[i].x2 * fw;
         float ey = p.buttons[i].y2 * fh;
         float dx = fpx - ex, dy = fpy - ey;
         if (dx * dx + dy * dy <= 14.0f * 14.0f) { outBtnIdx = i; return DRAG_SWIPE_END; }
+    }
+    if (hasSkillCast) {
+        float ccx = p.castCenterX * fw, ccy = p.castCenterY * fh;
+        if ((fpx - ccx) * (fpx - ccx) + (fpy - ccy) * (fpy - ccy) <= 16.0f * 16.0f) {
+            return DRAG_CAST_CENTER;
+        }
     }
     for (int i = static_cast<int>(p.buttons.size()) - 1; i >= 0; --i) {
         const KeyNode& b = p.buttons[i];
@@ -851,6 +859,10 @@ void HudOverlay::onMouseDown(int x, int y, bool rightBtn) {
                     nodeY = p.buttons[btnIdx].y2;
                 }
                 break;
+            case DRAG_CAST_CENTER:
+                nodeX = p.castCenterX;
+                nodeY = p.castCenterY;
+                break;
             default: break;
         }
         // N33: preserve grab offset so node never snaps center onto cursor on click!
@@ -962,6 +974,11 @@ void HudOverlay::onMouseMove(int x, int y) {
                 p.buttons[dragBtnIndex_].y2 = ny;
             }
             break;
+        case DRAG_CAST_CENTER:
+            EditorGeometry::snapAndCollectGuides(p, -1, nx, ny, shiftHeld, activeGuides_);
+            p.castCenterX = nx;
+            p.castCenterY = ny;
+            break;
         default: break;
     }
     // N33: HUD-only redraw during drag — engine & debounced worker save run on onMouseUp!
@@ -1018,7 +1035,10 @@ void HudOverlay::onMouseWheel(int x, int y, int delta) {
     bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     Profile& p = host_->hudProfile();
 
-    if (t == DRAG_JOY) {
+    if (t == DRAG_BUTTON && btnIdx >= 0 && btnIdx < static_cast<int>(p.buttons.size()) &&
+        p.buttons[btnIdx].action == NODE_SKILL_CAST) {
+        p.buttons[btnIdx].radius = clampRange(p.buttons[btnIdx].radius + step, 0.04f, 0.30f);
+    } else if (t == DRAG_JOY) {
         if (shiftHeld) p.joySprintRadius = clampRange(p.joySprintRadius + step, 0.04f, 0.35f);
         else p.joyRadius = clampRange(p.joyRadius + step, 0.03f, 0.25f);
     } else if (t == DRAG_AIM) {
@@ -1230,10 +1250,16 @@ bool HudOverlay::handleKeyDown(int vk) {
     if (vk == 'T' && selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
         undoStack_.push(p, "Change action");
         KeyNode& b = p.buttons[selectedBtnIndex_];
-        b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 1) % 10);
+        b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 1) % 11);
         if (b.action == NODE_SWIPE && b.x2 == b.x && b.y2 == b.y) {
             b.x2 = clamp01(b.x + 0.12f);
             b.durationMs = 120;
+        } else if (b.action == NODE_SKILL_CAST) {
+            if (b.x2 == b.x && b.y2 == b.y) {
+                b.x2 = 0.880f;
+                b.y2 = 0.180f;
+            }
+            if (b.radius < 0.04f) b.radius = 0.110f;
         }
         host_->hudOnProfileChanged(true);
         host_->hudOnToast("Node '" + b.label + "' -> " + ProfileDefaults::actionTypeToHumanLabel(b.action), 1600);

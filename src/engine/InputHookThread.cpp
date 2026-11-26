@@ -318,6 +318,9 @@ LRESULT InputHookThread::handleMouseHook(int nCode, WPARAM wParam, LPARAM lParam
         }
 
         if (!s.nativeVideoActive) {
+            if (wParam == WM_MOUSEMOVE && inVideo && fg) {
+                engine_->onCursorHoverNorm(nx, ny);
+            }
             if (wParam == WM_LBUTTONDOWN && inVideo && fg) {
                 cursorDirectDragging_ = true;
                 engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
@@ -328,6 +331,16 @@ LRESULT InputHookThread::handleMouseHook(int nCode, WPARAM wParam, LPARAM lParam
                 cursorDirectDragging_ = false;
                 engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
                 return 1;
+            } else if (wParam == WM_MBUTTONDOWN && inVideo && fg) {
+                middlePanDragging_ = true;
+                engine_->onDirectCursorTwoFingerPan(TOUCH_DOWN, nx, ny);
+                return 1;
+            } else if (wParam == WM_MOUSEMOVE && middlePanDragging_) {
+                if (inVideo) engine_->onDirectCursorTwoFingerPan(TOUCH_MOVE, nx, ny);
+            } else if (wParam == WM_MBUTTONUP && middlePanDragging_) {
+                middlePanDragging_ = false;
+                engine_->onDirectCursorTwoFingerPan(TOUCH_UP, clamp01(nx), clamp01(ny));
+                return 1;
             } else if (wParam == WM_RBUTTONDOWN && s.rightClickBack && inVideo && fg) {
                 rightClickBackSwallowUp_ = true;
                 if (s.shellHwnd) PostMessageW(s.shellHwnd, MSG_ANDROID_BACK, 0, 0);
@@ -337,8 +350,16 @@ LRESULT InputHookThread::handleMouseHook(int nCode, WPARAM wParam, LPARAM lParam
                 return 1;
             } else if (wParam == WM_MOUSEWHEEL && inVideo && fg) {
                 short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
-                int notches = rawDelta / WHEEL_DELTA;
-                if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
+                DWORD nowT = GetTickCount();
+                if ((rawDelta > 0 && wheelDeltaAccum_ < 0) ||
+                    (rawDelta < 0 && wheelDeltaAccum_ > 0) ||
+                    (nowT - lastWheelTick_) > 350u) {
+                    wheelDeltaAccum_ = 0;
+                }
+                lastWheelTick_ = nowT;
+                wheelDeltaAccum_ += static_cast<int>(rawDelta);
+                int notches = wheelDeltaAccum_ / WHEEL_DELTA;
+                wheelDeltaAccum_ -= notches * WHEEL_DELTA;
                 if (notches != 0) {
                     bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                     if (ctrlHeld) {
@@ -346,8 +367,8 @@ LRESULT InputHookThread::handleMouseHook(int nCode, WPARAM wParam, LPARAM lParam
                     } else {
                         engine_->onDirectCursorScroll(nx, ny, notches);
                     }
-                    return 1;
                 }
+                return 1;
             }
         }
     }

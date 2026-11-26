@@ -101,7 +101,8 @@ private:
         DRAG_FIRE,
         DRAG_LEFT_FIRE,
         DRAG_BUTTON,
-        DRAG_SWIPE_END
+        DRAG_SWIPE_END,
+        DRAG_CAST_CENTER
     };
 
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

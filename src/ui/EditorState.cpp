@@ -154,9 +154,11 @@ std::vector<KeyConflict> EditorGeometry::detectConflicts(const Profile& p, bool 
                 vk == VK_XBUTTON1 || vk == VK_XBUTTON2);
     };
 
+    bool hasSkillCast = false;
     for (size_t i = 0; i < p.buttons.size(); ++i) {
         uint32_t k = bindKey(p.buttons[i].comboVk, p.buttons[i].vk);
         if (p.buttons[i].vk != 0) keyCounts[k]++;
+        if (p.buttons[i].action == NODE_SKILL_CAST) hasSkillCast = true;
     }
 
     for (size_t i = 0; i < p.buttons.size(); ++i) {
@@ -164,15 +166,19 @@ std::vector<KeyConflict> EditorGeometry::detectConflicts(const Profile& p, bool 
         uint32_t k = bindKey(b.comboVk, b.vk);
         bool dup = (b.vk != 0 && keyCounts[k] > 1);
         bool fireClashes = (b.comboVk == 0 && b.vk != 0 && b.vk == p.fireVk);
+        bool cancelClashes = (hasSkillCast && p.castCancelVk != 0 && b.comboVk == 0 && b.vk != 0 &&
+                              KeyCodes::matches(b.vk, p.castCancelVk));
         bool mouseBlocked = (!isAimMode && b.comboVk == 0 && isMouseVk(b.vk));
 
-        if (!dup && !fireClashes && !mouseBlocked) continue;
+        if (!dup && !fireClashes && !cancelClashes && !mouseBlocked) continue;
 
         KeyConflict c;
         c.buttonIndex = static_cast<int>(i);
         c.cannotFireInCursor = mouseBlocked;
         if (fireClashes) {
             c.reason = KeyCodes::comboToName(b.comboVk, b.vk) + " conflicts with Fire key";
+        } else if (cancelClashes) {
+            c.reason = KeyCodes::comboToName(b.comboVk, b.vk) + " conflicts with Skill Cast Cancel key";
         } else if (dup) {
             c.reason = KeyCodes::comboToName(b.comboVk, b.vk) + " is bound multiple times";
         } else {

@@ -302,6 +302,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
     hudOverlay_.create(hwnd_, hInst_);
     tooltipPopup_.create(hwnd_, hInst_);
     modalPopup_.create(hwnd_, hInst_, this);
+    engine_->setPadNavCallback(ShellWindow::onPadNav, this);
 
     InputHookSnapshot initSnap;
     initSnap.shellHwnd = hwnd_;
@@ -2150,9 +2151,12 @@ void ShellWindow::setDrawerState(bool open, int tab) {
         drawerPanel_.clearFocus();
     }
 
-    // N32: ONLY KEYS tab (0) enters Edit Mode unless Test Live is active; SENS/PROFILES/DEVICE stay playable!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && !editTestLive_ && (bridge_->isConnected() || demoMode_));
+    // N32 + F6: Keys tab (0) OR Pad tab (4) while binding a pad button enters Edit Mode so HUD nodes are clickable
+    bool wantEdit = (drawerOpen_ &&
+                     (drawerPanel_.activeTab() == 0 || (drawerPanel_.activeTab() == 4 && drawerPanel_.hasSelectedPadButton())) &&
+                     !editTestLive_ && (bridge_->isConnected() || demoMode_));
     setEditMode(wantEdit);
+    engine_->setShellMenuOpen(drawerOpen_ || activePopup_ != POPUP_NONE);
     layoutChildren();
     if (open && !wasOpen) {
         animator_.start(ANIM_DRAWER_SLIDE, static_cast<float>(metrics_.drawerW()), 0.0f, ANIM_BASE_MS, EASE_OUT_CUBIC, &drawerRc_);
@@ -2388,6 +2392,21 @@ std::string ShellWindow::hudSpecialRebindLabel() const {
 }
 
 void ShellWindow::hudOnSelectionChanged(int newSelectedIdx) {
+    // F6: If picking a HUD target node from Gamepad tab, bind it immediately and return to playable mode!
+    if (newSelectedIdx >= 0 && drawerOpen_ && drawerPanel_.activeTab() == 4 && drawerPanel_.hasSelectedPadButton() &&
+        newSelectedIdx < static_cast<int>(profile_.buttons.size())) {
+        std::string lbl = profile_.buttons[newSelectedIdx].label;
+        if (lbl.empty()) lbl = KeyCodes::toName(profile_.buttons[newSelectedIdx].vk);
+        std::string toastMsg;
+        if (drawerPanel_.bindSelectedPadButtonToNode(profile_, lbl, toastMsg)) {
+            applyProfileToEngine(true);
+            bool wantEdit = (drawerOpen_ && drawerPanel_.hasSelectedPadButton() && (bridge_->isConnected() || demoMode_));
+            setEditMode(wantEdit);
+            if (!toastMsg.empty()) showToast(toastMsg, 2000, TOAST_SUCCESS);
+            invalidateShell();
+            return;
+        }
+    }
     // Clicking a key node while on PROFILES tab immediately opens its Inspector in KEYS tab!
     if (newSelectedIdx >= 0 && drawerOpen_ && drawerPanel_.activeTab() == 2) {
         drawerPanel_.setActiveTab(0);
@@ -2515,10 +2534,10 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         float offset = static_cast<float>((addNodeStagger_++ % 6) * 0.03f);
         n.x = clamp01(0.46f + offset);
         n.y = clamp01(0.54f + offset * 0.6f);
-        n.x2 = (n.action == NODE_SWIPE) ? clamp01(n.x + 0.14f) : n.x;
-        n.y2 = n.y;
+        n.x2 = (n.action == NODE_SKILL_CAST) ? 0.880f : ((n.action == NODE_SWIPE) ? clamp01(n.x + 0.14f) : n.x);
+        n.y2 = (n.action == NODE_SKILL_CAST) ? 0.180f : n.y;
         n.durationMs = (n.action == NODE_SWIPE) ? 120 : 35;
-        n.radius = 0.030f;
+        n.radius = (n.action == NODE_SKILL_CAST) ? 0.110f : 0.030f;
         profile_.buttons.push_back(n);
         int newIdx = static_cast<int>(profile_.buttons.size()) - 1;
         hudOverlay_.startNewNodeCapture(newIdx, beforeAdd);
@@ -2657,8 +2676,10 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         syncHudAndVideo();
     }
 
-    // N32: ONLY KEYS tab (0) enters Edit Mode unless Test Live is active; SENS/PROFILES/DEVICE stay playable!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && !editTestLive_ && (bridge_->isConnected() || demoMode_));
+    // N32 + F6: KEYS tab (0) or PAD tab (4) while picking a node enters Edit Mode
+    bool wantEdit = (drawerOpen_ &&
+                     (drawerPanel_.activeTab() == 0 || (drawerPanel_.activeTab() == 4 && drawerPanel_.hasSelectedPadButton())) &&
+                     !editTestLive_ && (bridge_->isConnected() || demoMode_));
     if (wantEdit != editMode_) {
         setEditMode(wantEdit);
     }
@@ -2931,6 +2952,35 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (activePopup_ == POPUP_CHEAT_SHEET) closePopup();
             else openPopup(POPUP_CHEAT_SHEET);
             return 0;
+        case MSG_PAD_NAV: {
+            uint8_t mask = static_cast<uint8_t>(wParam);
+            if (mask & PAD_NAV_GUIDE) {
+                if (activePopup_ != POPUP_NONE) closePopup();
+                else openPopup(POPUP_CMD_PALETTE);
+            }
+            if (activePopup_ != POPUP_NONE) {
+                if (mask & PAD_NAV_UP)     handlePopupKeyDown(VK_UP);
+                if (mask & PAD_NAV_DOWN)   handlePopupKeyDown(VK_DOWN);
+                if (mask & PAD_NAV_SELECT) handlePopupKeyDown(VK_RETURN);
+                if (mask & PAD_NAV_BACK)   handlePopupKeyDown(VK_ESCAPE);
+            } else if (drawerOpen_) {
+                if (mask & PAD_NAV_BACK) {
+                    setDrawerState(false, drawerPanel_.activeTab());
+                } else {
+                    DrawerActionResult res;
+                    int vk = (mask & (PAD_NAV_DOWN | PAD_NAV_UP)) ? VK_TAB
+                           : (mask & PAD_NAV_LEFT)   ? VK_LEFT
+                           : (mask & PAD_NAV_RIGHT)  ? VK_RIGHT
+                           : (mask & PAD_NAV_SELECT) ? VK_SPACE : 0;
+                    if (vk != 0 && drawerPanel_.onKeyDown(vk, profile_, settings_, hudOverlay_.selectedBtnIndex(), res)) {
+                        handleDrawerResult(res);
+                        syncInputHookSnapshot();
+                        invalidateShell();
+                    }
+                }
+            }
+            return 0;
+        }
         case MSG_TOGGLE_STUDIO:
             if (drawerOpen_ && drawerPanel_.activeTab() == 0) setDrawerState(false, 0);
             else setDrawerState(true, 0);
@@ -3611,6 +3661,19 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
                 }
                 return 0;
+            } else if (middlePanDragging_ && !editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, false)) {
+                    lastCursorNormX_ = nx;
+                    lastCursorNormY_ = ny;
+                    engine_->onDirectCursorTwoFingerPan(TOUCH_MOVE, nx, ny);
+                }
+                return 0;
+            } else if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+                    engine_->onCursorHoverNorm(nx, ny);
+                }
             } else if (editMode_ && viewportHost_.isNativeVideoActive()) {
                 int vx = 0, vy = 0;
                 if (mapShellClientToVideoLocal(mx, my, vx, vy, !d3dHudDragging_)) {
@@ -3687,6 +3750,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 cursorDirectDragging_ = false;
                 engine_->onDirectCursorTouch(TOUCH_UP, lastCursorNormX_, lastCursorNormY_);
             }
+            if (middlePanDragging_) {
+                middlePanDragging_ = false;
+                engine_->onDirectCursorTwoFingerPan(TOUCH_UP, lastCursorNormX_, lastCursorNormY_);
+            }
             if (d3dHudDragging_) {
                 d3dHudDragging_ = false;
                 hudOverlay_.dispatchMouseUp();
@@ -3761,13 +3828,46 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             return 0;
         }
 
-        case WM_MBUTTONDOWN:
+        case WM_MBUTTONDOWN: {
             if (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind()) {
                 hudOnMouseBindToDrawer(VK_MBUTTON);
                 return 0;
             }
             if (hudOverlay_.rebindTarget() != HUD_REBIND_NONE && hudOverlay_.handleMouseBind(VK_MBUTTON)) return 0;
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
+            if (!editMode_ && !aimMode_ && bridge_->isConnected() &&
+                profile_.toggleAimVk != VK_MBUTTON && !engine_->isKeyMapped(VK_MBUTTON, false)) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+                    SetFocus(hwnd);
+                    drawerPanel_.clearFocus();
+                    middlePanDragging_ = true;
+                    lastCursorNormX_ = nx;
+                    lastCursorNormY_ = ny;
+                    SetCapture(hwnd);
+                    engine_->onDirectCursorTwoFingerPan(TOUCH_DOWN, nx, ny);
+                    return 0;
+                }
+            }
             break;
+        }
+
+        case WM_MBUTTONUP: {
+            if (middlePanDragging_) {
+                middlePanDragging_ = false;
+                int mx = static_cast<short>(LOWORD(lParam));
+                int my = static_cast<short>(HIWORD(lParam));
+                float nx = lastCursorNormX_, ny = lastCursorNormY_;
+                mapShellClientToVideoNorm(mx, my, nx, ny, false);
+                lastCursorNormX_ = nx;
+                lastCursorNormY_ = ny;
+                engine_->onDirectCursorTwoFingerPan(TOUCH_UP, nx, ny);
+                if (GetCapture() == hwnd) ReleaseCapture();
+                return 0;
+            }
+            break;
+        }
 
         case WM_XBUTTONDOWN: {
             int xvk = (HIWORD(wParam) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2;
@@ -3829,14 +3929,22 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
                 float nx = 0.0f, ny = 0.0f;
                 if (mapShellClientToVideoNorm(pt.x, pt.y, nx, ny, true)) {
-                    int notches = delta / WHEEL_DELTA;
-                    if (notches == 0 && delta != 0) notches = (delta > 0) ? 1 : -1;
+                    DWORD nowT = GetTickCount();
+                    if ((delta > 0 && wheelDeltaAccum_ < 0) ||
+                        (delta < 0 && wheelDeltaAccum_ > 0) ||
+                        (nowT - lastWheelTick_) > 350u) {
+                        wheelDeltaAccum_ = 0;
+                    }
+                    lastWheelTick_ = nowT;
+                    wheelDeltaAccum_ += delta;
+                    int notches = wheelDeltaAccum_ / WHEEL_DELTA;
+                    wheelDeltaAccum_ -= notches * WHEEL_DELTA;
                     if (notches != 0) {
                         bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                         if (ctrlHeld) engine_->onDirectCursorPinch(nx, ny, notches);
                         else          engine_->onDirectCursorScroll(nx, ny, notches);
-                        return 0;
                     }
+                    return 0;
                 }
             }
             break;
@@ -4593,6 +4701,8 @@ void ShellWindow::initCommandPalette() {
     addCmd("drawer.sens",     "Open Sensitivity & Aim Physics",    "sens dpi accel fire joy",      "",            "Studio");
     addCmd("drawer.profiles", "Open Profiles Manager",             "profile config template import","",            "Profiles");
     addCmd("drawer.device",   "Open Device & Stream Settings",     "device stream fps bitrate adb","",            "Device");
+    addCmd("tab.gamepad",     "Open Gamepad & Controller Tab",     "gamepad pad controller uhid",   "",            "Gamepad");
+    addCmd("pad.mode",        "Switch Gamepad Touch / Native UHID","gamepad uhid native touch mode","",            "Gamepad");
     addCmd("fire.cycle",      "Cycle Fire Mode",                   "fire drag claw dual",          "F3",          "Play");
     addCmd("hud.toggle",      "Toggle HUD Overlay Badges",         "hud hide show opacity",        "F4",          "Play");
     addCmd("touch.reset",     "Reset All Virtual Touches",         "reset unstick release",        "F5",          "Play");
@@ -4689,6 +4799,7 @@ void ShellWindow::openPopup(int modeInt) {
     ClientToScreen(hwnd_, &tl);
     RECT scrRc = { tl.x, tl.y, tl.x + (localRc.right - localRc.left), tl.y + (localRc.bottom - localRc.top) };
     modalPopup_.showBounds(scrRc);
+    engine_->setShellMenuOpen(true);
     syncInputHookSnapshot();
 }
 
@@ -4699,7 +4810,15 @@ void ShellWindow::closePopup() {
     popupFiltered_.clear();
     popupRowRects_.clear();
     modalPopup_.hide();
+    engine_->setShellMenuOpen(drawerOpen_);
     syncInputHookSnapshot();
+}
+
+void ShellWindow::onPadNav(void* ctx, uint8_t navMask) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (self && self->hwnd_ && navMask != 0) {
+        PostMessageW(self->hwnd_, MSG_PAD_NAV, static_cast<WPARAM>(navMask), 0);
+    }
 }
 
 void ShellWindow::executeCommandById(const std::string& cmdId) {
@@ -4717,6 +4836,14 @@ void ShellWindow::executeCommandById(const std::string& cmdId) {
     if (cmdId == "drawer.sens")     { setDrawerState(true, 1); return; }
     if (cmdId == "drawer.profiles") { setDrawerState(true, 2); return; }
     if (cmdId == "drawer.device")   { setDrawerState(true, 3); return; }
+    if (cmdId == "tab.gamepad")     { setDrawerState(true, 4); return; }
+    if (cmdId == "pad.mode") {
+        profile_.padMode = (profile_.padMode == PAD_MODE_NATIVE) ? PAD_MODE_TOUCH : PAD_MODE_NATIVE;
+        applyProfileToEngine(true);
+        invalidateShell();
+        showToast(profile_.padMode == PAD_MODE_NATIVE ? "Controller: NATIVE UHID" : "Controller: TOUCH MAP", 1800, TOAST_INFO);
+        return;
+    }
     if (cmdId == "fire.cycle")      { toggleFireMode(); return; }
     if (cmdId == "hud.toggle")      { toggleHud(); return; }
     if (cmdId == "touch.reset")     { triggerQuickReset(); return; }

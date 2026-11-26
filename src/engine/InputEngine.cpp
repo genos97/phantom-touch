@@ -124,6 +124,8 @@ void InputEngine::rebuildKeyRouteCacheLocked() {
     routeVkSprint_ = profile_.vkSprint;
     routeVkWalk_   = profile_.vkWalk;
     routeFireVk_   = profile_.fireVk;
+    routeCastCancelVk_ = profile_.castCancelVk;
+    routeHasSkillCast_ = false;
     routeButtons_.clear();
     routeButtons_.reserve(profile_.buttons.size());
     for (size_t i = 0; i < profile_.buttons.size(); ++i) {
@@ -131,6 +133,7 @@ void InputEngine::rebuildKeyRouteCacheLocked() {
         e.comboVk = profile_.buttons[i].comboVk;
         e.vk      = profile_.buttons[i].vk;
         e.action  = profile_.buttons[i].action;
+        if (e.action == NODE_SKILL_CAST) routeHasSkillCast_ = true;
         routeButtons_.push_back(e);
     }
 }
@@ -254,6 +257,10 @@ void InputEngine::updateTuning(const Profile& profile) {
         dst.joySteppedGlide    = profile.joySteppedGlide;
         dst.fireBoxHalfW       = profile.fireBoxHalfW;
         dst.fireBoxHalfH       = profile.fireBoxHalfH;
+        dst.padMode            = profile.padMode;
+        dst.padDeadzoneL       = profile.padDeadzoneL;
+        dst.padDeadzoneR       = profile.padDeadzoneR;
+        dst.padLookSens        = profile.padLookSens;
     };
     copyTuning(rawProfile_);
     copyTuning(profile_);
@@ -275,9 +282,34 @@ void InputEngine::setGamepadEnabled(bool enabled) {
     EnterCriticalSection(&lock_);
     gamepad_.setEnabled(enabled);
     if (!enabled) {
-        gamepad_.releaseAll(packetsThisSec_);
+        uint32_t w = 1920, h = 1080;
+        bridge_->getScreenSize(w, h);
+        GamepadFrameOutput gpOut;
+        gamepad_.pollAndProcess(profile_, w, h, 0.0, packetsThisSec_, gpOut, true, shellMenuOpen_ != 0);
+        for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
+            processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, getTimeMs(), true);
+        }
+        if (gpOut.uhidNeedDestroy) {
+            bridge_->sendUhidDestroy(3);
+        }
         if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
+        prevGpStickDeflected_ = false;
     }
+    LeaveCriticalSection(&lock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+void InputEngine::setShellMenuOpen(bool open) {
+    LONG val = open ? 1 : 0;
+    if (InterlockedExchange(&shellMenuOpen_, val) != val && wakeEvent_) {
+        SetEvent(wakeEvent_);
+    }
+}
+
+void InputEngine::setPadNavCallback(PadNavCallbackFn fn, void* ctx) {
+    EnterCriticalSection(&lock_);
+    padNavCb_ = fn;
+    padNavCtx_ = ctx;
     LeaveCriticalSection(&lock_);
 }
 
@@ -335,6 +367,24 @@ void InputEngine::onRawMouseDelta(int dx, int dy) {
     if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
+void InputEngine::onCursorHoverNorm(float normX, float normY) {
+    if (normX < 0.0f) normX = 0.0f;
+    if (normX > 1.0f) normX = 1.0f;
+    if (normY < 0.0f) normY = 0.0f;
+    if (normY > 1.0f) normY = 1.0f;
+    EnterCriticalSection(&inputLock_);
+    cursorHoverNormX_ = normX;
+    cursorHoverNormY_ = normY;
+    LeaveCriticalSection(&inputLock_);
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        actions_.setCursorNorm(normX, normY);
+        LeaveCriticalSection(&lock_);
+    } else if (actions_.hasActiveSkillCast() && wakeEvent_) {
+        SetEvent(wakeEvent_);
+    }
+}
+
 void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float normY) {
     if (aimMode_) return;
     if (thread_ == NULL) {
@@ -344,11 +394,35 @@ void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float nor
         return;
     }
     EnterCriticalSection(&inputLock_);
-    if (action == TOUCH_MOVE && !pendingCursor_.empty() && pendingCursor_.back().action == TOUCH_MOVE) {
+    cursorHoverNormX_ = static_cast<float>(clampd(normX, 0.0, 1.0));
+    cursorHoverNormY_ = static_cast<float>(clampd(normY, 0.0, 1.0));
+    if (action == TOUCH_MOVE && !pendingCursor_.empty() &&
+        pendingCursor_.back().action == TOUCH_MOVE && !pendingCursor_.back().twoFingerPan) {
         pendingCursor_.back().normX = normX;
         pendingCursor_.back().normY = normY;
     } else {
-        QueuedCursorTouch q = { action, normX, normY };
+        QueuedCursorTouch q = { action, normX, normY, false };
+        pendingCursor_.push_back(q);
+    }
+    LeaveCriticalSection(&inputLock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+void InputEngine::onDirectCursorTwoFingerPan(TouchAction action, float normX, float normY) {
+    if (aimMode_) return;
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        processDirectCursorTwoFingerPanLocked(action, normX, normY);
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+    EnterCriticalSection(&inputLock_);
+    if (action == TOUCH_MOVE && !pendingCursor_.empty() &&
+        pendingCursor_.back().action == TOUCH_MOVE && pendingCursor_.back().twoFingerPan) {
+        pendingCursor_.back().normX = normX;
+        pendingCursor_.back().normY = normY;
+    } else {
+        QueuedCursorTouch q = { action, normX, normY, true };
         pendingCursor_.push_back(q);
     }
     LeaveCriticalSection(&inputLock_);
@@ -402,10 +476,13 @@ void InputEngine::onDirectCursorPinch(float normX, float normY, int wheelNotches
 void InputEngine::processDirectCursorLocked(TouchAction action, float normX, float normY) {
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
+    actions_.setCursorNorm(normX, normY);
     int32_t px = static_cast<int32_t>(normX * static_cast<float>(w) + 0.5f);
     int32_t py = static_cast<int32_t>(normY * static_cast<float>(h) + 0.5f);
 
     if (action == TOUCH_DOWN) {
+        releaseCursorPinchLocked();
+        releaseCursorTwoFingerPanLocked();
         directCursorDown_ = true;
         directCursorLastX_ = px;
         directCursorLastY_ = py;
@@ -430,8 +507,51 @@ void InputEngine::processDirectCursorLocked(TouchAction action, float normX, flo
     }
 }
 
+void InputEngine::processDirectCursorTwoFingerPanLocked(TouchAction action, float normX, float normY) {
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    int32_t maxX = static_cast<int32_t>(w > 10 ? w - 5 : 1915);
+    int32_t maxY = static_cast<int32_t>(h > 10 ? h - 5 : 1075);
+    auto clampX = [&](int32_t v) -> int32_t { return (v < 4) ? 4 : (v > maxX ? maxX : v); };
+    auto clampY = [&](int32_t v) -> int32_t { return (v < 4) ? 4 : (v > maxY ? maxY : v); };
+    int32_t px = clampX(static_cast<int32_t>(normX * static_cast<float>(w) + 0.5f));
+    int32_t py = clampY(static_cast<int32_t>(normY * static_cast<float>(h) + 0.5f));
+    const int32_t spread = 48;
+
+    if (action == TOUCH_DOWN) {
+        releaseCursorPinchLocked();
+        releaseCursorScrollLocked();
+        twoFingerPanDown_ = true;
+        twoFingerPanLastX_ = px;
+        twoFingerPanLastY_ = py;
+        fingerPool_.emit(TOUCH_DOWN, PointerId::PINCH_A, clampX(px - spread), py, true);
+        fingerPool_.emit(TOUCH_DOWN, PointerId::PINCH_B, clampX(px + spread), py, true);
+        packetsThisSec_ += 2;
+    } else if (action == TOUCH_MOVE) {
+        if (twoFingerPanDown_ && (px != twoFingerPanLastX_ || py != twoFingerPanLastY_)) {
+            twoFingerPanLastX_ = px;
+            twoFingerPanLastY_ = py;
+            if (fingerPool_.emit(TOUCH_MOVE, PointerId::PINCH_A, clampX(px - spread), py, true)) ++packetsThisSec_;
+            if (fingerPool_.emit(TOUCH_MOVE, PointerId::PINCH_B, clampX(px + spread), py, true)) ++packetsThisSec_;
+        }
+    } else if (action == TOUCH_UP) {
+        releaseCursorTwoFingerPanLocked();
+    }
+}
+
+void InputEngine::releaseCursorTwoFingerPanLocked() {
+    if (twoFingerPanDown_) {
+        fingerPool_.releaseLogical(PointerId::PINCH_A);
+        fingerPool_.releaseLogical(PointerId::PINCH_B);
+        twoFingerPanDown_ = false;
+        packetsThisSec_ += 2;
+    }
+}
+
 void InputEngine::processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs) {
     if (wheelNotches == 0) return;
+    releaseCursorPinchLocked();
+    releaseCursorTwoFingerPanLocked();
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
     double dw = static_cast<double>(w > 0 ? w : 1920);
@@ -485,6 +605,7 @@ void InputEngine::releaseCursorScrollLocked() {
 void InputEngine::processDirectCursorPinchLocked(float normX, float normY, int wheelNotches, double nowMs) {
     if (wheelNotches == 0) return;
     releaseCursorScrollLocked();
+    releaseCursorTwoFingerPanLocked();
 
     uint32_t w = 1920, h = 1080;
     bridge_->getScreenSize(w, h);
@@ -594,6 +715,9 @@ bool InputEngine::classifyKeyInputLocked(int vk, bool down, bool isAim, bool& ou
         return true;
     }
     if ((isAim || !KeyCodes::isMouseKey(routeFireVk_)) && KeyCodes::matches(vk, routeFireVk_)) {
+        return true;
+    }
+    if (routeHasSkillCast_ && routeCastCancelVk_ != 0 && KeyCodes::matches(vk, routeCastCancelVk_)) {
         return true;
     }
     return hasCustomBtn;
@@ -756,7 +880,14 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs, bool fr
         return;
     }
 
-    // 4. Action Buttons (2-level combo lookup + 10 KeyActionType behaviors)
+    if (down && profile_.castCancelVk != 0 && KeyCodes::matches(vk, profile_.castCancelVk) &&
+        actions_.hasActiveSkillCast()) {
+        if (actions_.cancelActiveSkillCasts(profile_, w, h, packetsThisSec_)) {
+            return;
+        }
+    }
+
+    // 4. Action Buttons (2-level combo lookup + 11 KeyActionType behaviors)
     ActionEffects eff;
     actions_.dispatchKey(vk, down, (isAim || fromGamepad), profile_, heldKeys_, w, h, nowMs,
                          scopeSensActive_, eff, packetsThisSec_);
@@ -874,12 +1005,17 @@ void InputEngine::releaseMouseTouchesLocked() {
     }
     releaseCursorScrollLocked();
     releaseCursorPinchLocked();
+    releaseCursorTwoFingerPanLocked();
 }
 
 void InputEngine::releaseAllLocked() {
     releaseMouseTouchesLocked();
     joystick_.release(packetsThisSec_);
     gamepad_.releaseAll(packetsThisSec_);
+    if (gamepad_.isUhidCreated()) {
+        bridge_->sendUhidDestroy(3);
+        gamepad_.markUhidDestroyed();
+    }
     joyOwner_ = JOY_NONE;
     prevGpStickDeflected_ = false;
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
@@ -917,13 +1053,17 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     std::vector<QueuedKeyEvent> localKeys;
     std::vector<QueuedCursorTouch> localCursor;
     std::vector<QueuedCursorScroll> localScroll;
+    float curHoverX = 0.5f, curHoverY = 0.5f;
     EnterCriticalSection(&inputLock_);
     if (!pendingKeys_.empty()) localKeys.swap(pendingKeys_);
     if (!pendingCursor_.empty()) localCursor.swap(pendingCursor_);
     if (!pendingScroll_.empty()) localScroll.swap(pendingScroll_);
+    curHoverX = cursorHoverNormX_;
+    curHoverY = cursorHoverNormY_;
     LeaveCriticalSection(&inputLock_);
 
     EnterCriticalSection(&lock_);
+    actions_.setCursorNorm(curHoverX, curHoverY);
 
     if (nowMs - lastStatMs_ >= 1000.0) {
         lastPacketsPerSec_ = packetsThisSec_;
@@ -939,7 +1079,11 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     }
     for (size_t i = 0; i < localCursor.size(); ++i) {
         if (!aimMode_) {
-            processDirectCursorLocked(localCursor[i].action, localCursor[i].normX, localCursor[i].normY);
+            if (localCursor[i].twoFingerPan) {
+                processDirectCursorTwoFingerPanLocked(localCursor[i].action, localCursor[i].normX, localCursor[i].normY);
+            } else {
+                processDirectCursorLocked(localCursor[i].action, localCursor[i].normX, localCursor[i].normY);
+            }
         }
     }
     for (size_t i = 0; i < localScroll.size(); ++i) {
@@ -955,20 +1099,24 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     }
 
     GamepadFrameOutput gpOut;
+    uint8_t navMask = 0;
     if (runPeriodic) {
         actions_.tick(profile_, nowMs, packetsThisSec_);
         joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
 
-        // Stage 3: XInput Gamepad-to-Touch polling (E3 single joystick owner + E4 focus/edit gating)
+        // Stage 3 / F6: XInput Gamepad-to-Touch & UHID polling (E3/E4/E11/shell nav)
         double dtMs = (lastTickMs_ > 0.0) ? clampd(nowMs - lastTickMs_, 0.5, 40.0) : 4.0;
         lastTickMs_ = nowMs;
+        bool wantGamepad = profile_.keymapEnabled || (profile_.padMode == PAD_MODE_NATIVE) ||
+                           gamepad_.isConnected() || gamepad_.isUhidCreated();
         if (appFocused_ == 0 || editMode_ != 0) {
             gamepad_.suspendForFocusLoss(packetsThisSec_, gpOut);
             if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
             prevGpStickDeflected_ = false;
-        } else if (profile_.keymapEnabled) {
+        } else if (wantGamepad) {
             bool kbOwnsJoy = (joyOwner_ == JOY_KEYBOARD);
-            gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut, kbOwnsJoy);
+            bool menuOpen = (shellMenuOpen_ != 0);
+            gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut, kbOwnsJoy, menuOpen);
             if (gpOut.stickDeflected && !prevGpStickDeflected_ && kbOwnsJoy) {
                 joystick_.release(packetsThisSec_);
                 joyOwner_ = JOY_GAMEPAD;
@@ -979,6 +1127,18 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
             }
             prevGpStickDeflected_ = gpOut.stickDeflected;
         }
+        if (gpOut.uhidNeedCreate) {
+            uint16_t dSz = 0;
+            const uint8_t* desc = GamepadController::hidReportDescriptor(dSz);
+            bridge_->sendUhidCreate(3, 0x045E, 0x028E, "PhantomTouch Gamepad", desc, dSz);
+        }
+        if (gpOut.uhidReportChanged) {
+            bridge_->sendUhidInput(3, gpOut.uhidReport, 15);
+        }
+        if (gpOut.uhidNeedDestroy) {
+            bridge_->sendUhidDestroy(3);
+        }
+        navMask = gpOut.shellNavMask;
         for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
             processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs, true);
         }
@@ -988,6 +1148,9 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
         }
         if (cursorPinchDown_ && (aimMode_ || nowMs >= pinchReleaseAtMs_)) {
             releaseCursorPinchLocked();
+        }
+        if (twoFingerPanDown_ && aimMode_) {
+            releaseCursorTwoFingerPanLocked();
         }
 
         if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {
@@ -1004,7 +1167,7 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     auto computeNeedsFastTicks = [&]() -> bool {
         return joystick_.isDown() || gamepad_.isConnected() ||
                fireDown_ || fireHeld_ || pendingFireDown_ ||
-               directCursorDown_ || cursorScrollDown_ || cursorPinchDown_ ||
+               directCursorDown_ || cursorScrollDown_ || cursorPinchDown_ || twoFingerPanDown_ ||
                viewStack_.mainView().isFingerPlaced() || viewStack_.isOverlayActive() ||
                actions_.hasActiveTasks() ||
                std::fabs(smoothDx_) > 0.01 || std::fabs(smoothDy_) > 0.01;
@@ -1012,7 +1175,10 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
 
     if ((!aimMode_ && !hasGpLook && !viewStack_.mainView().isFingerPlaced()) || pendingFireDown_) {
         bool fast = computeNeedsFastTicks();
+        PadNavCallbackFn cb = padNavCb_;
+        void* ctx = padNavCtx_;
         LeaveCriticalSection(&lock_);
+        if (cb && navMask != 0) cb(ctx, navMask);
         return fast;
     }
 
@@ -1082,7 +1248,10 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
             viewStack_.onMouseDelta(feedDx, feedDy, 1.0, 1.0, nowMs, packetsThisSec_);
         }
         viewStack_.tick(nowMs, true, packetsThisSec_);
+        PadNavCallbackFn cb = padNavCb_;
+        void* ctx = padNavCtx_;
         LeaveCriticalSection(&lock_);
+        if (cb && navMask != 0) cb(ctx, navMask);
         return true;
     }
 
@@ -1139,7 +1308,10 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     }
 
     bool fast = hasFeed || computeNeedsFastTicks();
+    PadNavCallbackFn cb = padNavCb_;
+    void* ctx = padNavCtx_;
     LeaveCriticalSection(&lock_);
+    if (cb && navMask != 0) cb(ctx, navMask);
     return fast;
 }
 

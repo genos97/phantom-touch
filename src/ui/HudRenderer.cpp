@@ -23,6 +23,7 @@ uint32_t nodeAccentRgb(KeyActionType act) {
         case NODE_RESET_VIEW:
         case NODE_SWITCH_SENS:
         case NODE_REACTIVATE_JOY: return Theme::HUD_TOGGLE & 0x00FFFFFFu;
+        case NODE_SKILL_CAST:     return 0x38D9A9u;
         default:                  return 0xDCE8FAu;
     }
 }
@@ -234,6 +235,23 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
     // =========================================================================
     // 4. Action Nodes — minimalist translucent rounded keycaps!
     // =========================================================================
+    bool hasSkillCastNode = false;
+    for (size_t i = 0; i < profile.buttons.size(); ++i) {
+        if (profile.buttons[i].action == NODE_SKILL_CAST) {
+            hasSkillCastNode = true;
+            break;
+        }
+    }
+    if (editMode && hasSkillCastNode) {
+        float ccx = profile.castCenterX * fw;
+        float ccy = profile.castCenterY * fh;
+        Gdiplus::Pen ccPen(GdiPlusDraw::argb(withAlpha(0x38D9A9u, 0.88f)), 1.4f);
+        g.DrawEllipse(&ccPen, ccx - 10.0f, ccy - 10.0f, 20.0f, 20.0f);
+        g.DrawLine(&ccPen, ccx - 14.0f, ccy, ccx + 14.0f, ccy);
+        g.DrawLine(&ccPen, ccx, ccy - 14.0f, ccx, ccy + 14.0f);
+        drawSubtleText(g, "CAST CTR", ccx, ccy + 18.0f, 8.5f, true, withAlpha(0x38D9A9u, 0.92f));
+    }
+
     for (size_t i = 0; i < profile.buttons.size(); ++i) {
         const KeyNode& b = profile.buttons[i];
         float bx = b.x * fw;
@@ -261,7 +279,7 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
         bool hovered  = editMode && (static_cast<int>(i) == hoveredBtnIndex);
         uint32_t accentRgb = nodeAccentRgb(b.action);
 
-        // Smooth vector swipe trajectory (Edit Mode only)
+        // Smooth vector swipe trajectory or MOBA skill-cast radius + cancel zone (Edit Mode only)
         if (editMode && b.action == NODE_SWIPE) {
             float bx2 = b.x2 * fw;
             float by2 = b.y2 * fh;
@@ -271,6 +289,21 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
             drawFrostedCap(g, bx2, by2, 16.0f, 16.0f, 8.0f,
                            withAlpha(0x2A1E0Cu, 0.88f), withAlpha(0xFFB84Du, 0.95f), 1.5f);
             drawSubtleText(g, "END", bx2, by2 + 14.0f, 8.5f, true, withAlpha(0xFFD488u, 0.9f));
+        } else if (editMode && b.action == NODE_SKILL_CAST) {
+            float minDim = (fw < fh) ? fw : fh;
+            float rPx = (b.radius > 0.01f ? b.radius : 0.110f) * minDim;
+            Gdiplus::Pen scPen(GdiPlusDraw::argb(withAlpha(0x38D9A9u, 0.55f)), 1.3f);
+            scPen.SetDashStyle(Gdiplus::DashStyleDash);
+            g.DrawEllipse(&scPen, bx - rPx, by - rPx, rPx * 2.0f, rPx * 2.0f);
+
+            float cx2 = b.x2 * fw;
+            float cy2 = b.y2 * fh;
+            Gdiplus::Pen cnPen(GdiPlusDraw::argb(withAlpha(0xFF5C6Cu, 0.60f)), 1.2f);
+            cnPen.SetDashStyle(Gdiplus::DashStyleDash);
+            g.DrawLine(&cnPen, bx, by, cx2, cy2);
+            drawFrostedCap(g, cx2, cy2, 18.0f, 18.0f, 9.0f,
+                           withAlpha(0x2A1016u, 0.88f), withAlpha(0xFF5C6Cu, 0.95f), 1.4f);
+            drawSubtleText(g, "CNL", cx2, cy2 + 15.0f, 8.2f, true, withAlpha(0xFF9AA6u, 0.90f));
         }
 
         std::string keyTxt = (selected && static_cast<int>(i) == selectedBtnIndex && waitingButtonRebind)
@@ -337,6 +370,8 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                     Gdiplus::PointF(gx - 2.0f, gy + 2.0f)
                 };
                 g.DrawLines(&gPen, ar, 3);
+            } else if (b.action == NODE_SKILL_CAST) {
+                g.DrawEllipse(&gPen, gx - 2.2f, gy - 2.2f, 4.4f, 4.4f);
             } else if (b.action == NODE_HOLD_VIEW || b.action == NODE_CURSOR_TOGGLE ||
                        b.action == NODE_RESET_VIEW || b.action == NODE_SWITCH_SENS ||
                        b.action == NODE_REACTIVATE_JOY) {
