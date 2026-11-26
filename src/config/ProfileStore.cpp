@@ -108,6 +108,58 @@ std::vector<std::string> splitUnescapedComma(const std::string& val) {
     return parts;
 }
 
+std::string baseNameNoExt(const std::string& path) {
+    size_t sl = path.find_last_of("\\/");
+    std::string fname = (sl == std::string::npos) ? path : path.substr(sl + 1);
+    size_t dot = fname.find_last_of('.');
+    return (dot == std::string::npos) ? fname : fname.substr(0, dot);
+}
+
+std::wstring utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), NULL, 0);
+    if (wlen <= 0) {
+        std::wstring fb;
+        for (size_t i = 0; i < utf8.size(); ++i) fb.push_back(static_cast<wchar_t>(static_cast<unsigned char>(utf8[i])));
+        return fb;
+    }
+    std::wstring ws(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), &ws[0], wlen);
+    return ws;
+}
+
+bool readFileUtf8(const std::string& utf8Path, std::string& outText, std::string* outErr) {
+    outText.clear();
+    std::wstring wp = utf8ToWide(utf8Path);
+    if (wp.empty()) {
+        if (outErr) *outErr = "Empty file path.";
+        return false;
+    }
+    HANDLE hf = CreateFileW(wp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        if (outErr) *outErr = "Could not open file: " + utf8Path;
+        return false;
+    }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(hf, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (2 * 1024 * 1024)) {
+        CloseHandle(hf);
+        if (outErr) *outErr = "Profile file is empty or exceeds 2 MB.";
+        return false;
+    }
+    outText.resize(static_cast<size_t>(sz.QuadPart));
+    DWORD totalRead = 0;
+    while (totalRead < static_cast<DWORD>(outText.size())) {
+        DWORD chunk = 0;
+        if (!ReadFile(hf, &outText[totalRead], static_cast<DWORD>(outText.size()) - totalRead, &chunk, NULL) || chunk == 0) {
+            break;
+        }
+        totalRead += chunk;
+    }
+    CloseHandle(hf);
+    outText.resize(totalRead);
+    return !outText.empty();
+}
+
 } // namespace
 
 std::vector<std::string> ProfileStore::listProfiles(const std::string& profilesDir) {
@@ -177,16 +229,22 @@ void ProfileStore::saveLastActive(const std::string& profilesDir, const std::str
     }
 }
 
-bool ProfileStore::load(const std::string& path, Profile& outProfile) {
-    std::ifstream in(path.c_str());
-    if (!in.is_open()) return false;
+bool ProfileStore::parseFromString(const std::string& text, Profile& outProfile, std::string* outError) {
+    if (text.empty()) {
+        if (outError) *outError = "Profile text is empty.";
+        return false;
+    }
 
     Profile p = ProfileDefaults::createFreeFire();
     p.appPackage.clear(); // Only auto-link if explicitly configured in the .cfg file
     bool sawAnyButton = false;
+    bool sawKnownKey = false;
 
+    std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.find("# phantom-touch-profile v") == 0) sawKnownKey = true;
         line = trim(stripUnescapedComment(line));
         if (line.empty()) continue;
 
@@ -196,15 +254,15 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         std::string key = trim(line.substr(0, eq));
         std::string val = trim(line.substr(eq + 1));
 
-        if (key == "name") p.name = unescapeCfgField(val);
-        else if (key == "app_package") p.appPackage = val;
-        else if (key == "keymap_enabled") p.keymapEnabled = (val == "1" || toUpper(val) == "TRUE");
-        else if (key == "edge_anchored") p.edgeAnchored = (val == "1" || toUpper(val) == "TRUE");
-        else if (key == "ref_aspect") p.refAspect = clampf(static_cast<float>(std::atof(val.c_str())), 0.40f, 3.50f);
-        else if (key == "scrcpy_args") p.scrcpyArgs = val;
+        if (key == "name") { p.name = unescapeCfgField(val); sawKnownKey = true; }
+        else if (key == "app_package" || key == "package") { p.appPackage = val; sawKnownKey = true; }
+        else if (key == "keymap_enabled") { p.keymapEnabled = (val == "1" || toUpper(val) == "TRUE"); sawKnownKey = true; }
+        else if (key == "edge_anchored") { p.edgeAnchored = (val == "1" || toUpper(val) == "TRUE"); sawKnownKey = true; }
+        else if (key == "ref_aspect") { p.refAspect = clampf(static_cast<float>(std::atof(val.c_str())), 0.40f, 3.50f); sawKnownKey = true; }
+        else if (key == "scrcpy_args") { p.scrcpyArgs = val; sawKnownKey = true; }
         else if (key == "control_max_size") p.controlMaxSize = clampi(std::atoi(val.c_str()), 0, 4096);
-        else if (key == "poll_hz") p.pollHz = clampi(std::atoi(val.c_str()), 0, 1000);
-        else if (key == "toggle_aim_key") { int vk = KeyCodes::fromName(val); if (vk) p.toggleAimVk = vk; }
+        else if (key == "poll_hz") { p.pollHz = clampi(std::atoi(val.c_str()), 0, 1000); sawKnownKey = true; }
+        else if (key == "toggle_aim_key") { int vk = KeyCodes::fromName(val); if (vk) p.toggleAimVk = vk; sawKnownKey = true; }
         else if (key == "hold_unlock_key") { p.holdUnlockVk = KeyCodes::fromName(val); }
         else if (key == "reset_touch_key") { int vk = KeyCodes::fromName(val); if (vk) p.resetTouchVk = vk; }
         else if (key == "show_hud_in_play") p.showHudInPlay = (val == "1" || toUpper(val) == "TRUE");
@@ -216,7 +274,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "cursor_remember_pos") p.rememberCursorPos = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "cursor_scroll_step_px") p.cursorScrollStepPx = clampi(std::atoi(val.c_str()), 20, 400);
 
-        else if (key == "aim_x") p.aimX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
+        else if (key == "aim_x") { p.aimX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f); sawKnownKey = true; }
         else if (key == "aim_y") p.aimY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
         else if (key == "aim_half_w") p.aimHalfW = clampf(static_cast<float>(std::atof(val.c_str())), 0.04f, 0.48f);
         else if (key == "aim_half_h") p.aimHalfH = clampf(static_cast<float>(std::atof(val.c_str())), 0.04f, 0.85f);
@@ -224,7 +282,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "unbounded_aim") p.unboundedAim = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "invert_y") p.invertY = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "ff_counter_accel") p.ffCounterAccel = clampf(static_cast<float>(std::atof(val.c_str())), 0.0f, 25.0f);
-        else if (key == "sens_x") p.sensX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 20.0f);
+        else if (key == "sens_x") { p.sensX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 20.0f); sawKnownKey = true; }
         else if (key == "sens_y") p.sensY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 20.0f);
         else if (key == "fire_sens_x") p.fireSensX = clampf(static_cast<float>(std::atof(val.c_str())), 0.10f, 5.0f);
         else if (key == "fire_sens_y") p.fireSensY = clampf(static_cast<float>(std::atof(val.c_str())), 0.10f, 5.0f);
@@ -239,7 +297,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "touch_up_delay_ms") p.touchUpDelayMs = clampi(std::atoi(val.c_str()), 0, 100);
         else if (key == "tap_jitter_px") p.tapJitterPx = clampi(std::atoi(val.c_str()), 0, 20);
 
-        else if (key == "fire_mode") p.fireMode = clampi(std::atoi(val.c_str()), 0, 2);
+        else if (key == "fire_mode") { p.fireMode = clampi(std::atoi(val.c_str()), 0, 2); sawKnownKey = true; }
         else if (key == "fire_drag_mode") p.fireMode = (val == "1" || toUpper(val) == "TRUE") ? FIRE_MODE_DRAG_RIGHT : FIRE_MODE_CLAW_LEFT;
         else if (key == "fire_key") { int vk = KeyCodes::fromName(val); if (vk) p.fireVk = vk; }
         else if (key == "fire_x") p.fireX = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.98f);
@@ -249,7 +307,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "left_fire_x") p.leftFireX = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.98f);
         else if (key == "left_fire_y") p.leftFireY = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.98f);
 
-        else if (key == "joy_x") p.joyX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
+        else if (key == "joy_x") { p.joyX = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f); sawKnownKey = true; }
         else if (key == "joy_y") p.joyY = clampf(static_cast<float>(std::atof(val.c_str())), 0.05f, 0.95f);
         else if (key == "joy_radius") p.joyRadius = clampf(static_cast<float>(std::atof(val.c_str())), 0.02f, 0.30f);
         else if (key == "joy_sprint_radius") p.joySprintRadius = clampf(static_cast<float>(std::atof(val.c_str())), 0.03f, 0.40f);
@@ -262,13 +320,14 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         else if (key == "joy_sprint") { int vk = KeyCodes::fromName(val); if (vk) p.vkSprint = vk; }
         else if (key == "joy_walk") { p.vkWalk = KeyCodes::fromName(val); }
         else if (key == "buttons_explicit") {
+            sawKnownKey = true;
             if (val == "1" || toUpper(val) == "TRUE") {
                 p.buttons.clear();
                 sawAnyButton = true;
             }
         }
-
         else if (key == "button") {
+            sawKnownKey = true;
             if (!sawAnyButton) {
                 p.buttons.clear();
                 sawAnyButton = true;
@@ -307,30 +366,23 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         }
     }
 
+    if (!sawKnownKey) {
+        if (outError) *outError = "Not a valid Phantom Touch profile file.";
+        return false;
+    }
     outProfile = p;
     return true;
 }
 
-bool ProfileStore::save(const std::string& path, const Profile& p) {
-    std::string tmpPath = path + ".tmp";
-    bool wroteTmp = false;
-    {
-        std::ofstream out(tmpPath.c_str(), std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) {
-            // Fallback directly to target path if .tmp cannot be opened
-            tmpPath = path;
-        } else {
-            wroteTmp = true;
-        }
-    }
-
-    std::ofstream out(tmpPath.c_str(), std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) return false;
-
+std::string ProfileStore::serializeToString(const Profile& p) {
+    std::ostringstream out;
     char buf[384];
-    out << "# Phantom Touch v3 Profile\n";
-    out << "# All coordinates are normalized (0.0 = top/left, 1.0 = bottom/right)\n";
-    out << "# Press F2 in-app to drag & drop nodes, T to cycle node Action Type, Ctrl+S to save.\n\n";
+    out << "# phantom-touch-profile v1\n";
+    out << "# Reference aspect for edge anchoring: " << p.refAspect << "\n";
+    if (!p.appPackage.empty()) {
+        out << "# package = " << p.appPackage << "\n";
+    }
+    out << "# All coordinates are normalized (0.0 = top/left, 1.0 = bottom/right)\n\n";
 
     out << "name = " << escapeCfgField(p.name) << "\n";
     out << "app_package = " << p.appPackage << "\n";
@@ -351,7 +403,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "cursor_remember_pos = " << (p.rememberCursorPos ? 1 : 0) << "\n";
     out << "cursor_scroll_step_px = " << p.cursorScrollStepPx << "\n\n";
 
-    out << "# --- Aim, View Stack & Free Fire Counter-Acceleration Physics ---\n";
+    out << "# --- Aim, View Stack & Counter-Acceleration Physics ---\n";
     std::snprintf(buf, sizeof(buf), "aim_x = %.4f\naim_y = %.4f\naim_half_w = %.4f\naim_half_h = %.4f\n",
                   p.aimX, p.aimY, p.aimHalfW, p.aimHalfH);
     out << buf;
@@ -369,7 +421,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
                   p.idleResetMs, p.touchDownDelayMs, p.touchUpDelayMs, p.tapJitterPx);
     out << buf;
 
-    out << "# --- Fire Button (0 = DRAG-FIRE Right, 1 = CLAW-LEFT Separate, 2 = DUAL-DRAG) ---\n";
+    out << "# --- Fire Button ---\n";
     out << "fire_mode = " << p.fireMode << "\n";
     out << "fire_key = " << KeyCodes::toName(p.fireVk) << "\n";
     std::snprintf(buf, sizeof(buf), "fire_x = %.4f\nfire_y = %.4f\nfire_box_half_w = %.4f\nfire_box_half_h = %.4f\n",
@@ -379,7 +431,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
                   p.leftFireX, p.leftFireY);
     out << buf;
 
-    out << "# --- WASD Virtual Joystick (with Free Fire 3-Stage Stepped Glide + Sprint/Walk Radius) ---\n";
+    out << "# --- WASD Virtual Joystick ---\n";
     std::snprintf(buf, sizeof(buf), "joy_x = %.4f\njoy_y = %.4f\njoy_radius = %.4f\njoy_sprint_radius = %.4f\njoy_walk_radius = %.4f\n",
                   p.joyX, p.joyY, p.joyRadius, p.joySprintRadius, p.joyWalkRadius);
     out << buf;
@@ -391,8 +443,7 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "joy_sprint = " << KeyCodes::toName(p.vkSprint) << "\n";
     out << "joy_walk = " << KeyCodes::toName(p.vkWalk) << "\n\n";
 
-    out << "# --- Action Nodes: LABEL, KEY[or K1+K2], X, Y, ACTION, FLAGS, DUR_MS[, X2, Y2] ---\n";
-    out << "# Actions: PRESS, CLICK, DOWN_UP, UP_TRIGGER, HOLD_VIEW, SWIPE, CURSOR_TOGGLE, RESET_VIEW, SWITCH_SENS, REACTIVATE_JOY\n";
+    out << "# --- Action Nodes ---\n";
     out << "buttons_explicit = 1\n";
     for (size_t i = 0; i < p.buttons.size(); ++i) {
         const KeyNode& b = p.buttons[i];
@@ -420,22 +471,113 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
         }
         out << buf;
     }
+    return out.str();
+}
 
-    out.flush();
-    bool ok = out.good();
-    out.close();
-    if (!ok) {
-        if (wroteTmp) DeleteFileA(tmpPath.c_str());
+bool ProfileStore::load(const std::string& path, Profile& outProfile) {
+    std::string raw;
+    if (!readFileUtf8(path, raw, nullptr)) return false;
+    return parseFromString(raw, outProfile, nullptr);
+}
+
+bool ProfileStore::save(const std::string& path, const Profile& p) {
+    std::string text = serializeToString(p);
+    std::wstring wpath = utf8ToWide(path);
+    std::wstring wtmp = utf8ToWide(path + ".tmp");
+    if (wpath.empty()) return false;
+
+    auto writeAll = [&](const std::wstring& target) -> bool {
+        HANDLE hf = CreateFileW(target.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        BOOL ok = WriteFile(hf, text.data(), static_cast<DWORD>(text.size()), &written, NULL);
+        CloseHandle(hf);
+        return (ok && written == static_cast<DWORD>(text.size()));
+    };
+
+    if (!wtmp.empty() && writeAll(wtmp)) {
+        if (MoveFileExW(wtmp.c_str(), wpath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            return true;
+        }
+        bool copied = (CopyFileW(wtmp.c_str(), wpath.c_str(), FALSE) != 0);
+        DeleteFileW(wtmp.c_str());
+        if (copied) return true;
+    }
+    return writeAll(wpath);
+}
+
+bool ProfileStore::importProfileText(const std::string& cfgText, const std::string& profilesDir,
+                                     std::string& outSavedPath, std::string& outError) {
+    outSavedPath.clear();
+    outError.clear();
+    Profile parsed;
+    if (!parseFromString(cfgText, parsed, &outError)) {
         return false;
     }
-
-    if (wroteTmp) {
-        if (!MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            // Fallback copy if atomic replace is blocked by AV/file lock
-            bool copied = (CopyFileA(tmpPath.c_str(), path.c_str(), FALSE) != 0);
-            DeleteFileA(tmpPath.c_str());
-            return copied;
-        }
+    std::string base = sanitizeFilename(parsed.name.empty() ? "imported" : parsed.name);
+    std::string fname = base;
+    std::string target = profilesDir + "\\" + fname + ".cfg";
+    int suffix = 2;
+    while (GetFileAttributesW(utf8ToWide(target).c_str()) != INVALID_FILE_ATTRIBUTES && suffix < 100) {
+        char sbuf[16];
+        std::snprintf(sbuf, sizeof(sbuf), "_%d", suffix++);
+        fname = base + sbuf;
+        target = profilesDir + "\\" + fname + ".cfg";
     }
+    if (suffix > 2 && !parsed.name.empty()) {
+        char sbuf[16];
+        std::snprintf(sbuf, sizeof(sbuf), " (%d)", suffix - 1);
+        parsed.name += sbuf;
+    }
+    if (!save(target, parsed)) {
+        outError = "Failed saving imported profile to " + target;
+        return false;
+    }
+    outSavedPath = target;
     return true;
+}
+
+bool ProfileStore::importProfileFile(const std::string& srcUtf8Path, const std::string& profilesDir,
+                                     std::string& outSavedPath, std::string& outError) {
+    std::string raw;
+    if (!readFileUtf8(srcUtf8Path, raw, &outError)) {
+        return false;
+    }
+    return importProfileText(raw, profilesDir, outSavedPath, outError);
+}
+
+bool ProfileStore::moveToTrash(const std::string& profilePath, const std::string& profilesDir,
+                               std::string& outTrashPath) {
+    outTrashPath.clear();
+    std::string trashDir = profilesDir + "\\.trash";
+    CreateDirectoryW(utf8ToWide(trashDir).c_str(), NULL);
+    std::string stem = sanitizeFilename(baseNameNoExt(profilePath));
+    char tbuf[32];
+    std::snprintf(tbuf, sizeof(tbuf), "_%lu", static_cast<unsigned long>(GetTickCount()));
+    outTrashPath = trashDir + "\\" + stem + tbuf + ".cfg";
+    std::wstring wSrc = utf8ToWide(profilePath);
+    std::wstring wDst = utf8ToWide(outTrashPath);
+    if (MoveFileExW(wSrc.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        return true;
+    }
+    if (CopyFileW(wSrc.c_str(), wDst.c_str(), FALSE)) {
+        DeleteFileW(wSrc.c_str());
+        return true;
+    }
+    outTrashPath.clear();
+    return false;
+}
+
+bool ProfileStore::restoreFromTrash(const std::string& trashPath, const std::string& originalPath) {
+    if (trashPath.empty() || originalPath.empty()) return false;
+    std::wstring wSrc = utf8ToWide(trashPath);
+    std::wstring wDst = utf8ToWide(originalPath);
+    if (MoveFileExW(wSrc.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        return true;
+    }
+    if (CopyFileW(wSrc.c_str(), wDst.c_str(), FALSE)) {
+        DeleteFileW(wSrc.c_str());
+        return true;
+    }
+    return false;
 }

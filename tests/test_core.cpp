@@ -15,7 +15,9 @@
 #include "engine/JoystickController.hpp"
 #include "engine/ThreadScheduling.hpp"
 #include "ui/DrawerPanel.hpp"
+#include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "ui/HudRenderer.hpp"
 #include "ui/OnboardingView.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
@@ -1423,6 +1425,232 @@ static void testSprint2bConnectionOnboardingAndSettings() {
     std::printf("[Test] Sprint 2B (X2/F1/F2/F3/F16) OK!\n");
 }
 
+static void removeDirRecursiveA(const std::string& dir) {
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (std::strcmp(fd.cFileName, ".") == 0 || std::strcmp(fd.cFileName, "..") == 0) continue;
+        std::string full = dir + "\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            removeDirRecursiveA(full);
+            RemoveDirectoryA(full.c_str());
+        } else {
+            DeleteFileA(full.c_str());
+        }
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+    RemoveDirectoryA(dir.c_str());
+}
+
+static void testSprint3aProfileLibraryEditorAndDynamicHud() {
+    std::printf("[Test] Sprint 3A (F4 Templates/Import/Trash, X4 Editor, X9 Undo, S5 Dynamic HUD)...\n");
+
+    // 1. All 6 Profile Templates & Human Action Labels
+    for (int k = 0; k <= static_cast<int>(TMPL_PLATFORMER); ++k) {
+        ProfileTemplateKind kind = static_cast<ProfileTemplateKind>(k);
+        Profile tp = ProfileDefaults::createTemplate(kind);
+        assert(!tp.name.empty());
+        assert(std::strlen(ProfileDefaults::templateName(kind)) > 0);
+        if (kind == TMPL_DESKTOP || kind == TMPL_CONTROLLER_BASIC) {
+            assert(!tp.keymapEnabled);
+        } else {
+            assert(tp.keymapEnabled);
+            assert(!tp.buttons.empty());
+        }
+    }
+    assert(ProfileDefaults::actionTypeToHumanLabel(NODE_PRESS) == "Hold");
+    assert(ProfileDefaults::actionTypeToHumanLabel(NODE_CLICK) == "Tap");
+    assert(ProfileDefaults::actionTypeToHumanLabel(NODE_DOWN_UP) == "Tap Down & Up");
+    assert(ProfileDefaults::actionTypeToHumanLabel(NODE_HOLD_VIEW) == "Free Look");
+    assert(ProfileDefaults::actionTypeToHumanLabel(NODE_CURSOR_TOGGLE) == "Cursor Toggle");
+
+    // 2. ProfileStore serialize/parse v1 + headerless v0 + escaping + error cases
+    Profile br = ProfileDefaults::createTemplate(TMPL_MOBA);
+    br.name = "My , Pro #1 \\MOBA";
+    std::string cfgText = ProfileStore::serializeToString(br);
+    assert(cfgText.find("# phantom-touch-profile v1") != std::string::npos);
+
+    Profile parsed;
+    std::string parseErr;
+    assert(ProfileStore::parseFromString(cfgText, parsed, &parseErr));
+    assert(parsed.name == br.name);
+    assert(parsed.buttons.size() == br.buttons.size());
+
+    // Headerless v0 still parses cleanly
+    size_t firstNl = cfgText.find('\n');
+    std::string v0Text = (firstNl != std::string::npos) ? cfgText.substr(firstNl + 1) : cfgText;
+    Profile parsedV0;
+    assert(ProfileStore::parseFromString(v0Text, parsedV0, &parseErr));
+    assert(parsedV0.buttons.size() == br.buttons.size());
+
+    // Garbage text rejected cleanly
+    Profile badProf;
+    std::string badErr;
+    assert(!ProfileStore::parseFromString("not_a_profile_at_all\n###\n", badProf, &badErr));
+    assert(!badErr.empty());
+
+    // 3. Import clash deduplication + soft-delete Trash & Restore
+    std::string tempDir = "tests\\_tmp_s3a_profiles";
+    removeDirRecursiveA(tempDir);
+    CreateDirectoryA(tempDir.c_str(), NULL);
+    std::string srcCfg = tempDir + "\\incoming_source.txt";
+    assert(ProfileStore::save(srcCfg, br));
+
+    std::string imp1, imp2, impErr;
+    assert(ProfileStore::importProfileFile(srcCfg, tempDir, imp1, impErr));
+    assert(ProfileStore::importProfileFile(srcCfg, tempDir, imp2, impErr));
+    assert(imp1 != imp2);
+    assert(ProfileStore::listProfiles(tempDir).size() == 2);
+
+    std::string trashPath;
+    assert(ProfileStore::moveToTrash(imp2, tempDir, trashPath));
+    assert(ProfileStore::listProfiles(tempDir).size() == 1);
+    assert(GetFileAttributesA(trashPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    assert(ProfileStore::restoreFromTrash(trashPath, imp2));
+    assert(ProfileStore::listProfiles(tempDir).size() == 2);
+
+    // 4. N27 Last Phone Dimensions Persistence
+    AppSettings sDef;
+    sDef.lastPhoneW = 2340;
+    sDef.lastPhoneH = 1080;
+    std::string setTmp = tempDir + "\\settings.cfg";
+    assert(AppSettingsStore::save(setTmp, sDef));
+    AppSettings sLoad;
+    assert(AppSettingsStore::load(setTmp, sLoad));
+    assert(sLoad.lastPhoneW == 2340 && sLoad.lastPhoneH == 1080);
+
+    removeDirRecursiveA(tempDir);
+
+    // 5. ProfileUndoStack bounded history & Redo
+    ProfileUndoStack undoStack;
+    Profile cur = ProfileDefaults::createBlank("undo_test");
+    for (int i = 0; i < 60; ++i) {
+        Profile before = cur;
+        KeyNode n;
+        n.vk = 'A' + (i % 26);
+        n.label = "K";
+        cur.buttons.push_back(n);
+        undoStack.push(before, "add");
+    }
+    assert(undoStack.canUndo());
+    int undone = 0;
+    while (undoStack.canUndo()) {
+        assert(undoStack.undo(cur));
+        ++undone;
+    }
+    assert(undone == static_cast<int>(ProfileUndoStack::kMaxDepth)); // bounded at 50!
+    assert(cur.buttons.size() == 10);
+    assert(undoStack.canRedo());
+    assert(undoStack.redo(cur));
+    assert(cur.buttons.size() == 11);
+
+    // 6. EditorGeometry snapping, alignment guides, and conflict detection
+    Profile ed;
+    KeyNode a; a.vk = 'G'; a.label = "G1"; a.x = 0.500f; a.y = 0.400f;
+    KeyNode b; b.vk = 'G'; b.label = "G2"; b.x = 0.504f; b.y = 0.700f; // near-aligned x & duplicate key
+    KeyNode m; m.vk = VK_LBUTTON; m.label = "LMB"; m.x = 0.300f; m.y = 0.300f;
+    ed.buttons.push_back(a);
+    ed.buttons.push_back(b);
+    ed.buttons.push_back(m);
+
+    float snapX = 0.504f, snapY = 0.650f;
+    std::vector<AlignGuide> guides;
+    EditorGeometry::snapAndCollectGuides(ed, 1, snapX, snapY, false, guides);
+    assert(std::fabs(snapX - 0.500f) < 0.001f);
+    assert(!guides.empty());
+
+    float gridX = 0.413f, gridY = 0.627f;
+    EditorGeometry::snapAndCollectGuides(ed, 1, gridX, gridY, true, guides);
+    assert(std::fabs(gridX - 0.41f) < 0.001f);
+    assert(std::fabs(gridY - 0.63f) < 0.001f);
+
+    std::vector<KeyConflict> conflicts = EditorGeometry::detectConflicts(ed, false /* cursor mode */);
+    bool sawDup = false, sawCursorMouse = false;
+    for (size_t ci = 0; ci < conflicts.size(); ++ci) {
+        if (conflicts[ci].buttonIndex == 0 || conflicts[ci].buttonIndex == 1) sawDup = true;
+        if (conflicts[ci].buttonIndex == 2 && conflicts[ci].cannotFireInCursor) sawCursorMouse = true;
+    }
+    assert(sawDup && sawCursorMouse);
+
+    // 7. HudRenderer clean glyph labels, snackbar button rect, and extras
+    assert(HudRenderer::shortKeyLabel(0, VK_SPACE) == "Spc");
+    assert(HudRenderer::shortKeyLabel(0, VK_CUSTOM_MWHEEL_UP) == "Scr+");
+    assert(HudRenderer::shortKeyLabel(0, VK_OEM_3) == "~");
+
+    HDC scDC = GetDC(NULL);
+    HDC mDC = CreateCompatibleDC(scDC);
+    HBITMAP bmp = CreateCompatibleBitmap(scDC, 600, 900);
+    HGDIOBJ old = SelectObject(mDC, bmp);
+    {
+        Gdiplus::Graphics g(mDC);
+        std::vector<int> multi; multi.push_back(0); multi.push_back(1);
+        HudEditExtras ex;
+        ex.multiSelected = &multi;
+        ex.alignGuides = &guides;
+        ex.conflicts = &conflicts;
+        ex.marqueeActive = true;
+        ex.marqueeRc = RECT{ 20, 20, 180, 140 };
+        ex.skipDynamicDots = true;
+        EngineTelemetry tel;
+        HudRenderer::paintKeymapNodes(g, 600, 900, ed, tel, true, false, 0, 1, false, false, 1.0f, &ex);
+        RECT undoRc = { 0, 0, 0, 0 };
+        HudRenderer::paintToastWithAction(g, 600, 900, "Cleared extra keys", "Undo", &undoRc);
+        assert(undoRc.right > undoRc.left && undoRc.bottom > undoRc.top);
+
+        // 8. DrawerPanel palette search + Profiles templates/import/export + Live Test button + Undo clear
+        DrawerPanel dp;
+        RECT dr = { 0, 0, 356, 860 };
+        AppSettings appS;
+        dp.setActiveTab(0);
+        dp.paint(g, dr, ed, appS, "", 0, false, true, "Phone", "com.test", std::vector<std::string>(), -1, -1);
+
+        RECT rPS = { 0, 0, 0, 0 };
+        assert(dp.rectForAction(DA_FOCUS_PALETTE_SEARCH, -1, rPS));
+        DrawerActionResult res;
+        int sel = 0;
+        assert(dp.onMouseDown((rPS.left + rPS.right) / 2, (rPS.top + rPS.bottom) / 2, ed, appS, sel, res));
+        for (const char* s = "Swipe"; *s; ++s) assert(dp.onChar(*s, ed, appS, sel, res));
+        dp.paint(g, dr, ed, appS, "", 0, false, true, "Phone", "com.test", std::vector<std::string>(), -1, -1);
+        RECT rSwipeAdd = { 0, 0, 0, 0 }, rPressAdd = { 0, 0, 0, 0 };
+        assert(dp.rectForAction(DA_ADD_NODE, static_cast<int>(NODE_SWIPE), rSwipeAdd));
+        assert(!dp.rectForAction(DA_ADD_NODE, static_cast<int>(NODE_PRESS), rPressAdd));
+
+        RECT rTestLive = { 0, 0, 0, 0 }, rClrAll = { 0, 0, 0, 0 };
+        assert(dp.rectForAction(DA_TOGGLE_EDIT_TEST, -1, rTestLive));
+        assert(dp.rectForAction(DA_CLEAR_BUTTONS, -1, rClrAll));
+        DrawerActionResult resClr;
+        assert(dp.onMouseDown((rClrAll.left + rClrAll.right) / 2, (rClrAll.top + rClrAll.bottom) / 2, ed, appS, sel, resClr));
+        assert(resClr.requestClearButtonsUndo);
+
+        // Profiles tab: 6 starter templates + Import/Export/Copy Text hotspots
+        dp.setActiveTab(2);
+        dp.paint(g, dr, ed, appS, "", -1, false, true, "Phone", "com.test", std::vector<std::string>(), -1, -1);
+        for (int ti = 0; ti < 6; ++ti) {
+            RECT rt = { 0, 0, 0, 0 };
+            assert(dp.rectForAction(DA_CREATE_TEMPLATE, ti, rt));
+        }
+        RECT rImp = { 0, 0, 0, 0 }, rExp = { 0, 0, 0, 0 }, rCpy = { 0, 0, 0, 0 };
+        assert(dp.rectForAction(DA_IMPORT_PROFILE, -1, rImp));
+        assert(dp.rectForAction(DA_EXPORT_PROFILE, -1, rExp));
+        assert(dp.rectForAction(DA_COPY_PROFILE_TEXT, -1, rCpy));
+    }
+    SelectObject(mDC, old);
+    DeleteObject(bmp);
+    DeleteDC(mDC);
+    ReleaseDC(NULL, scDC);
+
+    // 9. D3D11Renderer::setDynamicHudMarkers thread-safe pre-init call (S5)
+    D3D11Renderer renderer;
+    DynamicHudMarkers dm;
+    dm.active = true;
+    dm.aimFingerDown = true;
+    dm.joyDown = true;
+    renderer.setDynamicHudMarkers(dm);
+
+    std::printf("[Test] Sprint 3A (F4/X4/X9/S5) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1440,6 +1668,7 @@ int main() {
     testSprint1bPhase2PresetsAndTelemetry();
     testSprint2aUiFoundation();
     testSprint2bConnectionOnboardingAndSettings();
-    std::printf("ALL SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    testSprint3aProfileLibraryEditorAndDynamicHud();
+    std::printf("ALL SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

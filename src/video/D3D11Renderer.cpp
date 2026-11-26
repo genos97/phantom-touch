@@ -59,12 +59,14 @@ void safeRelease(T*& p) {
 struct QuadCB {
     float rectNdc[4]; // x0, y0 (bottom-left NDC), x1, y1 (top-right NDC)
     float uvRect[4];  // u0, v0, u1, v1 (exact hardware crop window inside NV12 surface)
+    float tint[4];    // r, g, b, a for dynamic vector sprites
 };
 
 const char* kShaderSrc = R"(
 cbuffer QuadCB : register(b0) {
     float4 rectNdc;
     float4 uvRect;
+    float4 tint;
 };
 
 struct VSOut {
@@ -109,6 +111,17 @@ float4 psHud(VSOut i) : SV_TARGET {
 
 float4 psYOnly(VSOut i) : SV_TARGET {
     return float4(texY.Sample(samp, i.uv).r, 0.0, 0.0, 1.0);
+}
+
+float4 psMarker(VSOut i) : SV_TARGET {
+    float2 d = i.uv - float2(0.5, 0.5);
+    float dist = length(d) * 2.0;
+    if (dist > 1.0) discard;
+    float rim = smoothstep(0.66, 0.84, dist);
+    float edge = 1.0 - smoothstep(0.88, 1.0, dist);
+    float3 col = lerp(tint.rgb, float3(1.0, 1.0, 1.0), rim * 0.72);
+    float a = tint.a * edge;
+    return float4(col * a, a);
 }
 )";
 
@@ -503,16 +516,19 @@ bool D3D11Renderer::compileShadersLocked(std::string& outError) {
     ID3DBlob* psNV12Blob = nullptr;
     ID3DBlob* psHudBlob = nullptr;
     ID3DBlob* psYOnlyBlob = nullptr;
+    ID3DBlob* psMarkerBlob = nullptr;
     bool ok = compileOne("vsMain", "vs_4_0", &vsBlob) &&
               compileOne("psNV12", "ps_4_0", &psNV12Blob) &&
               compileOne("psHud", "ps_4_0", &psHudBlob) &&
-              compileOne("psYOnly", "ps_4_0", &psYOnlyBlob);
+              compileOne("psYOnly", "ps_4_0", &psYOnlyBlob) &&
+              compileOne("psMarker", "ps_4_0", &psMarkerBlob);
 
     if (ok) {
         if (FAILED(device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), NULL, &vsQuad_)) ||
             FAILED(device_->CreatePixelShader(psNV12Blob->GetBufferPointer(), psNV12Blob->GetBufferSize(), NULL, &psNV12_)) ||
             FAILED(device_->CreatePixelShader(psHudBlob->GetBufferPointer(), psHudBlob->GetBufferSize(), NULL, &psHud_)) ||
-            FAILED(device_->CreatePixelShader(psYOnlyBlob->GetBufferPointer(), psYOnlyBlob->GetBufferSize(), NULL, &psYOnly_))) {
+            FAILED(device_->CreatePixelShader(psYOnlyBlob->GetBufferPointer(), psYOnlyBlob->GetBufferSize(), NULL, &psYOnly_)) ||
+            FAILED(device_->CreatePixelShader(psMarkerBlob->GetBufferPointer(), psMarkerBlob->GetBufferSize(), NULL, &psMarker_))) {
             outError = "Failed creating D3D11 shader objects.";
             ok = false;
         }
@@ -522,6 +538,7 @@ bool D3D11Renderer::compileShadersLocked(std::string& outError) {
     safeRelease(psNV12Blob);
     safeRelease(psHudBlob);
     safeRelease(psYOnlyBlob);
+    safeRelease(psMarkerBlob);
     FreeLibrary(hComp);
     return ok;
 }
@@ -544,6 +561,7 @@ void D3D11Renderer::shutdown() {
     safeRelease(blendPremul_);
     safeRelease(samplerLinear_);
     safeRelease(cbQuad_);
+    safeRelease(psMarker_);
     safeRelease(psYOnly_);
     safeRelease(psHud_);
     safeRelease(psNV12_);
@@ -685,6 +703,12 @@ void D3D11Renderer::clearHudBitmap() {
     LeaveCriticalSection(&frameLock_);
 }
 
+void D3D11Renderer::setDynamicHudMarkers(const DynamicHudMarkers& markers) {
+    EnterCriticalSection(&frameLock_);
+    dynMarkers_ = markers;
+    LeaveCriticalSection(&frameLock_);
+}
+
 bool D3D11Renderer::ensureVideoTexturesLocked(uint32_t w, uint32_t h) {
     if (texY_ && texUV_ && texVideoW_ == w && texVideoH_ == h) return true;
     safeRelease(srvY_);
@@ -808,7 +832,8 @@ bool D3D11Renderer::ensureHudTextureLocked(int w, int h) {
 }
 
 void D3D11Renderer::updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x1Ndc, float y1Ndc,
-                                               float u0, float v0, float u1, float v1) {
+                                               float u0, float v0, float u1, float v1,
+                                               float r, float g, float b, float a) {
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(ctx_->Map(cbQuad_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         QuadCB* cb = reinterpret_cast<QuadCB*>(ms.pData);
@@ -820,6 +845,10 @@ void D3D11Renderer::updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x
         cb->uvRect[1] = v0;
         cb->uvRect[2] = u1;
         cb->uvRect[3] = v1;
+        cb->tint[0] = r;
+        cb->tint[1] = g;
+        cb->tint[2] = b;
+        cb->tint[3] = a;
         ctx_->Unmap(cbQuad_, 0);
     }
 }
@@ -1138,6 +1167,7 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
         }
         canDrawHud = (srvHud_ != nullptr);
     }
+    DynamicHudMarkers dm = dynMarkers_;
     LeaveCriticalSection(&frameLock_);
 
     // 3. Clear dark emulator canvas backdrop (#0A0D13)
@@ -1200,6 +1230,40 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
         ctx_->Draw(4, 0);
         ID3D11ShaderResourceView* nullSrv = NULL;
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
+    }
+
+    // 5b. Pass 3 (S5): Zero-upload dynamic GPU markers (crosshair, joystick thumb dot, aim dot)
+    if (drawHudOverlay && dm.active && psMarker_ && videoRectInHost.w > 8 && videoRectInHost.h > 8) {
+        const float blendFactor[4] = { 0, 0, 0, 0 };
+        ctx_->OMSetBlendState(blendPremul_, blendFactor, 0xFFFFFFFFu);
+        ctx_->PSSetShader(psMarker_, NULL, 0);
+        ctx_->PSSetConstantBuffers(0, 1, &cbQuad_);
+
+        auto drawMarkerDot = [&](float normX, float normY, float radPx, float r, float g, float b, float a) {
+            float cxPx = static_cast<float>(videoRectInHost.x) + normX * static_cast<float>(videoRectInHost.w);
+            float cyPx = static_cast<float>(videoRectInHost.y) + normY * static_cast<float>(videoRectInHost.h);
+            float mx0 = ((cxPx - radPx) / static_cast<float>(backbufW_)) * 2.0f - 1.0f;
+            float mx1 = ((cxPx + radPx) / static_cast<float>(backbufW_)) * 2.0f - 1.0f;
+            float myT = 1.0f - ((cyPx - radPx) / static_cast<float>(backbufH_)) * 2.0f;
+            float myB = 1.0f - ((cyPx + radPx) / static_cast<float>(backbufH_)) * 2.0f;
+            updateConstantBufferLocked(mx0, myB, mx1, myT, 0.0f, 0.0f, 1.0f, 1.0f, r, g, b, a);
+            ctx_->Draw(4, 0);
+        };
+
+        float op = (dm.opacity < 0.15f) ? 0.15f : (dm.opacity > 1.0f ? 1.0f : dm.opacity);
+        if (dm.showCrosshair) {
+            drawMarkerDot(0.5f, 0.5f, 3.0f, 0.17f, 0.90f, 0.61f, 0.88f);
+        }
+        if (dm.joyDown) {
+            drawMarkerDot(dm.joyX, dm.joyY, 6.5f, 0.17f, 0.90f, 0.61f, 0.82f * op);
+        }
+        if (dm.aimFingerDown) {
+            if (dm.fireHeld) {
+                drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 1.00f, 0.36f, 0.42f, 0.78f * op);
+            } else {
+                drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 0.00f, 0.83f, 1.00f, 0.78f * op);
+            }
+        }
     }
 
     UINT syncInterval = vsyncEnabled_ ? 1u : 0u;

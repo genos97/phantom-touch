@@ -87,6 +87,7 @@ public:
                              bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
     void submitDecodedFrame(const DecodedNV12Frame& frame);
     void updateEmbeddedHud(const void* bgraPremulPixels, int width, int height);
+    void setDynamicHudMarkers(const DynamicHudMarkers& markers) { d3d_.setDynamicHudMarkers(markers); }
     void renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
     bool captureNativeScreenshot(const std::string& savePath, std::string& outError) const;
     bool hasNativeVideoFrame() const { return d3d_.hasVideoFrame(); }

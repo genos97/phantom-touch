@@ -25,6 +25,15 @@ enum KeyActionType : int {
     NODE_REACTIVATE_JOY = 9  // Releases and cleanly re-engages WASD joystick
 };
 
+enum ProfileTemplateKind : int {
+    TMPL_DESKTOP          = 0,
+    TMPL_CONTROLLER_BASIC = 1,
+    TMPL_MOBA             = 2,
+    TMPL_STRATEGY_RTS     = 3,
+    TMPL_RACING           = 4,
+    TMPL_PLATFORMER       = 5
+};
+
 struct KeyNode {
     std::string label;
     int comboVk = 0;                 // Optional 2-key prefix (0 = single key, e.g. LALT for LALT+1)
@@ -120,6 +129,8 @@ public:
     static Profile createFreeFire();
     static Profile createBlank(const std::string& name);
     static Profile createDesktop(const std::string& name = "Desktop (Typing)");
+    static Profile createTemplate(ProfileTemplateKind kind);
+    static const char* templateName(ProfileTemplateKind kind);
     static bool matchesPackage(const std::string& packageList, const std::string& activePkg);
     static void mapEdgeAnchored(float nx, float ny, bool edgeAnchored,
                                 float refAspect, float liveAspect,
@@ -129,5 +140,6 @@ public:
                                   float& outX, float& outY);
     static Profile resolveLayout(const Profile& src, uint32_t screenW, uint32_t screenH);
     static std::string actionTypeToName(KeyActionType action);
+    static std::string actionTypeToHumanLabel(KeyActionType action);
     static KeyActionType nameToActionType(const std::string& raw);
 };

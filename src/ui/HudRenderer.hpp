@@ -2,9 +2,29 @@
 
 #include "config/Profile.hpp"
 #include "engine/InputEngine.hpp"
+#include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
 
 #include <string>
+#include <vector>
+
+struct HudEditExtras {
+    const std::vector<int>* multiSelected;
+    const std::vector<AlignGuide>* alignGuides;
+    const std::vector<KeyConflict>* conflicts;
+    bool marqueeActive;
+    RECT marqueeRc;
+    bool skipDynamicDots;
+
+    HudEditExtras()
+        : multiSelected(nullptr),
+          alignGuides(nullptr),
+          conflicts(nullptr),
+          marqueeActive(false),
+          skipDynamicDots(false) {
+        ZeroMemory(&marqueeRc, sizeof(marqueeRc));
+    }
+};
 
 // Clean, minimalist emulator-style GDI+ HUD renderer (BlueStacks 5 / MuMu style).
 // Renders directly into a 32-bit premultiplied ARGB surface for silky per-pixel glass transparency.
@@ -25,7 +45,8 @@ public:
                                  bool editMode, bool demoMode,
                                  int selectedBtnIndex, int hoveredBtnIndex,
                                  bool hoverDeleteChip, bool waitingButtonRebind,
-                                 float playOpacity);
+                                 float playOpacity,
+                                 const HudEditExtras* extras = nullptr);
 
     static void paintCrosshairDot(Gdiplus::Graphics& g, int w, int h);
 
@@ -36,4 +57,7 @@ public:
                                   const std::string& targetName, bool specialAimKey);
 
     static void paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg);
+    static void paintToastWithAction(Gdiplus::Graphics& g, int w, int h,
+                                     const std::string& msg, const std::string& actionLabel,
+                                     RECT* outActionRc = nullptr);
 };

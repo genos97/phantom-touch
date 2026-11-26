@@ -1,5 +1,9 @@
 #include "config/Profile.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -33,6 +37,22 @@ std::string ProfileDefaults::actionTypeToName(KeyActionType a) {
         case NODE_SWITCH_SENS:    return "SWITCH_SENS";
         case NODE_REACTIVATE_JOY: return "REACTIVATE_JOY";
         default:                  return "PRESS";
+    }
+}
+
+std::string ProfileDefaults::actionTypeToHumanLabel(KeyActionType a) {
+    switch (a) {
+        case NODE_PRESS:          return "Hold";
+        case NODE_CLICK:          return "Tap";
+        case NODE_DOWN_UP:        return "Tap Down & Up";
+        case NODE_UP_TRIGGER:     return "Tap on Release";
+        case NODE_HOLD_VIEW:      return "Free Look";
+        case NODE_SWIPE:          return "Swipe";
+        case NODE_CURSOR_TOGGLE:  return "Cursor Toggle";
+        case NODE_RESET_VIEW:     return "Reset Camera";
+        case NODE_SWITCH_SENS:    return "Sensitivity Switch";
+        case NODE_REACTIVATE_JOY: return "Reset Joystick";
+        default:                  return "Hold";
     }
 }
 
@@ -162,6 +182,107 @@ Profile ProfileDefaults::createDesktop(const std::string& name) {
     p.keymapEnabled = false;
     p.showHudInPlay = false;
     return p;
+}
+
+const char* ProfileDefaults::templateName(ProfileTemplateKind kind) {
+    switch (kind) {
+        case TMPL_DESKTOP:          return "Desktop";
+        case TMPL_CONTROLLER_BASIC: return "Controller Basic";
+        case TMPL_MOBA:             return "MOBA";
+        case TMPL_STRATEGY_RTS:     return "Strategy / RTS";
+        case TMPL_RACING:           return "Racing";
+        case TMPL_PLATFORMER:       return "Platformer";
+        default:                    return "Desktop";
+    }
+}
+
+Profile ProfileDefaults::createTemplate(ProfileTemplateKind kind) {
+    auto makeNode = [](const char* label, int vk, KeyActionType act, float x, float y,
+                       float x2 = -1.0f, float y2 = -1.0f, int durMs = 35) {
+        KeyNode n;
+        n.label = label;
+        n.comboVk = 0;
+        n.vk = vk;
+        n.action = act;
+        n.x = x;
+        n.y = y;
+        n.x2 = (x2 >= 0.0f) ? x2 : x;
+        n.y2 = (y2 >= 0.0f) ? y2 : y;
+        n.durationMs = durMs;
+        n.radius = 0.030f;
+        return n;
+    };
+
+    switch (kind) {
+        case TMPL_DESKTOP:
+            return createDesktop("Desktop (Typing)");
+        case TMPL_CONTROLLER_BASIC: {
+            Profile p = createBlank("Controller Basic");
+            p.keymapEnabled = false;
+            p.showHudInPlay = false;
+            return p;
+        }
+        case TMPL_MOBA: {
+            Profile p = createBlank("MOBA Starter");
+            p.keymapEnabled = true;
+            p.edgeAnchored = true;
+            p.refAspect = 2.1667f;
+            p.joyX = 0.145f;
+            p.joyY = 0.760f;
+            p.joyRadius = 0.090f;
+            p.buttons.push_back(makeNode("ATTACK", VK_SPACE, NODE_CLICK,         0.895f, 0.840f));
+            p.buttons.push_back(makeNode("SKILL1", 'Q',      NODE_CLICK,         0.775f, 0.815f));
+            p.buttons.push_back(makeNode("SKILL2", 'W',      NODE_CLICK,         0.820f, 0.675f));
+            p.buttons.push_back(makeNode("SKILL3", 'E',      NODE_CLICK,         0.895f, 0.565f));
+            p.buttons.push_back(makeNode("ULT",    'R',      NODE_CLICK,         0.935f, 0.435f));
+            p.buttons.push_back(makeNode("SPELL",  'F',      NODE_CLICK,         0.700f, 0.860f));
+            p.buttons.push_back(makeNode("RECALL", 'B',      NODE_CLICK,         0.605f, 0.880f));
+            p.buttons.push_back(makeNode("SHOP",   'G',      NODE_CURSOR_TOGGLE, 0.145f, 0.215f));
+            return p;
+        }
+        case TMPL_STRATEGY_RTS: {
+            Profile p = createBlank("Strategy / RTS");
+            p.keymapEnabled = true;
+            p.edgeAnchored = true;
+            p.refAspect = 2.1667f;
+            p.buttons.push_back(makeNode("CURSOR", VK_TAB,   NODE_CURSOR_TOGGLE, 0.925f, 0.115f));
+            p.buttons.push_back(makeNode("PAN_L",  'A',      NODE_SWIPE,         0.450f, 0.500f, 0.650f, 0.500f, 160));
+            p.buttons.push_back(makeNode("PAN_R",  'D',      NODE_SWIPE,         0.550f, 0.500f, 0.350f, 0.500f, 160));
+            p.buttons.push_back(makeNode("UNIT1",  '1',      NODE_CLICK,         0.380f, 0.880f));
+            p.buttons.push_back(makeNode("UNIT2",  '2',      NODE_CLICK,         0.460f, 0.880f));
+            p.buttons.push_back(makeNode("UNIT3",  '3',      NODE_CLICK,         0.540f, 0.880f));
+            p.buttons.push_back(makeNode("ACT",    VK_SPACE, NODE_PRESS,         0.880f, 0.820f));
+            return p;
+        }
+        case TMPL_RACING: {
+            Profile p = createBlank("Racing");
+            p.keymapEnabled = true;
+            p.edgeAnchored = true;
+            p.refAspect = 2.1667f;
+            p.buttons.push_back(makeNode("LEFT",  'A',        NODE_PRESS, 0.125f, 0.780f));
+            p.buttons.push_back(makeNode("RIGHT", 'D',        NODE_PRESS, 0.255f, 0.780f));
+            p.buttons.push_back(makeNode("GAS",   'W',        NODE_PRESS, 0.900f, 0.780f));
+            p.buttons.push_back(makeNode("BRAKE", 'S',        NODE_PRESS, 0.775f, 0.840f));
+            p.buttons.push_back(makeNode("NITRO", VK_LSHIFT,  NODE_PRESS, 0.845f, 0.630f));
+            p.buttons.push_back(makeNode("DRIFT", VK_SPACE,   NODE_PRESS, 0.720f, 0.720f));
+            return p;
+        }
+        case TMPL_PLATFORMER: {
+            Profile p = createBlank("Platformer");
+            p.keymapEnabled = true;
+            p.edgeAnchored = true;
+            p.refAspect = 2.1667f;
+            p.joyX = 0.165f;
+            p.joyY = 0.760f;
+            p.buttons.push_back(makeNode("JUMP",  VK_SPACE,  NODE_PRESS, 0.905f, 0.775f));
+            p.buttons.push_back(makeNode("DASH",  VK_LSHIFT, NODE_CLICK, 0.815f, 0.735f));
+            p.buttons.push_back(makeNode("ATK",   'J',       NODE_PRESS, 0.835f, 0.865f));
+            p.buttons.push_back(makeNode("USE",   'E',       NODE_CLICK, 0.885f, 0.595f));
+            return p;
+        }
+        default:
+            return createDesktop("Desktop (Typing)");
+    }
 }
 
 bool ProfileDefaults::matchesPackage(const std::string& packageList, const std::string& activePkg) {

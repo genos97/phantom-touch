@@ -1,8 +1,10 @@
 #include "ui/DrawerPanel.hpp"
 #include "config/KeyCodes.hpp"
 #include "config/ProfileStore.hpp"
+#include "ui/EditorState.hpp"
 #include "ui/Theme.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 
@@ -48,6 +50,21 @@ std::string baseName(const std::string& p) {
 
 int dp(int px) {
     return GdiPlusDraw::dp(px);
+}
+
+bool containsCaseInsensitive(const std::string& hay, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (hay.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            unsigned char a = static_cast<unsigned char>(hay[i + j]);
+            unsigned char b = static_cast<unsigned char>(needle[j]);
+            if (std::tolower(a) != std::tolower(b)) { ok = false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -297,17 +314,54 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
 int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
                               const Profile& p, int selectedBtnIndex, bool waitingRebind,
                               int hoverX, int hoverY) {
+    // 0. Quick Edit <-> Live Test toggle (test keymap without closing KEYS panel!)
+    {
+        RECT rTest = { x, y, x + w, y + 28 };
+        bool hovT = ptIn(rTest, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rTest, 7.0f,
+                                 editTestLive_ ? (hovT ? Theme::ACCENT_AMBER : Theme::ACCENT_AMBER_BG)
+                                               : (hovT ? Theme::ACCENT_GREEN : Theme::ACCENT_GREEN_BG),
+                                 editTestLive_ ? Theme::ACCENT_AMBER : Theme::ACCENT_GREEN, 1.1f);
+        GdiPlusDraw::textCenter(g,
+            editTestLive_ ? "LIVE TEST ACTIVE (Click to resume Edit)" : "TEST LIVE (Pause Edit Mode)",
+            static_cast<float>(x + w / 2), static_cast<float>(y + 14),
+            10.5f, true,
+            hovT ? 0xFF07130Du : (editTestLive_ ? Theme::ACCENT_AMBER : Theme::ACCENT_GREEN));
+        if (rTest.bottom > bodyClip_.top && rTest.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rTest, DA_TOGGLE_EDIT_TEST, 0 });
+        }
+        y += 34;
+    }
+
     // 1. Docked Selected Key Inspector (ALWAYS visible at top when a key is selected!)
     if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(p.buttons.size())) {
         const KeyNode& node = p.buttons[selectedBtnIndex];
-        RECT card = { x, y, x + w, y + 320 };
-        GdiPlusDraw::roundedCard(g, card, 10.0f, Theme::BG_CARD, Theme::ACCENT_CYAN, 1.4f);
+        std::vector<KeyConflict> conflicts = EditorGeometry::detectConflicts(p, true);
+        std::string conflictMsg;
+        for (size_t ci = 0; ci < conflicts.size(); ++ci) {
+            if (conflicts[ci].buttonIndex == selectedBtnIndex) {
+                conflictMsg = conflicts[ci].reason;
+                break;
+            }
+        }
+        int extraH = conflictMsg.empty() ? 0 : 22;
+        RECT card = { x, y, x + w, y + 320 + extraH };
+        GdiPlusDraw::roundedCard(g, card, 10.0f, Theme::BG_CARD,
+                                 conflictMsg.empty() ? Theme::ACCENT_CYAN : Theme::ACCENT_AMBER, 1.4f);
 
         int ix = x + 10;
         int iw = w - 20;
         int cy = y + 10;
         GdiPlusDraw::textLeft(g, "SELECTED KEY INSPECTOR", static_cast<float>(ix), static_cast<float>(cy + 7), 10.5f, true, Theme::ACCENT_CYAN);
         cy += 22;
+
+        if (!conflictMsg.empty()) {
+            RECT rWarn = { ix, cy, ix + iw, cy + 18 };
+            GdiPlusDraw::roundedCard(g, rWarn, 4.0f, Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 0.9f);
+            GdiPlusDraw::textLeft(g, "! " + conflictMsg, static_cast<float>(ix + 6), static_cast<float>(cy + 9),
+                                  9.5f, true, Theme::ACCENT_AMBER, static_cast<float>(iw - 12));
+            cy += 22;
+        }
 
         // Label field
         RECT rLbl = { ix, cy, ix + iw, cy + 26 };
@@ -374,7 +428,7 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         GdiPlusDraw::roundedCard(g, rAct,  5.0f, Theme::BG_INPUT, Theme::BORDER_SUBTLE, 1.0f);
         GdiPlusDraw::roundedCard(g, rNext, 5.0f, ptIn(rNext, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_INPUT, Theme::BORDER_STRONG, 1.0f);
         GdiPlusDraw::textCenter(g, "<", static_cast<float>(rPrev.left + rPrev.right) * 0.5f, static_cast<float>(cy + 13), 12.0f, true, Theme::TEXT_PRIMARY);
-        GdiPlusDraw::textCenter(g, ProfileDefaults::actionTypeToName(node.action), static_cast<float>(rAct.left + rAct.right) * 0.5f, static_cast<float>(cy + 13), 11.5f, true, Theme::ACCENT_GREEN);
+        GdiPlusDraw::textCenter(g, ProfileDefaults::actionTypeToHumanLabel(node.action), static_cast<float>(rAct.left + rAct.right) * 0.5f, static_cast<float>(cy + 13), 11.5f, true, Theme::ACCENT_GREEN);
         GdiPlusDraw::textCenter(g, ">", static_cast<float>(rNext.left + rNext.right) * 0.5f, static_cast<float>(cy + 13), 12.0f, true, Theme::TEXT_PRIMARY);
         if (rPrev.bottom > bodyClip_.top && rPrev.top < bodyClip_.bottom) {
             hotspots_.push_back(Hotspot{ rPrev, DA_INSP_ACT_PREV, 0 });
@@ -426,9 +480,25 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         y = hint.bottom + 12;
     }
 
-    // 2. Add New Controls Palette (10 action types)
+    // 2. Add New Controls Palette (10 action types + live search filter)
     GdiPlusDraw::textLeft(g, "ADD NEW CONTROL TO PHONE", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
     y += 22;
+
+    RECT rPS = { x, y, x + w, y + 24 };
+    GdiPlusDraw::roundedCard(g, rPS, 6.0f, Theme::BG_INPUT,
+                             editingPaletteSearch_ ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE,
+                             editingPaletteSearch_ ? 1.3f : 1.0f);
+    std::string psTxt = paletteSearch_.empty()
+        ? (editingPaletteSearch_ ? "Type to filter controls... _" : "Filter controls (Tap, Hold, Swipe, Scope)...")
+        : ("Filter: " + paletteSearch_ + (editingPaletteSearch_ ? "_" : ""));
+    GdiPlusDraw::textLeft(g, psTxt, static_cast<float>(x + 9), static_cast<float>(y + 12), 10.5f,
+                          !paletteSearch_.empty(),
+                          paletteSearch_.empty() ? Theme::TEXT_MUTED : Theme::TEXT_PRIMARY,
+                          static_cast<float>(w - 18));
+    if (rPS.bottom > bodyClip_.top && rPS.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rPS, DA_FOCUS_PALETTE_SEARCH, 0 });
+    }
+    y += 30;
 
     struct PaletteSpec {
         const char* title;
@@ -437,36 +507,56 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         uint32_t accent;
     };
     static const PaletteSpec items[10] = {
-        { "+ Press Key",     "Hold touch down",     NODE_PRESS,          Theme::ACCENT_CYAN },
-        { "+ Tap / Click",   "Fixed single tap",    NODE_CLICK,          Theme::ACCENT_CYAN },
-        { "+ Hold-to-ADS",   "Tap on down & up",    NODE_DOWN_UP,        Theme::ACCENT_GREEN },
+        { "+ Hold Key",      "Hold touch down",     NODE_PRESS,          Theme::ACCENT_CYAN },
+        { "+ Tap",           "Fixed single tap",    NODE_CLICK,          Theme::ACCENT_CYAN },
+        { "+ Tap Down & Up", "ADS / hold-to-scope", NODE_DOWN_UP,        Theme::ACCENT_GREEN },
         { "+ Free Look",     "Temp drag-look",      NODE_HOLD_VIEW,      0xFF00F0F0u },
         { "+ Swipe",         "Drag A -> B",         NODE_SWIPE,          Theme::ACCENT_AMBER },
         { "+ Cursor Toggle", "Bag / Map unlock",    NODE_CURSOR_TOGGLE,  Theme::ACCENT_PURPLE },
-        { "+ View Reset",    "Re-center camera",    NODE_RESET_VIEW,     Theme::ACCENT_AMBER },
-        { "+ Scope Sens",    "ADS sensitivity",     NODE_SWITCH_SENS,    Theme::ACCENT_PURPLE },
-        { "+ Fix Joystick",  "Unstick WASD",        NODE_REACTIVATE_JOY, Theme::ACCENT_GREEN },
-        { "+ Up Trigger",    "Tap on release",      NODE_UP_TRIGGER,     Theme::TEXT_SECONDARY }
+        { "+ Reset Camera",  "Re-center view",      NODE_RESET_VIEW,     Theme::ACCENT_AMBER },
+        { "+ Sensitivity",   "Scope / ADS switch",  NODE_SWITCH_SENS,    Theme::ACCENT_PURPLE },
+        { "+ Reset Joy",     "Unstick WASD",        NODE_REACTIVATE_JOY, Theme::ACCENT_GREEN },
+        { "+ Release Tap",   "Tap on key release",  NODE_UP_TRIGGER,     Theme::TEXT_SECONDARY }
     };
+
+    std::vector<int> matched;
+    for (int i = 0; i < 10; ++i) {
+        if (containsCaseInsensitive(items[i].title, paletteSearch_) ||
+            containsCaseInsensitive(items[i].sub, paletteSearch_) ||
+            containsCaseInsensitive(ProfileDefaults::actionTypeToHumanLabel(items[i].type), paletteSearch_)) {
+            matched.push_back(i);
+        }
+    }
 
     int colW = (w - 8) / 2;
     int tileH = 44;
-    for (int i = 0; i < 10; ++i) {
-        int col = i % 2;
-        int row = i / 2;
-        int tx = x + col * (colW + 8);
-        int ty = y + row * (tileH + 6);
-        RECT r = { tx, ty, tx + colW, ty + tileH };
-        bool hov = ptIn(r, hoverX, hoverY);
-        GdiPlusDraw::roundedCard(g, r, 8.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
-                                 hov ? items[i].accent : Theme::BORDER_SUBTLE, hov ? 1.3f : 1.0f);
-        GdiPlusDraw::textLeft(g, items[i].title, static_cast<float>(tx + 10), static_cast<float>(ty + 15), 11.5f, true, items[i].accent, static_cast<float>(colW - 14));
-        GdiPlusDraw::textLeft(g, items[i].sub, static_cast<float>(tx + 10), static_cast<float>(ty + 31), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(colW - 14));
-        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) {
-            hotspots_.push_back(Hotspot{ r, DA_ADD_NODE, static_cast<int>(items[i].type) });
+    if (matched.empty()) {
+        RECT rEmpty = { x, y, x + w, y + 32 };
+        GdiPlusDraw::roundedCard(g, rEmpty, 7.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "No controls match '" + paletteSearch_ + "'",
+                                static_cast<float>(x + w / 2), static_cast<float>(y + 16),
+                                10.5f, false, Theme::TEXT_MUTED);
+        y += 38;
+    } else {
+        for (size_t mi = 0; mi < matched.size(); ++mi) {
+            int i = matched[mi];
+            int col = static_cast<int>(mi) % 2;
+            int row = static_cast<int>(mi) / 2;
+            int tx = x + col * (colW + 8);
+            int ty = y + row * (tileH + 6);
+            RECT r = { tx, ty, tx + colW, ty + tileH };
+            bool hov = ptIn(r, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, r, 8.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+                                     hov ? items[i].accent : Theme::BORDER_SUBTLE, hov ? 1.3f : 1.0f);
+            GdiPlusDraw::textLeft(g, items[i].title, static_cast<float>(tx + 10), static_cast<float>(ty + 15), 11.5f, true, items[i].accent, static_cast<float>(colW - 14));
+            GdiPlusDraw::textLeft(g, items[i].sub, static_cast<float>(tx + 10), static_cast<float>(ty + 31), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(colW - 14));
+            if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) {
+                hotspots_.push_back(Hotspot{ r, DA_ADD_NODE, static_cast<int>(items[i].type) });
+            }
         }
+        int rows = (static_cast<int>(matched.size()) + 1) / 2;
+        y += rows * (tileH + 6) + 8;
     }
-    y += 5 * (tileH + 6) + 8;
 
     RECT rClr = { x, y, x + w, y + 28 };
     bool hovClr = ptIn(rClr, hoverX, hoverY);
@@ -739,6 +829,46 @@ int DrawerPanel::paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
         hotspots_.push_back(Hotspot{ rClone, DA_CREATE_CLONE, 0 });
     }
     y += 40;
+
+    // 2x3 Starter Templates Gallery (F4)
+    GdiPlusDraw::textLeft(g, "STARTER TEMPLATES", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    y += 20;
+    const int tColW = (w - 8) / 2;
+    const int tTileH = 26;
+    for (int ti = 0; ti < 6; ++ti) {
+        int col = ti % 2;
+        int row = ti / 2;
+        RECT rt = { x + col * (tColW + 8), y + row * (tTileH + 6), x + col * (tColW + 8) + tColW, y + row * (tTileH + 6) + tTileH };
+        bool hovT = ptIn(rt, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rt, 6.0f, hovT ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+                                 hovT ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, ProfileDefaults::templateName(static_cast<ProfileTemplateKind>(ti)),
+                                static_cast<float>(rt.left + rt.right) * 0.5f,
+                                static_cast<float>(rt.top + rt.bottom) * 0.5f,
+                                10.0f, true, hovT ? Theme::ACCENT_CYAN : Theme::TEXT_PRIMARY);
+        if (rt.bottom > bodyClip_.top && rt.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rt, DA_CREATE_TEMPLATE, ti });
+        }
+    }
+    y += 3 * (tTileH + 6) + 8;
+
+    // Import / Export / Copy Text (F4)
+    int tw3 = (w - 12) / 3;
+    RECT rImp = { x, y, x + tw3, y + 26 };
+    RECT rExp = { rImp.right + 6, y, rImp.right + 6 + tw3, y + 26 };
+    RECT rCpy = { rExp.right + 6, y, x + w, y + 26 };
+    GdiPlusDraw::roundedCard(g, rImp, 6.0f, ptIn(rImp, hoverX, hoverY) ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD, Theme::ACCENT_CYAN, 1.0f);
+    GdiPlusDraw::roundedCard(g, rExp, 6.0f, ptIn(rExp, hoverX, hoverY) ? Theme::ACCENT_GREEN_BG : Theme::BG_CARD, Theme::ACCENT_GREEN, 1.0f);
+    GdiPlusDraw::roundedCard(g, rCpy, 6.0f, ptIn(rCpy, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "Import .cfg", static_cast<float>(rImp.left + rImp.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::ACCENT_CYAN);
+    GdiPlusDraw::textCenter(g, "Export .cfg", static_cast<float>(rExp.left + rExp.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::ACCENT_GREEN);
+    GdiPlusDraw::textCenter(g, "Copy Text", static_cast<float>(rCpy.left + rCpy.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::TEXT_SECONDARY);
+    if (rImp.bottom > bodyClip_.top && rImp.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rImp, DA_IMPORT_PROFILE, 0 });
+        hotspots_.push_back(Hotspot{ rExp, DA_EXPORT_PROFILE, 0 });
+        hotspots_.push_back(Hotspot{ rCpy, DA_COPY_PROFILE_TEXT, 0 });
+    }
+    y += 34;
 
     // Shareable Edge-Anchored Aspect Scaling (survives 20:9 <-> 16:9 screens!)
     char aspLbl[80];
@@ -1110,10 +1240,13 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 out.addNodeLabel = ProfileDefaults::actionTypeToName(out.addNodeType);
                 return true;
             case DA_CLEAR_BUTTONS:
-                profile.buttons.clear();
-                selectedBtnIndex = -1;
-                out.profileModified = true;
-                out.toastMessage = "Cleared extra keys (WASD / AIM / FIRE kept)";
+                out.requestClearButtonsUndo = true;
+                return true;
+            case DA_FOCUS_PALETTE_SEARCH:
+                editingPaletteSearch_ = true;
+                return true;
+            case DA_TOGGLE_EDIT_TEST:
+                out.requestToggleEditTest = true;
                 return true;
             case DA_INSP_LABEL: editingNodeLabel_ = true; return true;
             case DA_INSP_REBIND: out.requestStartRebindNode = true; return true;
@@ -1251,11 +1384,24 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                     } else if (lstrcmpiA(profileEntries_[hs.extra].path.c_str(), activeProfilePath_.c_str()) == 0) {
                         out.toastMessage = "Switch to another config before deleting the active one";
                     } else {
-                        std::remove(profileEntries_[hs.extra].path.c_str());
-                        out.toastMessage = "Deleted " + profileEntries_[hs.extra].fileName;
-                        refreshProfileList();
+                        out.requestDeleteProfileTrash = true;
+                        out.deleteProfilePath = profileEntries_[hs.extra].path;
+                        out.deleteProfileName = profileEntries_[hs.extra].fileName;
                     }
                 }
+                return true;
+            case DA_CREATE_TEMPLATE:
+                out.requestCreateTemplate = true;
+                out.templateKind = hs.extra;
+                return true;
+            case DA_IMPORT_PROFILE:
+                out.requestImportProfile = true;
+                return true;
+            case DA_EXPORT_PROFILE:
+                out.requestExportProfile = true;
+                return true;
+            case DA_COPY_PROFILE_TEXT:
+                out.requestCopyProfileText = true;
                 return true;
 
             case DA_TOGGLE_KEYMAP_MODE:
@@ -1436,6 +1582,11 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
         specialRebind_ = SRB_NONE;
         return true;
     }
+    if (editingPaletteSearch_) {
+        if (vk == VK_RETURN || vk == VK_ESCAPE) { editingPaletteSearch_ = false; return true; }
+        if (vk == VK_BACK && !paletteSearch_.empty()) paletteSearch_.pop_back();
+        return true;
+    }
     if (editingNewProfileName_) {
         if (vk == VK_RETURN || vk == VK_ESCAPE) { editingNewProfileName_ = false; return true; }
         if (vk == VK_BACK && !newProfileName_.empty()) newProfileName_.pop_back();
@@ -1494,6 +1645,10 @@ bool DrawerPanel::onMouseBind(int mouseVk, Profile& profile, DrawerActionResult&
 bool DrawerPanel::onChar(char ch, Profile& profile, AppSettings& settings,
                          int selectedBtnIndex, DrawerActionResult& out) {
     if (ch < 32 || ch > 126) return false;
+    if (editingPaletteSearch_) {
+        if (paletteSearch_.size() < 24) paletteSearch_.push_back(ch);
+        return true;
+    }
     if (editingNewProfileName_) {
         if (newProfileName_.size() < 24) newProfileName_.push_back(ch);
         return true;

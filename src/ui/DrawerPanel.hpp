@@ -3,6 +3,7 @@
 #include "bridge/ScrcpyBridge.hpp"
 #include "config/AppSettings.hpp"
 #include "config/Profile.hpp"
+#include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
 #include "video/LatencyTelemetry.hpp"
 
@@ -19,6 +20,8 @@ enum DrawerActionId {
 
     // Keys tab
     DA_ADD_NODE,        // extra = KeyActionType
+    DA_FOCUS_PALETTE_SEARCH,
+    DA_TOGGLE_EDIT_TEST,
     DA_CLEAR_BUTTONS,
     DA_INSP_LABEL,
     DA_INSP_REBIND,
@@ -64,6 +67,10 @@ enum DrawerActionId {
     DA_FOCUS_NEW_NAME,
     DA_CREATE_BLANK,
     DA_CREATE_CLONE,
+    DA_CREATE_TEMPLATE, // extra = ProfileTemplateKind
+    DA_IMPORT_PROFILE,
+    DA_EXPORT_PROFILE,
+    DA_COPY_PROFILE_TEXT,
     DA_LOAD_PROFILE,    // extra = idx
     DA_DELETE_PROFILE,  // extra = idx
     DA_TOGGLE_KEYMAP_MODE,
@@ -123,6 +130,16 @@ struct DrawerActionResult {
     bool requestRunLatencyProbe = false;
     bool vsyncToggled = false;
     bool requestOpenOnboarding = false;
+    bool requestToggleEditTest = false;
+    bool requestCreateTemplate = false;
+    int templateKind = 0;
+    bool requestImportProfile = false;
+    bool requestExportProfile = false;
+    bool requestCopyProfileText = false;
+    bool requestClearButtonsUndo = false;
+    bool requestDeleteProfileTrash = false;
+    std::string deleteProfilePath;
+    std::string deleteProfileName;
     std::string toastMessage;
 };
 
@@ -154,8 +171,9 @@ public:
         deviceEncoders_ = encoders;
     }
     void setPendingStreamChanges(bool pending) { pendingStreamChanges_ = pending; }
+    void setEditTestLive(bool live) { editTestLive_ = live; }
 
-    bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_; }
+    bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_ || editingPaletteSearch_; }
     bool isWaitingSpecialRebind() const { return specialRebind_ != SRB_NONE; }
     bool isRebindingToggleAim() const { return specialRebind_ == SRB_TOGGLE_AIM; }
     bool isRebindingHoldUnlock() const { return specialRebind_ == SRB_HOLD_UNLOCK; }
@@ -167,6 +185,7 @@ public:
         editingNewProfileName_ = false;
         editingNodeLabel_ = false;
         editingWireless_ = false;
+        editingPaletteSearch_ = false;
         specialRebind_ = SRB_NONE;
     }
 
@@ -269,6 +288,9 @@ private:
     bool editingNewProfileName_ = false;
     bool editingNodeLabel_ = false;
     bool editingWireless_ = false;
+    bool editingPaletteSearch_ = false;
+    bool editTestLive_ = false;
+    std::string paletteSearch_;
     bool advancedExpanded_ = false;
     bool pendingStreamChanges_ = false;
     SpecialRebindTarget specialRebind_ = SRB_NONE;

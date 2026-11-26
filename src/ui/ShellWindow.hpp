@@ -141,6 +141,8 @@ private:
     void toggleHud();
     void triggerQuickReset();
     void showToast(const std::string& msg, DWORD durationMs = 2200);
+    void showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs = 6000);
+    bool triggerShellUndo();
     RECT shellToastRect() const;
 
     void applyProfileToEngine(bool autoSaveNow = true);
@@ -281,6 +283,7 @@ private:
     bool demoMode_ = false;
     bool drawerOpen_ = false;
     bool editMode_ = false;
+    bool editTestLive_ = false;
     bool aimMode_ = false;
     bool fullscreen_ = false;
     RECT preFullscreenRect_;
@@ -369,8 +372,14 @@ private:
     int lastHoverItemId_ = -1;
     RECT lastHoverRc_ = { 0, 0, 0, 0 };
     std::string shellToastMsg_;
+    std::string shellToastActionLabel_;
+    RECT shellToastActionRc_ = {0, 0, 0, 0};
     DWORD shellToastExpireTick_ = 0;
     bool shellToastWasVisible_ = false;
+    enum PendingUndoKind { UNDO_NONE = 0, UNDO_HUD_EDIT, UNDO_TRASH_PROFILE };
+    PendingUndoKind pendingUndoKind_ = UNDO_NONE;
+    std::string undoTrashPath_;
+    std::string undoTrashOrigPath_;
 
     // F1 / F3 / X2 / F16 Connection Manager, Onboarding & Pending-Stream State
     bool showOnboarding_ = false;

@@ -4,6 +4,7 @@
 #include "ui/Theme.hpp"
 
 #include <shellapi.h>
+#include <commdlg.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -59,6 +60,63 @@ float clampRange(float v, float lo, float hi) {
 
 bool ptIn(const RECT& r, int x, int y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+std::wstring utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), NULL, 0);
+    if (len <= 0) return std::wstring();
+    std::wstring w(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &w[0], len);
+    return w;
+}
+
+std::string wideToUtf8(const wchar_t* ws) {
+    if (!ws || !*ws) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, NULL, 0, NULL, NULL);
+    if (len <= 1) return std::string();
+    std::string s(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, &s[0], len - 1, NULL, NULL);
+    return s;
+}
+
+bool isCfgFilePath(const std::string& p) {
+    size_t dot = p.find_last_of('.');
+    return (dot != std::string::npos && lstrcmpiA(p.c_str() + dot, ".cfg") == 0);
+}
+
+std::string makeUniqueProfilePath(const std::string& dir, const std::string& rawName, std::string& outFname) {
+    std::string base = ProfileStore::sanitizeFilename(rawName);
+    outFname = base;
+    std::string full = dir + "\\" + outFname + ".cfg";
+    int suffix = 2;
+    while (GetFileAttributesA(full.c_str()) != INVALID_FILE_ATTRIBUTES && suffix < 200) {
+        char sbuf[32];
+        std::snprintf(sbuf, sizeof(sbuf), "_%d", suffix++);
+        outFname = base + sbuf;
+        full = dir + "\\" + outFname + ".cfg";
+    }
+    return full;
+}
+
+bool writeClipboardUtf8(HWND owner, const std::string& utf8) {
+    std::wstring w = utf8ToWide(utf8);
+    if (w.empty() || !OpenClipboard(owner)) return false;
+    EmptyClipboard();
+    SIZE_T bytes = (w.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hMem) {
+        CloseClipboard();
+        return false;
+    }
+    void* ptr = GlobalLock(hMem);
+    if (ptr) {
+        std::memcpy(ptr, w.c_str(), bytes);
+        GlobalUnlock(hMem);
+    }
+    SetClipboardData(CF_UNICODETEXT, hMem);
+    CloseClipboard();
+    return true;
 }
 
 } // namespace
@@ -399,6 +457,7 @@ bool ShellWindow::saveCurrentProfile(bool silent) {
     if (ProfileStore::save(profilePath_, profile_)) {
         ProfileStore::saveLastActive(profilesDir_, profilePath_);
         profileDirty_ = false;
+        hasPendingProfileSave_ = false;
         if (!silent) {
             drawerPanel_.refreshProfileList();
             showToast("Saved config -> " + profile_.name, 2000);
@@ -473,6 +532,12 @@ void ShellWindow::syncHudAndVideo() {
         if (pw != lastPhoneW_ || ph != lastPhoneH_) {
             lastPhoneW_ = pw;
             lastPhoneH_ = ph;
+            if (pw >= 64 && ph >= 64 &&
+                (settings_.lastPhoneW != static_cast<int>(pw) || settings_.lastPhoneH != static_cast<int>(ph))) {
+                settings_.lastPhoneW = static_cast<int>(pw);
+                settings_.lastPhoneH = static_cast<int>(ph);
+                scheduleSettingsSave();
+            }
             viewportHost_.updateVideoLayout(pw, ph);
             viewportHost_.renderNativeFrame(true);
             invalidateShell();
@@ -485,7 +550,11 @@ void ShellWindow::syncHudAndVideo() {
             }
         }
     } else if (demoMode_) {
-        viewportHost_.updateVideoLayout(1920, 1080);
+        uint32_t dw = static_cast<uint32_t>(settings_.lastPhoneW >= 64 ? settings_.lastPhoneW : 1920);
+        uint32_t dh = static_cast<uint32_t>(settings_.lastPhoneH >= 64 ? settings_.lastPhoneH : 1080);
+        lastPhoneW_ = dw;
+        lastPhoneH_ = dh;
+        viewportHost_.updateVideoLayout(dw, dh);
     }
 
     if (viewportHost_.hwnd() && IsWindow(viewportHost_.hwnd())) {
@@ -1733,6 +1802,10 @@ bool ShellWindow::switchProfilePath(const std::string& targetPath, bool showAuto
     }
     hudOverlay_.setSelectedBtnIndex(-1);
     hudOverlay_.cancelRebind();
+    hudOverlay_.clearUndo();
+    if (pendingUndoKind_ == UNDO_HUD_EDIT) {
+        pendingUndoKind_ = UNDO_NONE;
+    }
     if (!profile_.keymapEnabled && aimMode_) {
         setAimMode(false);
     }
@@ -2027,13 +2100,19 @@ void ShellWindow::setDrawerState(bool open, int tab) {
     if (open) {
         drawerPanel_.setActiveTab(tab);
         drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+        if (tab != 0) {
+            editTestLive_ = false;
+            drawerPanel_.setEditTestLive(false);
+        }
     } else {
+        editTestLive_ = false;
+        drawerPanel_.setEditTestLive(false);
         hudOverlay_.cancelRebind();
         drawerPanel_.clearFocus();
     }
 
-    // N32: ONLY KEYS tab (0) enters Edit Mode; SENS (1), PROFILES (2), and DEVICE (3) stay playable!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && (bridge_->isConnected() || demoMode_));
+    // N32: ONLY KEYS tab (0) enters Edit Mode unless Test Live is active; SENS/PROFILES/DEVICE stay playable!
+    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && !editTestLive_ && (bridge_->isConnected() || demoMode_));
     setEditMode(wantEdit);
     layoutChildren();
 }
@@ -2151,11 +2230,15 @@ RECT ShellWindow::shellToastRect() const {
 void ShellWindow::showToast(const std::string& msg, DWORD durationMs) {
     if (bridge_->isConnected() || demoMode_) {
         shellToastMsg_.clear();
+        shellToastActionLabel_.clear();
+        ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
         shellToastWasVisible_ = false;
         hudOverlay_.showToast(msg, durationMs);
         return;
     }
     shellToastMsg_ = msg;
+    shellToastActionLabel_.clear();
+    ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
     shellToastExpireTick_ = GetTickCount() + durationMs;
     shellToastWasVisible_ = !msg.empty();
     if (hwnd_) {
@@ -2166,6 +2249,57 @@ void ShellWindow::showToast(const std::string& msg, DWORD durationMs) {
             invalidateShell();
         }
     }
+}
+
+void ShellWindow::showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs) {
+    if (bridge_->isConnected() || demoMode_) {
+        shellToastMsg_.clear();
+        shellToastActionLabel_.clear();
+        ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
+        shellToastWasVisible_ = false;
+        hudOverlay_.showSnackbar(msg, actionLabel, durationMs);
+        return;
+    }
+    shellToastMsg_ = msg;
+    shellToastActionLabel_ = actionLabel;
+    ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
+    shellToastExpireTick_ = GetTickCount() + durationMs;
+    shellToastWasVisible_ = !msg.empty();
+    if (hwnd_) {
+        RECT tr = shellToastRect();
+        if (tr.right > tr.left && tr.bottom > tr.top) {
+            InvalidateRect(hwnd_, &tr, FALSE);
+        } else {
+            invalidateShell();
+        }
+    }
+}
+
+bool ShellWindow::triggerShellUndo() {
+    if (pendingUndoKind_ == UNDO_TRASH_PROFILE &&
+        !undoTrashPath_.empty() && !undoTrashOrigPath_.empty()) {
+        std::string tp = undoTrashPath_;
+        std::string op = undoTrashOrigPath_;
+        pendingUndoKind_ = UNDO_NONE;
+        undoTrashPath_.clear();
+        undoTrashOrigPath_.clear();
+        if (ProfileStore::restoreFromTrash(tp, op)) {
+            drawerPanel_.refreshProfileList();
+            showToast("Restored deleted config", 1800);
+            invalidateShell();
+            return true;
+        }
+        return false;
+    }
+    if (hudOverlay_.canUndo()) {
+        pendingUndoKind_ = UNDO_NONE;
+        shellToastMsg_.clear();
+        shellToastActionLabel_.clear();
+        ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
+        shellToastWasVisible_ = false;
+        return hudOverlay_.undo();
+    }
+    return false;
 }
 
 void ShellWindow::triggerQuickReset() {
@@ -2197,7 +2331,16 @@ void ShellWindow::hudOnProfileChanged(bool commitSaveNow) {
         hudOverlay_.invalidate();
         return;
     }
-    applyProfileToEngine(true);
+    // N33: apply live + debounce async disk save 500ms after edit commit
+    engine_->setProfile(profile_);
+    hudOverlay_.applyOpacity(editMode_, profile_.hudOpacity);
+    profileDirty_ = true;
+    lastHudSig_.valid = false;
+    lastTopBarSig_.valid = false;
+    profileSaveDueTick_ = GetTickCount() + 500;
+    hasPendingProfileSave_ = true;
+    hudOverlay_.invalidate();
+    invalidateShell();
 }
 
 void ShellWindow::hudOnRequestSave() {
@@ -2283,6 +2426,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         showToast(b, 2200);
     }
     if (res.requestAddNode) {
+        Profile beforeAdd = profile_;
         KeyNode n;
         n.label = res.addNodeLabel.size() > 7 ? res.addNodeLabel.substr(0, 7) : res.addNodeLabel;
         n.vk = 'K';
@@ -2296,10 +2440,105 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         n.radius = 0.030f;
         profile_.buttons.push_back(n);
         int newIdx = static_cast<int>(profile_.buttons.size()) - 1;
-        hudOverlay_.setSelectedBtnIndex(newIdx);
-        hudOverlay_.startRebind(HUD_REBIND_BUTTON);
+        hudOverlay_.startNewNodeCapture(newIdx, beforeAdd);
         applyProfileToEngine(true);
-        showToast("Added " + ProfileDefaults::actionTypeToName(n.action) + "! Press ANY Key, Mouse Btn, or Scroll.", 3200);
+        showToast("Added " + ProfileDefaults::actionTypeToHumanLabel(n.action) + "! Press ANY Key, Mouse Btn, or Scroll (Esc cancels).", 3200);
+    }
+    if (res.requestClearButtonsUndo) {
+        if (profile_.buttons.empty()) {
+            showToast("No extra keys to clear", 1400);
+        } else {
+            hudOverlay_.pushUndoSnapshot(profile_, "Clear extra keys");
+            profile_.buttons.clear();
+            hudOverlay_.setSelectedBtnIndex(-1);
+            hudOverlay_.cancelRebind();
+            applyProfileToEngine(true);
+            pendingUndoKind_ = UNDO_HUD_EDIT;
+            showSnackbar("Cleared extra keys", "Undo", 6000);
+        }
+    }
+    if (res.requestToggleEditTest) {
+        editTestLive_ = !editTestLive_;
+        drawerPanel_.setEditTestLive(editTestLive_);
+        showToast(editTestLive_ ? "Live Test active — play directly on phone!" : "Resumed Keymap Edit Mode", 1800);
+    }
+    if (res.requestCreateTemplate) {
+        Profile np = ProfileDefaults::createTemplate(static_cast<ProfileTemplateKind>(res.templateKind));
+        std::string fname;
+        std::string fullPath = makeUniqueProfilePath(profilesDir_, np.name, fname);
+        if (ProfileStore::save(fullPath, np)) {
+            drawerPanel_.refreshProfileList();
+            switchProfilePath(fullPath, false);
+            showToast("Created template: " + np.name, 2200);
+        } else {
+            showToast("ERROR: Could not create template file", 2600);
+        }
+    }
+    if (res.requestImportProfile) {
+        wchar_t fileBuf[MAX_PATH * 2] = {0};
+        OPENFILENAMEW ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"Phantom Touch Profiles (*.cfg)\0*.cfg\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = fileBuf;
+        ofn.nMaxFile = sizeof(fileBuf) / sizeof(fileBuf[0]);
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        std::wstring initDir = utf8ToWide(profilesDir_);
+        if (!initDir.empty()) ofn.lpstrInitialDir = initDir.c_str();
+        if (GetOpenFileNameW(&ofn)) {
+            std::string savedPath, impErr;
+            if (ProfileStore::importProfileFile(wideToUtf8(fileBuf), profilesDir_, savedPath, impErr)) {
+                drawerPanel_.refreshProfileList();
+                switchProfilePath(savedPath, false);
+                showToast("Imported config: " + profile_.name, 2200);
+            } else {
+                showToast("Import failed: " + impErr, 3000);
+            }
+        }
+    }
+    if (res.requestExportProfile) {
+        wchar_t fileBuf[MAX_PATH * 2] = {0};
+        std::wstring defName = utf8ToWide(ProfileStore::sanitizeFilename(profile_.name) + ".cfg");
+        if (!defName.empty() && defName.size() < MAX_PATH) {
+            std::memcpy(fileBuf, defName.c_str(), (defName.size() + 1) * sizeof(wchar_t));
+        }
+        OPENFILENAMEW ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"Phantom Touch Profiles (*.cfg)\0*.cfg\0";
+        ofn.lpstrDefExt = L"cfg";
+        ofn.lpstrFile = fileBuf;
+        ofn.nMaxFile = sizeof(fileBuf) / sizeof(fileBuf[0]);
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+        if (GetSaveFileNameW(&ofn)) {
+            std::string destPath = wideToUtf8(fileBuf);
+            if (ProfileStore::save(destPath, profile_)) {
+                showToast("Exported profile -> " + destPath, 2400);
+            } else {
+                showToast("Export failed: could not write file", 2800);
+            }
+        }
+    }
+    if (res.requestCopyProfileText) {
+        if (writeClipboardUtf8(hwnd_, ProfileStore::serializeToString(profile_))) {
+            showToast("Copied profile config text to clipboard", 2000);
+        } else {
+            showToast("Could not access Windows clipboard", 2000);
+        }
+    }
+    if (res.requestDeleteProfileTrash && !res.deleteProfilePath.empty()) {
+        std::string trashPath;
+        if (ProfileStore::moveToTrash(res.deleteProfilePath, profilesDir_, trashPath)) {
+            drawerPanel_.refreshProfileList();
+            pendingUndoKind_ = UNDO_TRASH_PROFILE;
+            undoTrashPath_ = trashPath;
+            undoTrashOrigPath_ = res.deleteProfilePath;
+            showSnackbar("Deleted " + res.deleteProfileName, "Undo", 6000);
+        } else {
+            showToast("Could not delete " + res.deleteProfileName, 2200);
+        }
     }
     if (res.requestStartRebindNode && hudOverlay_.selectedBtnIndex() >= 0 &&
         hudOverlay_.selectedBtnIndex() < static_cast<int>(profile_.buttons.size())) {
@@ -2308,11 +2547,13 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
     if (res.requestDeleteSelectedNode && hudOverlay_.selectedBtnIndex() >= 0 &&
         hudOverlay_.selectedBtnIndex() < static_cast<int>(profile_.buttons.size())) {
+        hudOverlay_.pushUndoSnapshot(profile_, "Delete key");
         profile_.buttons.erase(profile_.buttons.begin() + hudOverlay_.selectedBtnIndex());
         hudOverlay_.setSelectedBtnIndex(-1);
         hudOverlay_.cancelRebind();
         applyProfileToEngine(true);
-        showToast("Key deleted", 1200);
+        pendingUndoKind_ = UNDO_HUD_EDIT;
+        showSnackbar("Key deleted", "Undo", 6000);
     }
     if (res.requestCloseDrawer) {
         setDrawerState(false, drawerPanel_.activeTab());
@@ -2335,8 +2576,8 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         syncHudAndVideo();
     }
 
-    // N32: ONLY KEYS tab (0) enters Edit Mode; SENS/PROFILES/DEVICE stay playable!
-    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && (bridge_->isConnected() || demoMode_));
+    // N32: ONLY KEYS tab (0) enters Edit Mode unless Test Live is active; SENS/PROFILES/DEVICE stay playable!
+    bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && !editTestLive_ && (bridge_->isConnected() || demoMode_));
     if (wantEdit != editMode_) {
         setEditMode(wantEdit);
     }
@@ -2800,6 +3041,12 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 bridge_->getScreenSize(pw, ph);
                 lastPhoneW_ = pw;
                 lastPhoneH_ = ph;
+                if (pw >= 64 && ph >= 64 &&
+                    (settings_.lastPhoneW != static_cast<int>(pw) || settings_.lastPhoneH != static_cast<int>(ph))) {
+                    settings_.lastPhoneW = static_cast<int>(pw);
+                    settings_.lastPhoneH = static_cast<int>(ph);
+                    scheduleSettingsSave();
+                }
                 std::string d3dErr;
                 if (viewportHost_.enableNativeVideo(pw, ph, d3dErr, settings_.vsyncEnabled)) {
                     hudOverlay_.setEmbeddedD3DMode(true, ShellWindow::onHudBitmapReady, this);
@@ -2927,20 +3174,42 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_DROPFILES: {
             HDROP hDrop = reinterpret_cast<HDROP>(wParam);
             UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, NULL, 0);
+            std::vector<std::string> cfgFiles;
             std::vector<std::string> dropped;
             for (UINT i = 0; i < count; ++i) {
                 wchar_t wpath[MAX_PATH * 2] = {0};
                 if (DragQueryFileW(hDrop, i, wpath, sizeof(wpath) / sizeof(wpath[0]) - 1) > 0) {
-                    int bytes = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, NULL, 0, NULL, NULL);
-                    if (bytes > 1) {
-                        std::string u8(static_cast<size_t>(bytes - 1), '\0');
-                        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &u8[0], bytes - 1, NULL, NULL);
-                        dropped.push_back(u8);
+                    std::string u8 = wideToUtf8(wpath);
+                    if (!u8.empty()) {
+                        if (isCfgFilePath(u8)) cfgFiles.push_back(u8);
+                        else                   dropped.push_back(u8);
                     }
                 }
             }
             DragFinish(hDrop);
-            startAsyncDropTransfer(dropped);
+            if (!cfgFiles.empty()) {
+                int imported = 0;
+                std::string lastSaved, lastErr;
+                for (size_t i = 0; i < cfgFiles.size(); ++i) {
+                    std::string savedPath, impErr;
+                    if (ProfileStore::importProfileFile(cfgFiles[i], profilesDir_, savedPath, impErr)) {
+                        ++imported;
+                        lastSaved = savedPath;
+                    } else {
+                        lastErr = impErr;
+                    }
+                }
+                if (imported > 0) {
+                    drawerPanel_.refreshProfileList();
+                    switchProfilePath(lastSaved, false);
+                    showToast("Imported " + profile_.name + " (drag & drop)", 2400);
+                } else if (!lastErr.empty()) {
+                    showToast("Profile import failed: " + lastErr, 2800);
+                }
+            }
+            if (!dropped.empty()) {
+                startAsyncDropTransfer(dropped);
+            }
             return 0;
         }
 
@@ -3040,6 +3309,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (shellToastWasVisible_ && static_cast<LONG>(nowTick - shellToastExpireTick_) >= 0) {
                     shellToastWasVisible_ = false;
                     shellToastMsg_.clear();
+                    shellToastActionLabel_.clear();
+                    ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
                     RECT tr = shellToastRect();
                     if (tr.right > tr.left && tr.bottom > tr.top) {
                         InvalidateRect(hwnd, &tr, FALSE);
@@ -3086,26 +3357,44 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     startRoundTripProbe(autoProbeSamples_);
                 }
                 bool connected = bridge_->isConnected();
+                if (viewportHost_.isNativeVideoActive()) {
+                    EngineTelemetry tel = engine_->getTelemetry();
+                    DynamicHudMarkers dm;
+                    dm.active = (!editMode_ && !showOnboarding_ && profile_.keymapEnabled &&
+                                 (profile_.showHudInPlay || demoMode_));
+                    dm.showCrosshair = (aimMode_ && profile_.showHudInPlay);
+                    dm.aimFingerDown = tel.aimFingerDown;
+                    dm.aimX = tel.aimFingerNormX;
+                    dm.aimY = tel.aimFingerNormY;
+                    dm.fireHeld = tel.fireHeld;
+                    dm.joyDown = tel.joyDown;
+                    dm.joyX = tel.joyFingerNormX;
+                    dm.joyY = tel.joyFingerNormY;
+                    dm.opacity = profile_.hudOpacity;
+                    viewportHost_.setDynamicHudMarkers(dm);
+                }
                 if ((nowTick - lastTelemetryPaintTick_) >= 150) {
                     lastTelemetryPaintTick_ = nowTick;
                     if (!editMode_ && (connected || demoMode_)) {
                         // Dirty-check visual HUD state: ZERO GDI+ bitmap redraws when nothing changed!
+                        // S5: Moving aim/joystick markers are rendered by D3D11 Pass 3 when native video is active.
                         bool hudUsesTelemetry = profile_.keymapEnabled &&
                                                 (profile_.showHudInPlay || demoMode_ || (fullscreen_ && !aimMode_));
                         if (hudUsesTelemetry) {
                             EngineTelemetry tel = engine_->getTelemetry();
+                            bool nativeVid = viewportHost_.isNativeVideoActive();
                             HudVisualSig cur;
                             cur.valid = true;
                             cur.aimMode = aimMode_;
-                            cur.aimFingerDown = tel.aimFingerDown;
-                            cur.fireHeld = tel.fireHeld;
+                            cur.aimFingerDown = nativeVid ? false : tel.aimFingerDown;
+                            cur.fireHeld = nativeVid ? false : tel.fireHeld;
                             cur.scopeActive = tel.scopeActive;
                             cur.holdViewActive = tel.holdViewActive;
-                            cur.joyDown = tel.joyDown;
+                            cur.joyDown = nativeVid ? false : tel.joyDown;
                             cur.showHud = profile_.showHudInPlay;
                             cur.fullscreen = fullscreen_;
-                            cur.aimQx = tel.aimFingerDown ? static_cast<int>(tel.aimFingerNormX * 64.0f) : -1;
-                            cur.aimQy = tel.aimFingerDown ? static_cast<int>(tel.aimFingerNormY * 64.0f) : -1;
+                            cur.aimQx = (!nativeVid && tel.aimFingerDown) ? static_cast<int>(tel.aimFingerNormX * 64.0f) : -1;
+                            cur.aimQy = (!nativeVid && tel.aimFingerDown) ? static_cast<int>(tel.aimFingerNormY * 64.0f) : -1;
                             cur.fsRate = (fullscreen_ && !aimMode_) ? tel.touchRateHz : 0;
 
                             bool changed = !lastHudSig_.valid ||
@@ -3613,6 +3902,18 @@ void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
         drawerPanel_.clearFocus();
         invalidateShell();
     }
+    // 3b. Clickable Undo/Action Snackbar (both offline shell toast & HUD overlay snackbar!)
+    if (!shellToastMsg_.empty() && !shellToastActionLabel_.empty() &&
+        static_cast<LONG>(GetTickCount() - shellToastExpireTick_) < 0 &&
+        ptIn(shellToastActionRc_, mx, my)) {
+        if (triggerShellUndo()) return;
+    }
+    if (bridge_->isConnected() || demoMode_) {
+        int vx = 0, vy = 0;
+        if (mapShellClientToVideoLocal(mx, my, vx, vy, true) && hudOverlay_.hitTestToastAction(vx, vy)) {
+            if (triggerShellUndo()) return;
+        }
+    }
     // 4. Native D3D11 Embedded Edit Mode Canvas (same-frame HUD interaction!)
     if (editMode_ && viewportHost_.isNativeVideoActive()) {
         int vx = 0, vy = 0;
@@ -3934,21 +4235,41 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 }
             }
 
-            // N29: Render shell-layer toast when no phone video/HUD layer is active
+            // N29 + X9: Render shell-layer toast/snackbar when no phone video/HUD layer is active
             if (!childCoversViewport && !shellToastMsg_.empty() &&
                 static_cast<LONG>(GetTickCount() - shellToastExpireTick_) < 0 &&
                 hitsDirty(viewportRc_)) {
                 int vw = viewportRc_.right - viewportRc_.left;
-                int pw = metrics_.dp(36) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastMsg_.size()) * 6.8f));
+                int btnW = shellToastActionLabel_.empty()
+                    ? 0
+                    : (metrics_.dp(24) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastActionLabel_.size()) * 7.0f)));
+                int pw = metrics_.dp(36) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastMsg_.size()) * 6.8f)) + (btnW > 0 ? btnW + metrics_.dp(10) : 0);
                 if (pw < metrics_.dp(150)) pw = metrics_.dp(150);
                 if (pw > vw - metrics_.dp(28)) pw = vw - metrics_.dp(28);
-                int ph = metrics_.dp(30);
+                int ph = metrics_.dp(32);
                 int cx = (viewportRc_.left + viewportRc_.right) / 2;
                 int cy = viewportRc_.bottom - ph / 2 - metrics_.dp(16);
                 RECT tr = { cx - pw / 2, cy - ph / 2, cx + pw / 2, cy + ph / 2 };
                 GdiPlusDraw::roundedCard(g, tr, metrics_.dpf(14.0f), 0xE2101622u, Theme::ACCENT_CYAN, 1.2f);
-                GdiPlusDraw::textCenter(g, shellToastMsg_, static_cast<float>(cx), static_cast<float>(cy),
-                                        11.5f, true, Theme::TEXT_PRIMARY);
+                if (btnW > 0) {
+                    int msgW = pw - btnW - metrics_.dp(22);
+                    GdiPlusDraw::textLeft(g, shellToastMsg_, static_cast<float>(tr.left + metrics_.dp(12)),
+                                          static_cast<float>(cy), 11.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(msgW));
+                    RECT actRc = { tr.right - btnW - metrics_.dp(6), tr.top + metrics_.dp(4),
+                                   tr.right - metrics_.dp(6), tr.bottom - metrics_.dp(4) };
+                    shellToastActionRc_ = actRc;
+                    GdiPlusDraw::roundedCard(g, actRc, metrics_.dpf(9.0f), Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.1f);
+                    GdiPlusDraw::textCenter(g, shellToastActionLabel_,
+                                            static_cast<float>(actRc.left + actRc.right) * 0.5f,
+                                            static_cast<float>(actRc.top + actRc.bottom) * 0.5f,
+                                            11.0f, true, Theme::ACCENT_CYAN);
+                } else {
+                    ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
+                    GdiPlusDraw::textCenter(g, shellToastMsg_, static_cast<float>(cx), static_cast<float>(cy),
+                                            11.5f, true, Theme::TEXT_PRIMARY);
+                }
+            } else if (!shellToastWasVisible_) {
+                ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
             }
 
             // Crisp outer 1px window border when restored (N35: skip when DWM Win11 rounding is active)

@@ -55,6 +55,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\engine\InputHookThread.cpp ^
     src\engine\InputEngine.cpp ^
     src\ui\GdiPlusDraw.cpp ^
+    src\ui\EditorState.cpp ^
     src\ui\HudRenderer.cpp ^
     src\ui\TopBar.cpp ^
     src\ui\SideRail.cpp ^
@@ -66,7 +67,7 @@ if %ERRORLEVEL% NEQ 0 (
     resources\phantom_touch.res ^
     -o PhantomTouch.exe ^
     -static ^
-    -ld3d11 -ldxgi -lmfplat -lmfuuid -lgdiplus -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -lgdi32 -luser32
+    -ld3d11 -ldxgi -lmfplat -lmfuuid -lgdiplus -lcomdlg32 -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -lgdi32 -luser32
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

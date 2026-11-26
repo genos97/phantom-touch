@@ -26,8 +26,26 @@ struct ID3D11ShaderResourceView;
 //      or falls back seamlessly to direct CPU NV12 upload (zero intermediate copies).
 //   2. Renders BT.709 NV12 -> RGB inside the exact letterboxed phone viewport rect.
 //   3. Composites the frosted-glass GDI+ keymap HUD (premultiplied BGRA) in the SAME frame.
-//   4. Safe to present directly from the video decode thread so the Win32 UI / input-hook
-//      thread stays <1% CPU and never blocks raw mouse aim or keyboard hooks!
+//   4. Renders S5 dynamic per-frame HUD sprites (crosshair, joystick dot, aim finger dot) on GPU
+//      with zero GDI+ redraws or texture uploads.
+struct DynamicHudMarkers {
+    bool active;
+    bool showCrosshair;
+    bool aimFingerDown;
+    float aimX;
+    float aimY;
+    bool fireHeld;
+    bool joyDown;
+    float joyX;
+    float joyY;
+    float opacity;
+
+    DynamicHudMarkers()
+        : active(false), showCrosshair(false), aimFingerDown(false),
+          aimX(0.5f), aimY(0.5f), fireHeld(false), joyDown(false),
+          joyX(0.16f), joyY(0.75f), opacity(0.75f) {}
+};
+
 class D3D11Renderer {
 public:
     D3D11Renderer();
@@ -85,6 +103,9 @@ public:
     void updateHudBitmap(const void* bgraPremulPixels, int width, int height);
     void clearHudBitmap();
 
+    // S5: Zero-upload dynamic GPU markers (crosshair, active finger dots) updated from InputEngine telemetry
+    void setDynamicHudMarkers(const DynamicHudMarkers& markers);
+
     // Thread-safe: renders dark canvas + letterboxed NV12 video + same-frame HUD overlay and Presents!
     void render(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
@@ -105,7 +126,8 @@ private:
     bool ensureProbeTargetsLocked();
     bool sampleYRectGpuLocked(float normX, float normY, float& outMeanY);
     void updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x1Ndc, float y1Ndc,
-                                    float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
+                                    float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f,
+                                    float r = 1.0f, float g = 1.0f, float b = 1.0f, float a = 1.0f);
     void renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
     mutable CRITICAL_SECTION d3dLock_;   // Protects all D3D11/DXGI calls (ALWAYS acquired before frameLock_)
@@ -138,6 +160,7 @@ private:
     ID3D11PixelShader* psNV12_ = nullptr;
     ID3D11PixelShader* psHud_ = nullptr;
     ID3D11PixelShader* psYOnly_ = nullptr;
+    ID3D11PixelShader* psMarker_ = nullptr;
     ID3D11Buffer* cbQuad_ = nullptr;
     ID3D11SamplerState* samplerLinear_ = nullptr;
     ID3D11BlendState* blendPremul_ = nullptr;
@@ -177,6 +200,7 @@ private:
     int stagedHudH_ = 0;
     bool hudDirty_ = false;
     bool hasHud_ = false;
+    DynamicHudMarkers dynMarkers_;
 
     // 16x16 probe Y-plane readback targets
     ID3D11Texture2D* probeRtTex_ = nullptr;

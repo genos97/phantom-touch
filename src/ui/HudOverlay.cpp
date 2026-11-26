@@ -149,10 +149,18 @@ void HudOverlay::setInteractiveEdit(bool editMode, float hudOpacity) {
     (void)hudOpacity;
     interactive_ = editMode;
     dragging_ = DRAG_NONE;
+    dragPending_ = false;
+    dragActive_ = false;
+    marqueeActive_ = false;
+    activeGuides_.clear();
     hoveredBtnIndex_ = -1;
     hoverDeleteChip_ = false;
     if (!editMode) {
+        if (pendingNewNode_ && rebindTarget_ != HUD_REBIND_NONE && host_) {
+            cancelRebind();
+        }
         rebindTarget_ = HUD_REBIND_NONE;
+        pendingNewNode_ = false;
     }
 
     if (hwnd_ && !embeddedD3DMode_) {
@@ -214,32 +222,113 @@ void HudOverlay::dispatchMouseWheel(int x, int y, int delta) {
 
 void HudOverlay::setSelectedBtnIndex(int idx) {
     selectedBtnIndex_ = idx;
+    selectedIndices_.clear();
+    if (idx >= 0) selectedIndices_.push_back(idx);
     renderLayered();
 }
 
 void HudOverlay::startRebind(HudRebindTarget target) {
+    pendingNewNode_ = false;
     rebindTarget_ = target;
     renderLayered();
 }
 
+void HudOverlay::startNewNodeCapture(int newIdx, const Profile& beforeAdd) {
+    pendingNewNode_ = true;
+    preAddProfile_ = beforeAdd;
+    selectedBtnIndex_ = newIdx;
+    selectedIndices_.clear();
+    if (newIdx >= 0) selectedIndices_.push_back(newIdx);
+    rebindTarget_ = HUD_REBIND_BUTTON;
+    renderLayered();
+}
+
 void HudOverlay::cancelRebind() {
-    if (rebindTarget_ != HUD_REBIND_NONE) {
-        rebindTarget_ = HUD_REBIND_NONE;
-        renderLayered();
+    if (rebindTarget_ == HUD_REBIND_NONE && !pendingNewNode_) return;
+    bool wasNew = pendingNewNode_;
+    pendingNewNode_ = false;
+    rebindTarget_ = HUD_REBIND_NONE;
+    if (wasNew && host_) {
+        host_->hudProfile() = preAddProfile_;
+        selectedBtnIndex_ = -1;
+        selectedIndices_.clear();
+        host_->hudOnSelectionChanged(-1);
+        host_->hudOnProfileChanged(true);
     }
+    renderLayered();
+}
+
+void HudOverlay::pushUndoSnapshot(const Profile& beforeState, const std::string& desc) {
+    undoStack_.push(beforeState, desc);
+}
+
+bool HudOverlay::undo() {
+    if (!host_) return false;
+    std::string desc;
+    if (!undoStack_.undo(host_->hudProfile(), &desc)) return false;
+    selectedBtnIndex_ = -1;
+    selectedIndices_.clear();
+    hoveredBtnIndex_ = -1;
+    pendingNewNode_ = false;
+    rebindTarget_ = HUD_REBIND_NONE;
+    host_->hudOnSelectionChanged(-1);
+    host_->hudOnProfileChanged(true);
+    host_->hudOnToast("Undid: " + (desc.empty() ? std::string("edit") : desc), 1600);
+    renderLayered();
+    return true;
+}
+
+bool HudOverlay::redo() {
+    if (!host_) return false;
+    std::string desc;
+    if (!undoStack_.redo(host_->hudProfile(), &desc)) return false;
+    selectedBtnIndex_ = -1;
+    selectedIndices_.clear();
+    hoveredBtnIndex_ = -1;
+    host_->hudOnSelectionChanged(-1);
+    host_->hudOnProfileChanged(true);
+    host_->hudOnToast("Redid: " + (desc.empty() ? std::string("edit") : desc), 1600);
+    renderLayered();
+    return true;
+}
+
+void HudOverlay::clearUndo() {
+    undoStack_.clear();
 }
 
 void HudOverlay::showToast(const std::string& msg, DWORD durationMs) {
     toastMsg_ = msg;
+    toastActionLabel_.clear();
+    ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
     toastExpireTick_ = GetTickCount() + durationMs;
-    toastWasVisible_ = true;
+    toastWasVisible_ = !msg.empty();
     renderLayered();
 }
 
+void HudOverlay::showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs) {
+    toastMsg_ = msg;
+    toastActionLabel_ = actionLabel;
+    ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
+    toastExpireTick_ = GetTickCount() + durationMs;
+    toastWasVisible_ = !msg.empty();
+    renderLayered();
+}
+
+bool HudOverlay::hitTestToastAction(int vx, int vy) const {
+    if (toastActionLabel_.empty() || !toastWasVisible_) return false;
+    if (static_cast<LONG>(GetTickCount() - toastExpireTick_) >= 0) return false;
+    return (vx >= toastActionRc_.left && vx < toastActionRc_.right &&
+            vy >= toastActionRc_.top && vy < toastActionRc_.bottom);
+}
+
 bool HudOverlay::checkToastExpired() {
-    bool active = (!toastMsg_.empty() && GetTickCount() < toastExpireTick_);
+    bool active = (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0);
     bool expired = (toastWasVisible_ && !active);
     toastWasVisible_ = active;
+    if (!active) {
+        toastActionLabel_.clear();
+        ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
+    }
     if (expired) renderLayered();
     return expired;
 }
@@ -272,9 +361,18 @@ void HudOverlay::renderLayered() {
             GdiPlusDraw::strokeRoundedRect(g, 1.0f, 1.0f, static_cast<float>(w - 2), static_cast<float>(h - 2),
                                            6.0f, 0x9900D4FFu, 1.5f);
 
+            std::vector<KeyConflict> conflicts = EditorGeometry::detectConflicts(p, aimMode);
+            HudEditExtras ex;
+            ex.multiSelected = &selectedIndices_;
+            ex.alignGuides = &activeGuides_;
+            ex.conflicts = &conflicts;
+            ex.marqueeActive = marqueeActive_;
+            ex.marqueeRc = marqueeRc_;
+            ex.skipDynamicDots = false;
+
             HudRenderer::paintKeymapNodes(g, w, h, p, tel, true, demoMode,
                                           selectedBtnIndex_, hoveredBtnIndex_, hoverDeleteChip_,
-                                          (rebindTarget_ == HUD_REBIND_BUTTON), p.hudOpacity);
+                                          (rebindTarget_ == HUD_REBIND_BUTTON), p.hudOpacity, &ex);
 
             if (rebindTarget_ != HUD_REBIND_NONE || host_->hudIsSpecialDrawerRebind()) {
                 std::string targetName = "KEY";
@@ -297,11 +395,16 @@ void HudOverlay::renderLayered() {
             // Play Mode: 100% transparent outside the frosted keycaps!
             g.Clear(Gdiplus::Color(0, 0, 0, 0));
 
+            std::vector<KeyConflict> playConflicts = EditorGeometry::detectConflicts(p, aimMode);
+            HudEditExtras ex;
+            ex.conflicts = &playConflicts;
+            ex.skipDynamicDots = embeddedD3DMode_;
+
             if (p.keymapEnabled && (p.showHudInPlay || demoMode)) {
                 HudRenderer::paintKeymapNodes(g, w, h, p, tel, false, demoMode,
-                                              -1, -1, false, false, p.hudOpacity);
+                                              -1, -1, false, false, p.hudOpacity, &ex);
             }
-            if (p.keymapEnabled && aimMode && !demoMode) {
+            if (p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) {
                 HudRenderer::paintCrosshairDot(g, w, h);
             }
             if (host_->hudIsFullscreen() && !aimMode) {
@@ -309,8 +412,10 @@ void HudOverlay::renderLayered() {
             }
         }
 
-        if (!toastMsg_.empty() && GetTickCount() < toastExpireTick_) {
-            HudRenderer::paintToast(g, w, h, toastMsg_);
+        if (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0) {
+            HudRenderer::paintToastWithAction(g, w, h, toastMsg_, toastActionLabel_, &toastActionRc_);
+        } else {
+            ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
         }
     }
 
@@ -534,18 +639,22 @@ bool HudOverlay::handleMouseBind(int mouseVk) {
     Profile& p = host_->hudProfile();
     if (rebindTarget_ == HUD_REBIND_BUTTON &&
         selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
+        Profile before = pendingNewNode_ ? preAddProfile_ : p;
         p.buttons[selectedBtnIndex_].comboVk = 0;
         p.buttons[selectedBtnIndex_].vk = mouseVk;
         if (p.buttons[selectedBtnIndex_].label == "KEY") {
             p.buttons[selectedBtnIndex_].label = KeyCodes::toName(mouseVk);
         }
+        undoStack_.push(before, pendingNewNode_ ? "Add key" : "Rebind key");
+        pendingNewNode_ = false;
         rebindTarget_ = HUD_REBIND_NONE;
         host_->hudOnProfileChanged(true);
-        host_->hudOnToast("Replaced '" + p.buttons[selectedBtnIndex_].label + "' -> " + KeyCodes::toName(mouseVk), 1800);
+        host_->hudOnToast("Bound '" + p.buttons[selectedBtnIndex_].label + "' -> " + KeyCodes::toName(mouseVk), 1800);
         renderLayered();
         return true;
     }
     if (rebindTarget_ == HUD_REBIND_FIRE_KEY) {
+        undoStack_.push(p, "Rebind Fire");
         p.fireVk = mouseVk;
         rebindTarget_ = HUD_REBIND_NONE;
         host_->hudOnProfileChanged(true);
@@ -558,6 +667,7 @@ bool HudOverlay::handleMouseBind(int mouseVk) {
             host_->hudOnToast("Use Keyboard, MMB, RMB, X1, X2, or Wheel for Aim Lock", 2400);
             return true;
         }
+        undoStack_.push(p, "Rebind Aim Lock");
         p.toggleAimVk = mouseVk;
         rebindTarget_ = HUD_REBIND_NONE;
         host_->hudOnProfileChanged(true);
@@ -605,22 +715,32 @@ void HudOverlay::onMouseDown(int x, int y, bool rightBtn) {
 
     Profile& p = host_->hudProfile();
 
-    // 1-click quick-delete 'x' chip on the currently selected keycap (BlueStacks-style)
+    // X9: Clickable Undo / Retry snackbar action over HUD overlay
+    if (!rightBtn && hitTestToastAction(x, y)) {
+        if (undo()) return;
+    }
+
+    // 1-click quick-delete 'x' chip on the currently selected keycap (with Undo!)
     if (!rightBtn && hitTestDeleteChip(x, y) &&
         selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
+        undoStack_.push(p, "Delete key");
         p.buttons.erase(p.buttons.begin() + selectedBtnIndex_);
         selectedBtnIndex_ = -1;
+        selectedIndices_.clear();
         hoveredBtnIndex_ = -1;
         hoverDeleteChip_ = false;
         dragging_ = DRAG_NONE;
+        dragPending_ = false;
+        dragActive_ = false;
         host_->hudOnSelectionChanged(-1);
         host_->hudOnProfileChanged(true);
-        host_->hudOnToast("Key deleted", 1200);
+        showSnackbar("Key deleted", "Undo", 6000);
         renderLayered();
         return;
     }
 
     if (rightBtn) {
+        Profile beforeAdd = p;
         KeyNode n;
         n.label = "KEY";
         n.vk = 'K';
@@ -633,23 +753,94 @@ void HudOverlay::onMouseDown(int x, int y, bool rightBtn) {
         n.y2 = n.y;
         n.radius = 0.030f;
         p.buttons.push_back(n);
-        selectedBtnIndex_ = static_cast<int>(p.buttons.size()) - 1;
-        rebindTarget_ = HUD_REBIND_BUTTON;
-        host_->hudOnSelectionChanged(selectedBtnIndex_);
-        host_->hudOnProfileChanged(true);
-        host_->hudOnToast("New Key placed! Press ANY key, Mouse button, or Scroll...", 3500);
-        renderLayered();
+        int newIdx = static_cast<int>(p.buttons.size()) - 1;
+        startNewNodeCapture(newIdx, beforeAdd);
+        host_->hudOnSelectionChanged(newIdx);
+        host_->hudOnToast("New Key placed! Press key, Mouse button, or Scroll (Esc cancels)", 3500);
         return;
     }
 
     int btnIdx = -1;
     dragging_ = hitTestNode(x, y, btnIdx);
     dragBtnIndex_ = btnIdx;
-    if (dragging_ == DRAG_BUTTON || dragging_ == DRAG_SWIPE_END) {
+    dragPending_ = false;
+    dragActive_ = false;
+    marqueeActive_ = false;
+    activeGuides_.clear();
+
+    bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (dragging_ == DRAG_BUTTON) {
+        if (ctrlHeld) {
+            bool found = false;
+            for (size_t i = 0; i < selectedIndices_.size(); ++i) {
+                if (selectedIndices_[i] == btnIdx) {
+                    selectedIndices_.erase(selectedIndices_.begin() + i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) selectedIndices_.push_back(btnIdx);
+            selectedBtnIndex_ = selectedIndices_.empty() ? -1 : selectedIndices_.back();
+        } else {
+            bool alreadyInGroup = false;
+            for (size_t i = 0; i < selectedIndices_.size(); ++i) {
+                if (selectedIndices_[i] == btnIdx) { alreadyInGroup = true; break; }
+            }
+            if (!alreadyInGroup) {
+                selectedIndices_.clear();
+                selectedIndices_.push_back(btnIdx);
+            }
+            selectedBtnIndex_ = btnIdx;
+        }
+    } else if (dragging_ == DRAG_SWIPE_END) {
         selectedBtnIndex_ = btnIdx;
+        selectedIndices_.assign(1, btnIdx);
     } else if (dragging_ == DRAG_NONE) {
-        selectedBtnIndex_ = -1;
+        if (!ctrlHeld) {
+            selectedBtnIndex_ = -1;
+            selectedIndices_.clear();
+        }
+        marqueeActive_ = true;
+        marqueeStartPx_ = x;
+        marqueeStartPy_ = y;
+        marqueeRc_ = { x, y, x, y };
     }
+
+    if (dragging_ != DRAG_NONE) {
+        preDragProfile_ = p;
+        dragPending_ = true;
+        dragStartPx_ = x;
+        dragStartPy_ = y;
+        float liveNx = clamp01(static_cast<float>(x) / static_cast<float>(w));
+        float liveNy = clamp01(static_cast<float>(y) / static_cast<float>(h));
+        float curNx = liveNx, curNy = liveNy;
+        ProfileDefaults::unmapEdgeAnchored(liveNx, liveNy, p.edgeAnchored, p.refAspect,
+                                           static_cast<float>(w) / static_cast<float>(h), curNx, curNy);
+        float nodeX = curNx, nodeY = curNy;
+        switch (dragging_) {
+            case DRAG_JOY:       nodeX = p.joyX; nodeY = p.joyY; break;
+            case DRAG_AIM:       nodeX = p.aimX; nodeY = p.aimY; break;
+            case DRAG_FIRE:      nodeX = p.fireX; nodeY = p.fireY; break;
+            case DRAG_LEFT_FIRE: nodeX = p.leftFireX; nodeY = p.leftFireY; break;
+            case DRAG_BUTTON:
+                if (btnIdx >= 0 && btnIdx < static_cast<int>(p.buttons.size())) {
+                    nodeX = p.buttons[btnIdx].x;
+                    nodeY = p.buttons[btnIdx].y;
+                }
+                break;
+            case DRAG_SWIPE_END:
+                if (btnIdx >= 0 && btnIdx < static_cast<int>(p.buttons.size())) {
+                    nodeX = p.buttons[btnIdx].x2;
+                    nodeY = p.buttons[btnIdx].y2;
+                }
+                break;
+            default: break;
+        }
+        // N33: preserve grab offset so node never snaps center onto cursor on click!
+        dragOffsetX_ = nodeX - curNx;
+        dragOffsetY_ = nodeY - curNy;
+    }
+
     host_->hudOnSelectionChanged(selectedBtnIndex_);
     renderLayered();
 }
@@ -659,6 +850,15 @@ void HudOverlay::onMouseMove(int x, int y) {
     int w = lastScreenRect_.right - lastScreenRect_.left;
     int h = lastScreenRect_.bottom - lastScreenRect_.top;
     if (w <= 0 || h <= 0) return;
+
+    if (marqueeActive_) {
+        marqueeRc_.left   = (marqueeStartPx_ < x) ? marqueeStartPx_ : x;
+        marqueeRc_.right  = (marqueeStartPx_ > x) ? marqueeStartPx_ : x;
+        marqueeRc_.top    = (marqueeStartPy_ < y) ? marqueeStartPy_ : y;
+        marqueeRc_.bottom = (marqueeStartPy_ > y) ? marqueeStartPy_ : y;
+        renderLayered();
+        return;
+    }
 
     if (dragging_ == DRAG_NONE) {
         bool newDelHov = hitTestDeleteChip(x, y);
@@ -674,26 +874,68 @@ void HudOverlay::onMouseMove(int x, int y) {
         return;
     }
 
+    // N33: require 4 dp drag threshold before moving node
+    if (dragPending_ && !dragActive_) {
+        int thresh = GdiPlusDraw::dp(4);
+        int dxPx = x - dragStartPx_;
+        int dyPx = y - dragStartPy_;
+        if (dxPx < 0) dxPx = -dxPx;
+        if (dyPx < 0) dyPx = -dyPx;
+        if (dxPx < thresh && dyPx < thresh) {
+            return;
+        }
+        dragActive_ = true;
+    }
+
     float liveNx = clamp01(static_cast<float>(x) / static_cast<float>(w));
     float liveNy = clamp01(static_cast<float>(y) / static_cast<float>(h));
     Profile& p = host_->hudProfile();
-    float nx = liveNx, ny = liveNy;
+    float curNx = liveNx, curNy = liveNy;
     ProfileDefaults::unmapEdgeAnchored(liveNx, liveNy, p.edgeAnchored, p.refAspect,
-                                       static_cast<float>(w) / static_cast<float>(h), nx, ny);
+                                       static_cast<float>(w) / static_cast<float>(h), curNx, curNy);
+    float nx = clamp01(curNx + dragOffsetX_);
+    float ny = clamp01(curNy + dragOffsetY_);
+
+    bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    activeGuides_.clear();
 
     switch (dragging_) {
-        case DRAG_JOY:       p.joyX = nx; p.joyY = ny; break;
-        case DRAG_AIM:       p.aimX = nx; p.aimY = ny; break;
-        case DRAG_FIRE:      p.fireX = nx; p.fireY = ny; break;
-        case DRAG_LEFT_FIRE: p.leftFireX = nx; p.leftFireY = ny; break;
+        case DRAG_JOY:
+            EditorGeometry::snapAndCollectGuides(p, -1, nx, ny, shiftHeld, activeGuides_);
+            p.joyX = nx; p.joyY = ny;
+            break;
+        case DRAG_AIM:
+            EditorGeometry::snapAndCollectGuides(p, -1, nx, ny, shiftHeld, activeGuides_);
+            p.aimX = nx; p.aimY = ny;
+            break;
+        case DRAG_FIRE:
+            EditorGeometry::snapAndCollectGuides(p, -1, nx, ny, shiftHeld, activeGuides_);
+            p.fireX = nx; p.fireY = ny;
+            break;
+        case DRAG_LEFT_FIRE:
+            EditorGeometry::snapAndCollectGuides(p, -1, nx, ny, shiftHeld, activeGuides_);
+            p.leftFireX = nx; p.leftFireY = ny;
+            break;
         case DRAG_BUTTON:
             if (dragBtnIndex_ >= 0 && dragBtnIndex_ < static_cast<int>(p.buttons.size())) {
+                EditorGeometry::snapAndCollectGuides(p, dragBtnIndex_, nx, ny, shiftHeld, activeGuides_);
                 KeyNode& b = p.buttons[dragBtnIndex_];
                 float dx = nx - b.x, dy = ny - b.y;
                 b.x = nx; b.y = ny;
                 if (b.action == NODE_SWIPE) {
                     b.x2 = clamp01(b.x2 + dx);
                     b.y2 = clamp01(b.y2 + dy);
+                }
+                for (size_t mi = 0; mi < selectedIndices_.size(); ++mi) {
+                    int idx = selectedIndices_[mi];
+                    if (idx == dragBtnIndex_ || idx < 0 || idx >= static_cast<int>(p.buttons.size())) continue;
+                    KeyNode& mb = p.buttons[idx];
+                    mb.x = clamp01(mb.x + dx);
+                    mb.y = clamp01(mb.y + dy);
+                    if (mb.action == NODE_SWIPE) {
+                        mb.x2 = clamp01(mb.x2 + dx);
+                        mb.y2 = clamp01(mb.y2 + dy);
+                    }
                 }
             }
             break;
@@ -705,13 +947,49 @@ void HudOverlay::onMouseMove(int x, int y) {
             break;
         default: break;
     }
-    host_->hudOnProfileChanged(false);
+    // N33: HUD-only redraw during drag — engine & debounced worker save run on onMouseUp!
+    renderLayered();
 }
 
 void HudOverlay::onMouseUp() {
+    activeGuides_.clear();
+    if (marqueeActive_) {
+        marqueeActive_ = false;
+        if (host_) {
+            int w = lastScreenRect_.right - lastScreenRect_.left;
+            int h = lastScreenRect_.bottom - lastScreenRect_.top;
+            if (w > 0 && h > 0 &&
+                (marqueeRc_.right - marqueeRc_.left >= 4 || marqueeRc_.bottom - marqueeRc_.top >= 4)) {
+                Profile resP = ProfileDefaults::resolveLayout(host_->hudProfile(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+                for (size_t i = 0; i < resP.buttons.size(); ++i) {
+                    int px = static_cast<int>(resP.buttons[i].x * static_cast<float>(w));
+                    int py = static_cast<int>(resP.buttons[i].y * static_cast<float>(h));
+                    if (px >= marqueeRc_.left && px <= marqueeRc_.right &&
+                        py >= marqueeRc_.top && py <= marqueeRc_.bottom) {
+                        bool dup = false;
+                        for (size_t j = 0; j < selectedIndices_.size(); ++j) {
+                            if (selectedIndices_[j] == static_cast<int>(i)) { dup = true; break; }
+                        }
+                        if (!dup) selectedIndices_.push_back(static_cast<int>(i));
+                    }
+                }
+                selectedBtnIndex_ = selectedIndices_.empty() ? -1 : selectedIndices_.back();
+                host_->hudOnSelectionChanged(selectedBtnIndex_);
+            }
+        }
+        renderLayered();
+        return;
+    }
     if (dragging_ != DRAG_NONE) {
+        bool didMove = dragActive_;
         dragging_ = DRAG_NONE;
-        if (host_) host_->hudOnProfileChanged(true);
+        dragPending_ = false;
+        dragActive_ = false;
+        if (didMove && host_) {
+            undoStack_.push(preDragProfile_, "Move node");
+            host_->hudOnProfileChanged(true);
+        }
+        renderLayered();
     }
 }
 
@@ -741,19 +1019,132 @@ void HudOverlay::onMouseWheel(int x, int y, int delta) {
     renderLayered();
 }
 
+void HudOverlay::duplicateSelected() {
+    if (!host_ || selectedIndices_.empty()) return;
+    Profile& p = host_->hudProfile();
+    undoStack_.push(p, "Duplicate node");
+    std::vector<int> nextSel;
+    for (size_t i = 0; i < selectedIndices_.size(); ++i) {
+        int idx = selectedIndices_[i];
+        if (idx < 0 || idx >= static_cast<int>(p.buttons.size())) continue;
+        KeyNode copy = p.buttons[idx];
+        copy.x = clamp01(copy.x + 0.025f);
+        copy.y = clamp01(copy.y + 0.025f);
+        if (copy.action == NODE_SWIPE) {
+            copy.x2 = clamp01(copy.x2 + 0.025f);
+            copy.y2 = clamp01(copy.y2 + 0.025f);
+        }
+        p.buttons.push_back(copy);
+        nextSel.push_back(static_cast<int>(p.buttons.size()) - 1);
+    }
+    if (!nextSel.empty()) {
+        selectedIndices_ = nextSel;
+        selectedBtnIndex_ = nextSel.back();
+        host_->hudOnSelectionChanged(selectedBtnIndex_);
+        host_->hudOnProfileChanged(true);
+        host_->hudOnToast("Duplicated key(s)", 1400);
+        renderLayered();
+    }
+}
+
+void HudOverlay::copySelected() {
+    if (!host_ || selectedIndices_.empty()) return;
+    const Profile& p = host_->hudProfile();
+    copiedNodes_.clear();
+    for (size_t i = 0; i < selectedIndices_.size(); ++i) {
+        int idx = selectedIndices_[i];
+        if (idx >= 0 && idx < static_cast<int>(p.buttons.size())) {
+            copiedNodes_.push_back(p.buttons[idx]);
+        }
+    }
+    if (!copiedNodes_.empty()) {
+        host_->hudOnToast("Copied node(s) — Ctrl+V to paste in any profile", 1800);
+    }
+}
+
+void HudOverlay::pasteCopied() {
+    if (!host_ || copiedNodes_.empty()) return;
+    Profile& p = host_->hudProfile();
+    undoStack_.push(p, "Paste node");
+    selectedIndices_.clear();
+    for (size_t i = 0; i < copiedNodes_.size(); ++i) {
+        KeyNode n = copiedNodes_[i];
+        n.x = clamp01(n.x + 0.02f);
+        n.y = clamp01(n.y + 0.02f);
+        if (n.action == NODE_SWIPE) {
+            n.x2 = clamp01(n.x2 + 0.02f);
+            n.y2 = clamp01(n.y2 + 0.02f);
+        }
+        p.buttons.push_back(n);
+        selectedIndices_.push_back(static_cast<int>(p.buttons.size()) - 1);
+    }
+    selectedBtnIndex_ = selectedIndices_.empty() ? -1 : selectedIndices_.back();
+    host_->hudOnSelectionChanged(selectedBtnIndex_);
+    host_->hudOnProfileChanged(true);
+    host_->hudOnToast("Pasted node(s)", 1400);
+    renderLayered();
+}
+
+void HudOverlay::nudgeSelected(float dx, float dy) {
+    if (!host_ || selectedIndices_.empty()) return;
+    Profile& p = host_->hudProfile();
+    undoStack_.push(p, "Nudge node");
+    for (size_t i = 0; i < selectedIndices_.size(); ++i) {
+        int idx = selectedIndices_[i];
+        if (idx < 0 || idx >= static_cast<int>(p.buttons.size())) continue;
+        p.buttons[idx].x = clamp01(p.buttons[idx].x + dx);
+        p.buttons[idx].y = clamp01(p.buttons[idx].y + dy);
+        if (p.buttons[idx].action == NODE_SWIPE) {
+            p.buttons[idx].x2 = clamp01(p.buttons[idx].x2 + dx);
+            p.buttons[idx].y2 = clamp01(p.buttons[idx].y2 + dy);
+        }
+    }
+    host_->hudOnProfileChanged(true);
+    renderLayered();
+}
+
+void HudOverlay::deleteSelected() {
+    if (!host_ || selectedIndices_.empty()) return;
+    Profile& p = host_->hudProfile();
+    undoStack_.push(p, "Delete key");
+    std::vector<KeyNode> kept;
+    for (size_t i = 0; i < p.buttons.size(); ++i) {
+        bool rm = false;
+        for (size_t j = 0; j < selectedIndices_.size(); ++j) {
+            if (selectedIndices_[j] == static_cast<int>(i)) { rm = true; break; }
+        }
+        if (!rm) kept.push_back(p.buttons[i]);
+    }
+    p.buttons.swap(kept);
+    selectedBtnIndex_ = -1;
+    selectedIndices_.clear();
+    hoveredBtnIndex_ = -1;
+    hoverDeleteChip_ = false;
+    host_->hudOnSelectionChanged(-1);
+    host_->hudOnProfileChanged(true);
+    showSnackbar("Key deleted", "Undo", 6000);
+    renderLayered();
+}
+
 bool HudOverlay::handleKeyDown(int vk) {
     if (!host_) return false;
     Profile& p = host_->hudProfile();
 
     if (rebindTarget_ != HUD_REBIND_NONE) {
         if (vk == VK_ESCAPE) {
-            rebindTarget_ = HUD_REBIND_NONE;
-            host_->hudOnToast("Rebind cancelled", 1000);
-            renderLayered();
+            if (pendingNewNode_) {
+                cancelRebind();
+                host_->hudOnToast("Add key cancelled", 1200);
+            } else {
+                rebindTarget_ = HUD_REBIND_NONE;
+                host_->hudOnToast("Rebind cancelled", 1000);
+                renderLayered();
+            }
             return true;
         }
         vk = KeyCodes::normalizeModifier(vk);
         if (rebindTarget_ == HUD_REBIND_FIRE_KEY) {
+            undoStack_.push(p, "Rebind Fire");
             p.fireVk = vk;
             rebindTarget_ = HUD_REBIND_NONE;
             host_->hudOnProfileChanged(true);
@@ -762,6 +1153,7 @@ bool HudOverlay::handleKeyDown(int vk) {
             return true;
         }
         if (rebindTarget_ == HUD_REBIND_TOGGLE_AIM) {
+            undoStack_.push(p, "Rebind Aim Lock");
             p.toggleAimVk = vk;
             rebindTarget_ = HUD_REBIND_NONE;
             host_->hudOnProfileChanged(true);
@@ -771,6 +1163,7 @@ bool HudOverlay::handleKeyDown(int vk) {
         }
         if (rebindTarget_ == HUD_REBIND_BUTTON &&
             selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
+            Profile before = pendingNewNode_ ? preAddProfile_ : p;
             int comboPrefix = 0;
             if (vk != VK_LMENU && vk != VK_RMENU && (GetAsyncKeyState(VK_LMENU) & 0x8000)) comboPrefix = VK_LMENU;
             else if (vk != VK_LCONTROL && vk != VK_RCONTROL && (GetAsyncKeyState(VK_LCONTROL) & 0x8000)) comboPrefix = VK_LCONTROL;
@@ -781,24 +1174,44 @@ bool HudOverlay::handleKeyDown(int vk) {
             if (p.buttons[selectedBtnIndex_].label == "KEY") {
                 p.buttons[selectedBtnIndex_].label = KeyCodes::comboToName(comboPrefix, vk);
             }
+            undoStack_.push(before, pendingNewNode_ ? "Add key" : "Rebind key");
+            pendingNewNode_ = false;
             rebindTarget_ = HUD_REBIND_NONE;
             host_->hudOnProfileChanged(true);
-            host_->hudOnToast("Replaced '" + p.buttons[selectedBtnIndex_].label + "' -> " + KeyCodes::comboToName(comboPrefix, vk), 1800);
+            host_->hudOnToast("Bound '" + p.buttons[selectedBtnIndex_].label + "' -> " + KeyCodes::comboToName(comboPrefix, vk), 1800);
             renderLayered();
         }
         return true;
     }
 
     bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     if (ctrlHeld && vk == 'S') {
         host_->hudOnRequestSave();
         return true;
     }
+    if (ctrlHeld && vk == 'Z') return undo();
+    if (ctrlHeld && vk == 'Y') return redo();
+    if (ctrlHeld && vk == 'D') { duplicateSelected(); return true; }
+    if (ctrlHeld && vk == 'C') { copySelected(); return true; }
+    if (ctrlHeld && vk == 'V') { pasteCopied(); return true; }
+
+    if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN) {
+        if (!selectedIndices_.empty()) {
+            float step = shiftHeld ? 0.010f : 0.002f;
+            float dx = (vk == VK_LEFT) ? -step : (vk == VK_RIGHT ? step : 0.0f);
+            float dy = (vk == VK_UP)   ? -step : (vk == VK_DOWN  ? step : 0.0f);
+            nudgeSelected(dx, dy);
+            return true;
+        }
+    }
+
     if (vk == VK_F2 || vk == VK_ESCAPE) {
         host_->hudOnRequestCloseEdit();
         return true;
     }
     if (vk == 'T' && selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
+        undoStack_.push(p, "Change action");
         KeyNode& b = p.buttons[selectedBtnIndex_];
         b.action = static_cast<KeyActionType>((static_cast<int>(b.action) + 1) % 10);
         if (b.action == NODE_SWIPE && b.x2 == b.x && b.y2 == b.y) {
@@ -806,25 +1219,19 @@ bool HudOverlay::handleKeyDown(int vk) {
             b.durationMs = 120;
         }
         host_->hudOnProfileChanged(true);
-        host_->hudOnToast("Node '" + b.label + "' -> " + ProfileDefaults::actionTypeToName(b.action), 1600);
+        host_->hudOnToast("Node '" + b.label + "' -> " + ProfileDefaults::actionTypeToHumanLabel(b.action), 1600);
         renderLayered();
         return true;
     }
     if (vk == VK_RETURN && selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
         rebindTarget_ = HUD_REBIND_BUTTON;
+        pendingNewNode_ = false;
         host_->hudOnToast("Replace '" + p.buttons[selectedBtnIndex_].label + "': Press ANY key, Mouse button, or Scroll", 4000);
         renderLayered();
         return true;
     }
-    if (vk == VK_DELETE && selectedBtnIndex_ >= 0 && selectedBtnIndex_ < static_cast<int>(p.buttons.size())) {
-        p.buttons.erase(p.buttons.begin() + selectedBtnIndex_);
-        selectedBtnIndex_ = -1;
-        hoveredBtnIndex_ = -1;
-        hoverDeleteChip_ = false;
-        host_->hudOnSelectionChanged(-1);
-        host_->hudOnProfileChanged(true);
-        host_->hudOnToast("Key deleted", 1200);
-        renderLayered();
+    if (vk == VK_DELETE && !selectedIndices_.empty()) {
+        deleteSelected();
         return true;
     }
     return false;

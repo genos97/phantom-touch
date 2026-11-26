@@ -2,9 +2,11 @@
 
 #include "config/Profile.hpp"
 #include "engine/InputEngine.hpp"
+#include "ui/EditorState.hpp"
 #include "ui/HudRenderer.hpp"
 
 #include <string>
+#include <vector>
 
 enum HudRebindTarget {
     HUD_REBIND_NONE = 0,
@@ -60,13 +62,25 @@ public:
 
     int selectedBtnIndex() const { return selectedBtnIndex_; }
     void setSelectedBtnIndex(int idx);
+    const std::vector<int>& selectedIndices() const { return selectedIndices_; }
 
     HudRebindTarget rebindTarget() const { return rebindTarget_; }
     void startRebind(HudRebindTarget target);
+    void startNewNodeCapture(int newIdx, const Profile& beforeAdd);
     void cancelRebind();
 
+    // X4 Undo / Redo / Multi-Select / Clipboard
+    void pushUndoSnapshot(const Profile& beforeState, const std::string& desc);
+    bool undo();
+    bool redo();
+    void clearUndo();
+    bool canUndo() const { return undoStack_.canUndo(); }
+    bool canRedo() const { return undoStack_.canRedo(); }
+
     void showToast(const std::string& msg, DWORD durationMs = 2000);
+    void showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs = 6000);
     bool checkToastExpired();
+    bool hitTestToastAction(int vx, int vy) const;
 
     // Forwarded from ShellWindow / ViewportHost (coords relative to video rect top-left)
     bool handleKeyDown(int vk);
@@ -103,6 +117,11 @@ private:
     void onMouseMove(int x, int y);
     void onMouseUp();
     void onMouseWheel(int x, int y, int delta);
+    void duplicateSelected();
+    void copySelected();
+    void pasteCopied();
+    void nudgeSelected(float dx, float dy);
+    void deleteSelected();
 
     IHudOverlayHost* host_;
     HWND hwnd_ = NULL;
@@ -113,12 +132,34 @@ private:
 
     DragTarget dragging_ = DRAG_NONE;
     int dragBtnIndex_ = -1;
+    bool dragPending_ = false;
+    bool dragActive_ = false;
+    int dragStartPx_ = 0;
+    int dragStartPy_ = 0;
+    float dragOffsetX_ = 0.0f;
+    float dragOffsetY_ = 0.0f;
+    Profile preDragProfile_;
+
+    bool marqueeActive_ = false;
+    int marqueeStartPx_ = 0;
+    int marqueeStartPy_ = 0;
+    RECT marqueeRc_ = { 0, 0, 0, 0 };
+
     int selectedBtnIndex_ = -1;
+    std::vector<int> selectedIndices_;
+    std::vector<KeyNode> copiedNodes_;
+    std::vector<AlignGuide> activeGuides_;
+    ProfileUndoStack undoStack_;
+
     int hoveredBtnIndex_ = -1;
     bool hoverDeleteChip_ = false;
     HudRebindTarget rebindTarget_ = HUD_REBIND_NONE;
+    bool pendingNewNode_ = false;
+    Profile preAddProfile_;
 
     std::string toastMsg_;
+    std::string toastActionLabel_;
+    RECT toastActionRc_ = { 0, 0, 0, 0 };
     DWORD toastExpireTick_ = 0;
     bool toastWasVisible_ = false;
 

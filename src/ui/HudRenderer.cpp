@@ -50,16 +50,19 @@ void drawSubtleText(Gdiplus::Graphics& g, const std::string& txt,
 
 std::string HudRenderer::shortKeyLabel(int comboVk, int vk) {
     if (comboVk == 0) {
-        if (vk == VK_CUSTOM_MWHEEL_UP)   return "SCR+";
-        if (vk == VK_CUSTOM_MWHEEL_DOWN) return "SCR-";
-        if (vk == 0x20) return "SPC";
-        if (vk == 0xA0 || vk == 0x10) return "SHFT";
-        if (vk == 0xA1) return "RSHF";
-        if (vk == 0xA2 || vk == 0x11) return "CTRL";
-        if (vk == 0xA3) return "RCTL";
-        if (vk == 0xA4 || vk == 0x12) return "ALT";
-        if (vk == 0xA5) return "RALT";
-        if (vk == 0x14) return "CAPS";
+        if (vk == VK_CUSTOM_MWHEEL_UP)   return "Scr+";
+        if (vk == VK_CUSTOM_MWHEEL_DOWN) return "Scr-";
+        if (vk == 0x20) return "Spc";
+        if (vk == 0x1B) return "Esc";
+        if (vk == 0x0D) return "Ret";
+        if (vk == 0x08) return "Bksp";
+        if (vk == 0xA0 || vk == 0x10) return "Shft";
+        if (vk == 0xA1) return "RShf";
+        if (vk == 0xA2 || vk == 0x11) return "Ctrl";
+        if (vk == 0xA3) return "RCtl";
+        if (vk == 0xA4 || vk == 0x12) return "Alt";
+        if (vk == 0xA5) return "RAlt";
+        if (vk == 0x14) return "Caps";
         if (vk == 0xC0) return "~";
         return KeyCodes::toName(vk);
     }
@@ -93,7 +96,8 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                                    bool editMode, bool demoMode,
                                    int selectedBtnIndex, int hoveredBtnIndex,
                                    bool hoverDeleteChip, bool waitingButtonRebind,
-                                   float playOpacity) {
+                                   float playOpacity,
+                                   const HudEditExtras* extras) {
     // S2(c): avoid copying Profile on every paint unless edge-anchored resolution is enabled
     Profile resolvedCopy;
     const Profile* profilePtr = &rawProfile;
@@ -146,8 +150,9 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
         drawSubtleText(g, KeyCodes::toName(profile.vkLeft),  jx - off, jy, fontSz, true, txtCol);
         drawSubtleText(g, KeyCodes::toName(profile.vkRight), jx + off, jy, fontSz, true, txtCol);
 
-        // Live active virtual thumb indicator
-        if (tel.joyDown) {
+        // Live active virtual thumb indicator (skipped when S5 GPU marker draws it!)
+        bool skipDyn = (extras && extras->skipDynamicDots);
+        if (tel.joyDown && !skipDyn) {
             float tx = tel.joyFingerNormX * fw;
             float ty = tel.joyFingerNormY * fh;
             Gdiplus::SolidBrush dotBr(GdiPlusDraw::argb(withAlpha(0x2CE59Bu, 0.78f * op)));
@@ -187,7 +192,8 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                            ax, ay + r + 10.0f, 9.5f, true, withAlpha(0xC8DCFAu, 0.88f));
         }
 
-        if (tel.aimFingerDown && !editMode) {
+        bool skipDynAim = (extras && extras->skipDynamicDots);
+        if (tel.aimFingerDown && !editMode && !skipDynAim) {
             float fx = tel.aimFingerNormX * fw;
             float fy = tel.aimFingerNormY * fh;
             uint32_t col = tel.fireHeld ? 0xFF5C6Cu : 0x00D4FFu;
@@ -234,6 +240,24 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
         float by = b.y * fh;
 
         bool selected = editMode && (static_cast<int>(i) == selectedBtnIndex);
+        if (!selected && editMode && extras && extras->multiSelected) {
+            for (size_t mi = 0; mi < extras->multiSelected->size(); ++mi) {
+                if ((*extras->multiSelected)[mi] == static_cast<int>(i)) {
+                    selected = true;
+                    break;
+                }
+            }
+        }
+        bool hasConflict = false;
+        bool cannotFire = false;
+        if (extras && extras->conflicts) {
+            for (size_t ci = 0; ci < extras->conflicts->size(); ++ci) {
+                if ((*extras->conflicts)[ci].buttonIndex == static_cast<int>(i)) {
+                    hasConflict = true;
+                    if ((*extras->conflicts)[ci].cannotFireInCursor) cannotFire = true;
+                }
+            }
+        }
         bool hovered  = editMode && (static_cast<int>(i) == hoveredBtnIndex);
         uint32_t accentRgb = nodeAccentRgb(b.action);
 
@@ -249,7 +273,7 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
             drawSubtleText(g, "END", bx2, by2 + 14.0f, 8.5f, true, withAlpha(0xFFD488u, 0.9f));
         }
 
-        std::string keyTxt = (selected && waitingButtonRebind)
+        std::string keyTxt = (selected && static_cast<int>(i) == selectedBtnIndex && waitingButtonRebind)
             ? "?"
             : shortKeyLabel(b.comboVk, b.vk);
 
@@ -264,16 +288,25 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                                            withAlpha(0x00D4FFu, 0.40f), 2.5f);
         }
 
-        // Translucent frosted keycap fill + hairline border
+        // Translucent frosted keycap fill + hairline border (dashed when node cannot fire in current mode)
         uint32_t fillRgb = selected ? 0x0E2A3Cu : (hovered ? 0x1A2434u : 0x0E131Cu);
         float fillA      = editMode ? (selected ? 0.84f : 0.70f) : (0.42f * op);
-        uint32_t rimRgb  = selected ? 0x00D4FFu : (hovered ? 0xFFFFFFu : accentRgb);
-        float rimA       = editMode ? (selected ? 0.98f : (hovered ? 0.88f : 0.58f)) : (0.48f * op);
+        uint32_t rimRgb  = selected ? 0x00D4FFu : (hasConflict ? 0xFFB84Du : (hovered ? 0xFFFFFFu : accentRgb));
+        float rimA       = editMode ? (selected ? 0.98f : (hovered ? 0.88f : (hasConflict ? 0.92f : 0.58f))) : (0.48f * op);
         float rimW       = selected ? 1.8f : (editMode ? 1.3f : 1.0f);
 
-        drawFrostedCap(g, bx, by, pw, ph, rad,
-                       withAlpha(fillRgb, fillA),
-                       withAlpha(rimRgb, rimA), rimW);
+        if (cannotFire) {
+            GdiPlusDraw::fillRoundedRect(g, bx - pw * 0.5f, by - ph * 0.5f, pw, ph, rad, withAlpha(fillRgb, fillA));
+            Gdiplus::GraphicsPath dpath;
+            GdiPlusDraw::addRoundedRectPath(dpath, bx - pw * 0.5f, by - ph * 0.5f, pw, ph, rad);
+            Gdiplus::Pen dashRim(GdiPlusDraw::argb(withAlpha(0xFFB84Du, rimA)), rimW);
+            dashRim.SetDashStyle(Gdiplus::DashStyleDash);
+            g.DrawPath(&dashRim, &dpath);
+        } else {
+            drawFrostedCap(g, bx, by, pw, ph, rad,
+                           withAlpha(fillRgb, fillA),
+                           withAlpha(rimRgb, rimA), rimW);
+        }
 
         // Single clean crisp key label centered inside the keycap (NEVER overflows!)
         float fontSz = (keyTxt.size() <= 2) ? (editMode ? 12.5f : 11.0f)
@@ -287,12 +320,19 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
             g.FillEllipse(&pipBr, bx - 2.2f, by + ph * 0.5f - 4.2f, 4.4f, 4.4f);
         }
 
-        // Edit Mode ONLY: subtle floating micro-label underneath + 1-click 'x' delete badge on selected node
+        // Edit Mode ONLY: subtle floating micro-label underneath + conflict badge + 'x' delete badge on primary selected node
         if (editMode) {
             if (!b.label.empty() && b.label != keyTxt) {
                 drawSubtleText(g, b.label, bx, by + ph * 0.5f + 8.5f, 8.8f, false, withAlpha(0xD4E2F5u, 0.82f));
             }
-            if (selected) {
+            if (hasConflict) {
+                float wx = bx - pw * 0.5f - 1.0f;
+                float wy = by - ph * 0.5f - 1.0f;
+                Gdiplus::SolidBrush wbr(GdiPlusDraw::argb(Theme::ACCENT_AMBER));
+                g.FillEllipse(&wbr, wx - 6.5f, wy - 6.5f, 13.0f, 13.0f);
+                GdiPlusDraw::textCenter(g, "!", wx, wy, 9.0f, true, 0xFF0A0D14u);
+            }
+            if (static_cast<int>(i) == selectedBtnIndex) {
                 float cx = 0.0f, cy = 0.0f, cr = 0.0f;
                 computeDeleteChipPos(bx, by, pw, ph, cx, cy, cr);
                 Gdiplus::SolidBrush dbr(GdiPlusDraw::argb(withAlpha(hoverDeleteChip ? 0xFF4757u : 0x2A1820u, 0.95f)));
@@ -301,6 +341,34 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
                 g.DrawEllipse(&dpen, cx - cr, cy - cr, cr * 2.0f, cr * 2.0f);
                 GdiPlusDraw::drawIcon(g, ICON_CLOSE, cx, cy, 7.0f, 0xFFFFFFFFu);
             }
+        }
+    }
+
+    // X4: Alignment snap guides & marquee multi-selection rectangle (Edit Mode only)
+    if (editMode && extras) {
+        if (extras->alignGuides) {
+            Gdiplus::Pen gPen(GdiPlusDraw::argb(0xCC00D4FFu), 1.0f);
+            gPen.SetDashStyle(Gdiplus::DashStyleDash);
+            for (size_t gi = 0; gi < extras->alignGuides->size(); ++gi) {
+                const AlignGuide& ag = (*extras->alignGuides)[gi];
+                if (ag.vertical) {
+                    float gx = ag.pos * fw;
+                    g.DrawLine(&gPen, gx, ag.spanStart * fh, gx, ag.spanEnd * fh);
+                } else {
+                    float gy = ag.pos * fh;
+                    g.DrawLine(&gPen, ag.spanStart * fw, gy, ag.spanEnd * fw, gy);
+                }
+            }
+        }
+        if (extras->marqueeActive) {
+            float mx = static_cast<float>(extras->marqueeRc.left);
+            float my = static_cast<float>(extras->marqueeRc.top);
+            float mw = static_cast<float>(extras->marqueeRc.right - extras->marqueeRc.left);
+            float mh = static_cast<float>(extras->marqueeRc.bottom - extras->marqueeRc.top);
+            Gdiplus::SolidBrush mbr(GdiPlusDraw::argb(0x2800D4FFu));
+            Gdiplus::Pen mpen(GdiPlusDraw::argb(0xCC00D4FFu), 1.2f);
+            g.FillRectangle(&mbr, mx, my, mw, mh);
+            g.DrawRectangle(&mpen, mx, my, mw, mh);
         }
     }
 }
@@ -346,14 +414,38 @@ void HudRenderer::paintRebindPrompt(Gdiplus::Graphics& g, int w, int h,
     GdiPlusDraw::textCenter(g, hint, cx, cy + 12.0f, 10.5f, false, Theme::TEXT_SECONDARY);
 }
 
-void HudRenderer::paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg) {
-    float pw = 34.0f + static_cast<float>(msg.size()) * 6.8f;
-    if (pw < 140.0f) pw = 140.0f;
+void HudRenderer::paintToastWithAction(Gdiplus::Graphics& g, int w, int h,
+                                         const std::string& msg, const std::string& actionLabel,
+                                         RECT* outActionRc) {
+    if (outActionRc) ZeroMemory(outActionRc, sizeof(*outActionRc));
+    float actW = actionLabel.empty() ? 0.0f : (22.0f + static_cast<float>(actionLabel.size()) * 7.0f);
+    float pw = 34.0f + static_cast<float>(msg.size()) * 6.8f + (actW > 0.0f ? actW + 12.0f : 0.0f);
+    if (pw < 150.0f) pw = 150.0f;
     if (pw > static_cast<float>(w - 28)) pw = static_cast<float>(w - 28);
-    float ph = 30.0f;
+    float ph = 32.0f;
     float cx = static_cast<float>(w) * 0.5f;
     float cy = static_cast<float>(h) - ph * 0.5f - 18.0f;
 
-    drawFrostedCap(g, cx, cy, pw, ph, 15.0f, 0xDC101622u, 0xAA00D4FFu, 1.2f);
-    GdiPlusDraw::textCenter(g, msg, cx, cy, 11.5f, true, Theme::TEXT_PRIMARY);
+    drawFrostedCap(g, cx, cy, pw, ph, 15.0f, 0xE2101622u, 0xAA00D4FFu, 1.2f);
+    if (actionLabel.empty()) {
+        GdiPlusDraw::textCenter(g, msg, cx, cy, 11.5f, true, Theme::TEXT_PRIMARY);
+    } else {
+        float left = cx - pw * 0.5f;
+        float right = cx + pw * 0.5f;
+        GdiPlusDraw::textLeft(g, msg, left + 14.0f, cy, 11.5f, true, Theme::TEXT_PRIMARY, pw - actW - 28.0f);
+        RECT rAct = {
+            static_cast<LONG>(right - actW - 8.0f),
+            static_cast<LONG>(cy - 11.0f),
+            static_cast<LONG>(right - 6.0f),
+            static_cast<LONG>(cy + 11.0f)
+        };
+        GdiPlusDraw::roundedCard(g, rAct, 8.0f, Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.0f);
+        GdiPlusDraw::textCenter(g, actionLabel, static_cast<float>(rAct.left + rAct.right) * 0.5f, cy,
+                                10.5f, true, Theme::ACCENT_CYAN);
+        if (outActionRc) *outActionRc = rAct;
+    }
+}
+
+void HudRenderer::paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg) {
+    paintToastWithAction(g, w, h, msg, "", nullptr);
 }
