@@ -455,7 +455,7 @@ void GdiPlusDraw::enableDarkDwmFrame(HWND hwnd) {
     if (!hDwm) return;
     typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
     DwmSetWindowAttributeFn fn = reinterpret_cast<DwmSetWindowAttributeFn>(
-        GetProcAddress(hDwm, "DwmSetWindowAttribute"));
+        reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
     if (fn) {
         BOOL dark = TRUE;
         fn(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));

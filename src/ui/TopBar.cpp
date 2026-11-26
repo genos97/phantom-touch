@@ -108,7 +108,11 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
             const char* fireTxt = (profile.fireMode == FIRE_MODE_DRAG_RIGHT) ? "DRAG-FIRE"
                                 : (profile.fireMode == FIRE_MODE_CLAW_LEFT)  ? "CLAW-LEFT"
                                                                              : "DUAL-DRAG";
-            std::snprintf(telBuf, sizeof(telBuf), "%s  |  %s  |  %u/s", modeTxt, fireTxt, tel.touchRateHz);
+            if (tel.gamepadConnected) {
+                std::snprintf(telBuf, sizeof(telBuf), "%s | PAD | %u/s", modeTxt, tel.touchRateHz);
+            } else {
+                std::snprintf(telBuf, sizeof(telBuf), "%s  |  %s  |  %u/s", modeTxt, fireTxt, tel.touchRateHz);
+            }
             if (tel.aimMode) {
                 bg = Theme::ACCENT_GREEN_BG;
                 bd = Theme::ACCENT_GREEN;

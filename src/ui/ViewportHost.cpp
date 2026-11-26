@@ -39,6 +39,7 @@ ViewportHost::ViewportHost() {
 
 ViewportHost::~ViewportHost() {
     detachMirror();
+    d3d_.shutdown();
     if (hwnd_ && IsWindow(hwnd_)) {
         DestroyWindow(hwnd_);
         hwnd_ = NULL;
@@ -46,33 +47,71 @@ ViewportHost::~ViewportHost() {
 }
 
 LRESULT CALLBACK ViewportHost::hostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    ViewportHost* self = nullptr;
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCTA* cs = reinterpret_cast<CREATESTRUCTA*>(lParam);
+        self = reinterpret_cast<ViewportHost*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    } else {
+        self = reinterpret_cast<ViewportHost*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    }
+    if (self) return self->handleHostMessage(hwnd, msg, wParam, lParam);
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            HBRUSH br = CreateSolidBrush(RGB(10, 13, 19));
-            FillRect(hdc, &rc, br);
-            DeleteObject(br);
+            if (isNativeVideoActive()) {
+                d3d_.render(videoRect_, true);
+            } else {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                HBRUSH br = CreateSolidBrush(RGB(10, 13, 19));
+                FillRect(hdc, &rc, br);
+                DeleteObject(br);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
         case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
+        case WM_LBUTTONUP:
         case WM_RBUTTONDOWN:
-        case WM_MBUTTONDOWN: {
-            HWND parent = GetParent(hwnd);
-            if (parent) {
-                SetFocus(parent);
-                // Forward viewport clicks to parent ShellWindow if needed (e.g. Device Hub)
+        case WM_MBUTTONDOWN:
+        case WM_XBUTTONDOWN:
+        case WM_MOUSEMOVE: {
+            if (msg == WM_MOUSEMOVE) {
+                TRACKMOUSEEVENT tme;
+                ZeroMemory(&tme, sizeof(tme));
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+            }
+            if (parentHwnd_) {
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+                    SetFocus(parentHwnd_);
+                }
                 POINT pt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
-                MapWindowPoints(hwnd, parent, &pt, 1);
-                PostMessageA(parent, msg, wParam, MAKELPARAM(pt.x, pt.y));
+                MapWindowPoints(hwnd, parentHwnd_, &pt, 1);
+                SendMessageA(parentHwnd_, msg, wParam, MAKELPARAM(pt.x, pt.y));
             }
             return 0;
         }
+        case WM_MOUSELEAVE:
+            if (parentHwnd_) PostMessageA(parentHwnd_, WM_MOUSELEAVE, 0, 0);
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (parentHwnd_) {
+                SendMessageA(parentHwnd_, msg, wParam, lParam);
+                return 0;
+            }
+            break;
         default:
             break;
     }
@@ -86,7 +125,7 @@ bool ViewportHost::create(HWND parentHwnd, HINSTANCE hInst) {
         WNDCLASSEXA wc;
         ZeroMemory(&wc, sizeof(wc));
         wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
         wc.lpfnWndProc = ViewportHost::hostWndProc;
         wc.hInstance = hInst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -98,8 +137,66 @@ bool ViewportHost::create(HWND parentHwnd, HINSTANCE hInst) {
     hwnd_ = CreateWindowExA(0, "PhantomTouchViewportHost", "",
                             WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                             0, 0, 100, 100,
-                            parentHwnd, NULL, hInst, NULL);
+                            parentHwnd, NULL, hInst, this);
     return hwnd_ != NULL;
+}
+
+bool ViewportHost::enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError) {
+    if (!hwnd_) {
+        outError = "ViewportHost HWND not created.";
+        return false;
+    }
+    int w = hostBounds_.right - hostBounds_.left;
+    int h = hostBounds_.bottom - hostBounds_.top;
+    if (w < 64) w = 640;
+    if (h < 64) h = 360;
+
+    if (!d3d_.isInitialized()) {
+        if (!d3d_.init(hwnd_, w, h, outError)) {
+            nativeVideoActive_ = false;
+            return false;
+        }
+    } else {
+        d3d_.resize(w, h);
+    }
+
+    nativeVideoActive_ = true;
+    ShowWindow(hwnd_, SW_SHOW);
+    SetWindowPos(hwnd_, HWND_BOTTOM, hostBounds_.left, hostBounds_.top, w, h, SWP_NOACTIVATE);
+    updateVideoLayout(phoneW, phoneH);
+    d3d_.render(videoRect_, true);
+    return true;
+}
+
+void ViewportHost::disableNativeVideo() {
+    nativeVideoActive_ = false;
+    d3d_.clearVideoFrame();
+    d3d_.clearHudBitmap();
+    if (!isMirrorEmbedded() && hwnd_ && IsWindow(hwnd_)) {
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+}
+
+void ViewportHost::submitDecodedFrame(const DecodedNV12Frame& frame) {
+    d3d_.submitNV12Frame(frame);
+}
+
+void ViewportHost::updateEmbeddedHud(const void* bgraPremulPixels, int width, int height) {
+    d3d_.updateHudBitmap(bgraPremulPixels, width, height);
+}
+
+void ViewportHost::renderNativeFrame(bool drawHudOverlay) {
+    if (isNativeVideoActive()) {
+        d3d_.render(videoRect_, drawHudOverlay);
+    }
+}
+
+bool ViewportHost::captureNativeScreenshot(const std::string& savePath, std::string& outError) const {
+    if (!isNativeVideoActive()) {
+        outError = "Native D3D11 video not active.";
+        return false;
+    }
+    return d3d_.saveLatestFramePng(savePath, outError);
 }
 
 void ViewportHost::setBounds(const RECT& boundsInParent) {
@@ -110,16 +207,22 @@ void ViewportHost::setBounds(const RECT& boundsInParent) {
     if (h < 1) h = 1;
 
     if (hwnd_) {
-        if (isMirrorEmbedded()) {
+        if (isMirrorEmbedded() || isNativeVideoActive()) {
             ShowWindow(hwnd_, SW_SHOW);
             SetWindowPos(hwnd_, HWND_BOTTOM, boundsInParent.left, boundsInParent.top, w, h,
                          SWP_NOACTIVATE);
+            if (isNativeVideoActive()) {
+                d3d_.resize(w, h);
+            }
         } else {
             // Keep child host hidden when Device Hub or Offline Studio is drawn directly on ShellWindow
             ShowWindow(hwnd_, SW_HIDE);
         }
     }
     updateVideoLayout(lastPhoneW_, lastPhoneH_);
+    if (isNativeVideoActive()) {
+        d3d_.render(videoRect_, true);
+    }
 }
 
 bool ViewportHost::tryEmbedMirror(const std::string& windowTitle, DWORD expectedPid,
@@ -173,7 +276,7 @@ void ViewportHost::updateVideoLayout(uint32_t phoneW, uint32_t phoneH) {
     }
     int hostW = hostBounds_.right - hostBounds_.left;
     int hostH = hostBounds_.bottom - hostBounds_.top;
-    int pad = isMirrorEmbedded() ? 4 : 16;
+    int pad = (isMirrorEmbedded() || isNativeVideoActive()) ? 4 : 16;
     videoRect_ = GdiPlusDraw::computeAspectFit(hostW, hostH, lastPhoneW_, lastPhoneH_, pad);
 
     if (isMirrorEmbedded()) {
@@ -184,6 +287,9 @@ void ViewportHost::updateVideoLayout(uint32_t phoneW, uint32_t phoneH) {
 }
 
 void ViewportHost::detachMirror() {
+    nativeVideoActive_ = false;
+    d3d_.clearVideoFrame();
+    d3d_.clearHudBitmap();
     if (embeddedHwnd_ && IsWindow(embeddedHwnd_)) {
         ShowWindow(embeddedHwnd_, SW_HIDE);
         SetParent(embeddedHwnd_, NULL);
@@ -214,6 +320,7 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
                          const std::string& statusMsg,
                          const std::vector<AdbDeviceInfo>& devices,
                          const std::string& wirelessAddr, bool editingWirelessAddr,
+                         bool showingQrPair, const QrMatrix* qrMatrix, const std::string& qrStatus,
                          int hoverX, int hoverY) {
     hotspots_.clear();
     GdiPlusDraw::fillRect(g, clientRc, Theme::BG_CANVAS);
@@ -227,10 +334,10 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
             clientRc.top  + videoRect_.y + videoRect_.h + 1
         };
         GdiPlusDraw::roundedCard(g, bezel, 6.0f, 0x00000000u, Theme::BORDER_SUBTLE, 1.0f);
-        if (!isMirrorEmbedded()) {
+        if (!isMirrorEmbedded() && !isNativeVideoActive()) {
             float cx = static_cast<float>(clientRc.left + clientRc.right) * 0.5f;
             float cy = static_cast<float>(clientRc.top + clientRc.bottom) * 0.5f;
-            GdiPlusDraw::textCenter(g, "Starting embedded phone stream...", cx, cy, 14.0f, true, Theme::ACCENT_CYAN);
+            GdiPlusDraw::textCenter(g, "Starting single-connection video stream...", cx, cy, 14.0f, true, Theme::ACCENT_CYAN);
         }
         return;
     }
@@ -285,17 +392,72 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
 
     // Header
     GdiPlusDraw::drawIcon(g, ICON_LOGO, static_cast<float>(x + 12), static_cast<float>(y + 10), 22.0f, Theme::ACCENT_CYAN);
-    GdiPlusDraw::textLeft(g, "Phantom Touch Device Hub", static_cast<float>(x + 34), static_cast<float>(y + 8), 18.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 130));
-    GdiPlusDraw::textLeft(g, "Connect an Android phone via USB debugging or Wireless ADB", static_cast<float>(x + 34), static_cast<float>(y + 28), 11.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 130));
+    GdiPlusDraw::textLeft(g, showingQrPair ? "Wireless QR Pairing (Android 11+)" : "Phantom Touch Device Hub",
+                          static_cast<float>(x + 34), static_cast<float>(y + 8), 18.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 130));
+    GdiPlusDraw::textLeft(g, showingQrPair ? "Developer options -> Wireless debugging -> Pair device with QR code"
+                                           : "Connect an Android phone via USB debugging or Wireless ADB",
+                          static_cast<float>(x + 34), static_cast<float>(y + 28), 11.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 130));
 
     RECT rRef = { card.right - 24 - 92, y + 2, card.right - 24, y + 32 };
     bool hovRef = ptIn(rRef, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, rRef, 8.0f, hovRef ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovRef ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
-    GdiPlusDraw::drawIcon(g, ICON_REFRESH, static_cast<float>(rRef.left + 16), static_cast<float>(rRef.top + 15), 12.0f, Theme::ACCENT_CYAN);
-    GdiPlusDraw::textLeft(g, "Refresh", static_cast<float>(rRef.left + 30), static_cast<float>(rRef.top + 15), 12.0f, true, Theme::TEXT_PRIMARY, 58.0f);
-    hotspots_.push_back(HubHotspot{ rRef, HUB_REFRESH_DEVICES, 0 });
+    if (showingQrPair) {
+        GdiPlusDraw::textCenter(g, "BACK", static_cast<float>(rRef.left + rRef.right) * 0.5f,
+                                static_cast<float>(rRef.top + rRef.bottom) * 0.5f, 12.0f, true, Theme::ACCENT_CYAN);
+        hotspots_.push_back(HubHotspot{ rRef, HUB_TOGGLE_QR_PAIR, 0 });
+    } else {
+        GdiPlusDraw::drawIcon(g, ICON_REFRESH, static_cast<float>(rRef.left + 16), static_cast<float>(rRef.top + 15), 12.0f, Theme::ACCENT_CYAN);
+        GdiPlusDraw::textLeft(g, "Refresh", static_cast<float>(rRef.left + 30), static_cast<float>(rRef.top + 15), 12.0f, true, Theme::TEXT_PRIMARY, 58.0f);
+        hotspots_.push_back(HubHotspot{ rRef, HUB_REFRESH_DEVICES, 0 });
+    }
     y += 50;
+
+    if (showingQrPair) {
+        // Render crisp scannable QR code with standard 4-module white quiet zone
+        const int qrBoxSz = 196;
+        int qx = cx - qrBoxSz / 2;
+        int qy = y + 4;
+        RECT rQrBg = { qx, qy, qx + qrBoxSz, qy + qrBoxSz };
+        GdiPlusDraw::roundedCard(g, rQrBg, 10.0f, 0xFFFFFFFFu, Theme::ACCENT_CYAN, 2.0f);
+
+        if (qrMatrix && qrMatrix->size > 0) {
+            const int quiet = 3;
+            const int totalMod = qrMatrix->size + quiet * 2;
+            const int cellPx = (qrBoxSz - 12) / totalMod;
+            if (cellPx >= 2) {
+                const int drawSz = cellPx * qrMatrix->size;
+                const int ox = qx + (qrBoxSz - drawSz) / 2;
+                const int oy = qy + (qrBoxSz - drawSz) / 2;
+                Gdiplus::SolidBrush darkBr(Gdiplus::Color(255, 10, 14, 22));
+                for (int r = 0; r < qrMatrix->size; ++r) {
+                    for (int c = 0; c < qrMatrix->size; ++c) {
+                        if (qrMatrix->at(c, r)) {
+                            g.FillRectangle(&darkBr, static_cast<INT>(ox + c * cellPx),
+                                            static_cast<INT>(oy + r * cellPx),
+                                            static_cast<INT>(cellPx), static_cast<INT>(cellPx));
+                        }
+                    }
+                }
+            }
+        }
+
+        int sy = qy + qrBoxSz + 18;
+        GdiPlusDraw::textCenter(g, qrStatus.empty() ? "Waiting for phone to scan QR code over Wi-Fi..." : qrStatus,
+                                static_cast<float>(cx), static_cast<float>(sy), 12.5f, true, Theme::ACCENT_CYAN);
+        GdiPlusDraw::textCenter(g, "Both PC and phone must be on the same Wi-Fi network (mDNS auto-pair + connect).",
+                                static_cast<float>(cx), static_cast<float>(sy + 20), 11.0f, false, Theme::TEXT_MUTED);
+
+        RECT rBack = { x, card.bottom - 52, x + w, card.bottom - 18 };
+        bool hovB = ptIn(rBack, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rBack, 8.0f, hovB ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+                                 hovB ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.0f);
+        GdiPlusDraw::textCenter(g, "Return to USB / Wireless Device List",
+                                static_cast<float>(rBack.left + rBack.right) * 0.5f,
+                                static_cast<float>(rBack.top + rBack.bottom) * 0.5f, 12.0f, true, Theme::TEXT_PRIMARY);
+        hotspots_.push_back(HubHotspot{ rBack, HUB_TOGGLE_QR_PAIR, 0 });
+        return;
+    }
 
     if (!statusMsg.empty()) {
         RECT rSt = { x, y, x + w, y + 32 };
@@ -348,26 +510,34 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
         }
     }
 
-    // Section 2: Wireless ADB Quick Connect
+    // Section 2: Wireless ADB Quick Connect + Android 11+ QR Code Pairing
     y += 6;
-    GdiPlusDraw::textLeft(g, "WIRELESS ADB (TCP/IP)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
+    GdiPlusDraw::textLeft(g, "WIRELESS ADB (TCP/IP & ANDROID 11+ QR PAIRING)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
     y += 22;
 
-    RECT rInp = { x, y, x + w - 110, y + 34 };
+    RECT rInp = { x, y, x + w - 194, y + 34 };
     GdiPlusDraw::roundedCard(g, rInp, 8.0f, Theme::BG_INPUT,
                              editingWirelessAddr ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG,
                              editingWirelessAddr ? 1.6f : 1.0f);
     GdiPlusDraw::drawIcon(g, ICON_WIFI, static_cast<float>(rInp.left + 16), static_cast<float>(y + 17), 13.0f, Theme::TEXT_MUTED);
     std::string dispAddr = wirelessAddr + (editingWirelessAddr ? "_" : "");
-    GdiPlusDraw::textLeft(g, dispAddr, static_cast<float>(rInp.left + 32), static_cast<float>(y + 17), 12.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 150));
+    GdiPlusDraw::textLeft(g, dispAddr, static_cast<float>(rInp.left + 32), static_cast<float>(y + 17), 12.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(rInp.right - rInp.left - 36));
     hotspots_.push_back(HubHotspot{ rInp, HUB_FOCUS_WIFI_ADDR, 0 });
 
-    RECT rWBtn = { rInp.right + 8, y, x + w, y + 34 };
+    RECT rWBtn = { rInp.right + 6, y, rInp.right + 96, y + 34 };
     bool hovW = ptIn(rWBtn, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, rWBtn, 8.0f, hovW ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovW ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.0f);
-    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWBtn.left + rWBtn.right) * 0.5f, static_cast<float>(y + 17), 12.0f, true, Theme::ACCENT_CYAN);
+    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWBtn.left + rWBtn.right) * 0.5f, static_cast<float>(y + 17), 11.5f, true, Theme::ACCENT_CYAN);
     hotspots_.push_back(HubHotspot{ rWBtn, HUB_CONNECT_WIFI, 0 });
+
+    RECT rQrBtn = { rWBtn.right + 6, y, x + w, y + 34 };
+    bool hovQr = ptIn(rQrBtn, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rQrBtn, 8.0f, hovQr ? Theme::ACCENT_PURPLE : Theme::ACCENT_PURPLE_BG,
+                             Theme::ACCENT_PURPLE, 1.1f);
+    GdiPlusDraw::textCenter(g, "QR PAIR", static_cast<float>(rQrBtn.left + rQrBtn.right) * 0.5f, static_cast<float>(y + 17), 11.5f, true,
+                            hovQr ? 0xFFFFFFFFu : Theme::ACCENT_PURPLE);
+    hotspots_.push_back(HubHotspot{ rQrBtn, HUB_TOGGLE_QR_PAIR, 0 });
 
     // Bottom Offline Keymap Studio Button
     RECT rOff = { x, card.bottom - 52, x + w, card.bottom - 18 };

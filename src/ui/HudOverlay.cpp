@@ -105,13 +105,25 @@ bool HudOverlay::create(HWND ownerShellHwnd, HINSTANCE hInst) {
     return hwnd_ != NULL;
 }
 
+void HudOverlay::setEmbeddedD3DMode(bool embedded, HudBitmapReadyFn cb, void* ctx) {
+    embeddedD3DMode_ = embedded;
+    d3dBitmapCb_ = cb;
+    d3dBitmapCtx_ = ctx;
+    if (embeddedD3DMode_ && hwnd_ && IsWindow(hwnd_)) {
+        // Never display the separate floating Win32 popup when D3D11 draws HUD in the same frame!
+        ShowWindow(hwnd_, SW_HIDE);
+    }
+    if (visible_) {
+        renderLayered();
+    }
+}
+
 void HudOverlay::syncBounds(const RECT& videoScreenRect, bool visible) {
-    if (!hwnd_) return;
     int w = videoScreenRect.right - videoScreenRect.left;
     int h = videoScreenRect.bottom - videoScreenRect.top;
     if (!visible || w < 32 || h < 32) {
         if (visible_) {
-            ShowWindow(hwnd_, SW_HIDE);
+            if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
             visible_ = false;
         }
         return;
@@ -124,7 +136,9 @@ void HudOverlay::syncBounds(const RECT& videoScreenRect, bool visible) {
     if (changed || !visible_) {
         lastScreenRect_ = videoScreenRect;
         if (!visible_) {
-            ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+            if (!embeddedD3DMode_ && hwnd_) {
+                ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+            }
             visible_ = true;
         }
         renderLayered();
@@ -133,7 +147,6 @@ void HudOverlay::syncBounds(const RECT& videoScreenRect, bool visible) {
 
 void HudOverlay::setInteractiveEdit(bool editMode, float hudOpacity) {
     (void)hudOpacity;
-    if (!hwnd_) return;
     interactive_ = editMode;
     dragging_ = DRAG_NONE;
     hoveredBtnIndex_ = -1;
@@ -142,15 +155,17 @@ void HudOverlay::setInteractiveEdit(bool editMode, float hudOpacity) {
         rebindTarget_ = HUD_REBIND_NONE;
     }
 
-    LONG ex = GetWindowLongA(hwnd_, GWL_EXSTYLE);
-    if (editMode) {
-        ex &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
-    } else {
-        ex |= (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    if (hwnd_ && !embeddedD3DMode_) {
+        LONG ex = GetWindowLongA(hwnd_, GWL_EXSTYLE);
+        if (editMode) {
+            ex &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        } else {
+            ex |= (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        }
+        SetWindowLongA(hwnd_, GWL_EXSTYLE, ex);
+        SetWindowPos(hwnd_, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    SetWindowLongA(hwnd_, GWL_EXSTYLE, ex);
-    SetWindowPos(hwnd_, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     renderLayered();
 }
 
@@ -161,9 +176,40 @@ void HudOverlay::applyOpacity(bool editMode, float hudOpacity) {
 }
 
 void HudOverlay::invalidate() {
-    if (hwnd_ && visible_) {
+    if (visible_ && (embeddedD3DMode_ || hwnd_)) {
         renderLayered();
     }
+}
+
+void HudOverlay::dispatchMouseDown(int x, int y, bool rightBtn) {
+    if (interactive_) onMouseDown(x, y, rightBtn);
+}
+
+void HudOverlay::dispatchDoubleClick(int x, int y) {
+    if (interactive_) onDoubleClick(x, y);
+}
+
+void HudOverlay::dispatchMouseMove(int x, int y) {
+    if (interactive_) onMouseMove(x, y);
+}
+
+void HudOverlay::dispatchMouseLeave() {
+    if (interactive_ && (hoveredBtnIndex_ != -1 || hoverDeleteChip_)) {
+        hoveredBtnIndex_ = -1;
+        hoverDeleteChip_ = false;
+        renderLayered();
+    }
+}
+
+void HudOverlay::dispatchMouseUp() {
+    if (interactive_) onMouseUp();
+}
+
+void HudOverlay::dispatchMouseWheel(int x, int y, int delta) {
+    if (!interactive_) return;
+    int wvk = (delta > 0) ? VK_CUSTOM_MWHEEL_UP : VK_CUSTOM_MWHEEL_DOWN;
+    if (handleMouseBind(wvk)) return;
+    onMouseWheel(x, y, delta);
 }
 
 void HudOverlay::setSelectedBtnIndex(int idx) {
@@ -199,7 +245,8 @@ bool HudOverlay::checkToastExpired() {
 }
 
 void HudOverlay::renderLayered() {
-    if (!hwnd_ || !visible_ || !host_) return;
+    if (!visible_ || !host_) return;
+    if (!embeddedD3DMode_ && !hwnd_) return;
     int w = lastScreenRect_.right - lastScreenRect_.left;
     int h = lastScreenRect_.bottom - lastScreenRect_.top;
     if (w < 32 || h < 32) return;
@@ -265,6 +312,13 @@ void HudOverlay::renderLayered() {
         if (!toastMsg_.empty() && GetTickCount() < toastExpireTick_) {
             HudRenderer::paintToast(g, w, h, toastMsg_);
         }
+    }
+
+    if (embeddedD3DMode_) {
+        if (d3dBitmapCb_) {
+            d3dBitmapCb_(d3dBitmapCtx_, dibBits_, w, h);
+        }
+        return;
     }
 
     POINT ptDst = { lastScreenRect_.left, lastScreenRect_.top };
@@ -393,11 +447,11 @@ LRESULT HudOverlay::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 bool HudOverlay::hitTestDeleteChip(int px, int py) const {
     if (!host_ || !interactive_) return false;
-    const Profile& p = host_->hudProfile();
-    if (selectedBtnIndex_ < 0 || selectedBtnIndex_ >= static_cast<int>(p.buttons.size())) return false;
     int w = lastScreenRect_.right - lastScreenRect_.left;
     int h = lastScreenRect_.bottom - lastScreenRect_.top;
     if (w <= 0 || h <= 0) return false;
+    Profile p = ProfileDefaults::resolveLayout(host_->hudProfile(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    if (selectedBtnIndex_ < 0 || selectedBtnIndex_ >= static_cast<int>(p.buttons.size())) return false;
 
     const KeyNode& b = p.buttons[selectedBtnIndex_];
     float bx = b.x * static_cast<float>(w);
@@ -426,7 +480,7 @@ HudOverlay::DragTarget HudOverlay::hitTestNode(int px, int py, int& outBtnIdx) c
     float fw = static_cast<float>(w);
     float fh = static_cast<float>(h);
 
-    const Profile& p = host_->hudProfile();
+    Profile p = ProfileDefaults::resolveLayout(host_->hudProfile(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     for (int i = static_cast<int>(p.buttons.size()) - 1; i >= 0; --i) {
         if (p.buttons[i].action != NODE_SWIPE) continue;
         float ex = p.buttons[i].x2 * fw;
@@ -571,8 +625,10 @@ void HudOverlay::onMouseDown(int x, int y, bool rightBtn) {
         n.label = "KEY";
         n.vk = 'K';
         n.action = NODE_PRESS;
-        n.x = clamp01(static_cast<float>(x) / static_cast<float>(w));
-        n.y = clamp01(static_cast<float>(y) / static_cast<float>(h));
+        float liveNx = clamp01(static_cast<float>(x) / static_cast<float>(w));
+        float liveNy = clamp01(static_cast<float>(y) / static_cast<float>(h));
+        ProfileDefaults::unmapEdgeAnchored(liveNx, liveNy, p.edgeAnchored, p.refAspect,
+                                           static_cast<float>(w) / static_cast<float>(h), n.x, n.y);
         n.x2 = n.x;
         n.y2 = n.y;
         n.radius = 0.030f;
@@ -618,9 +674,12 @@ void HudOverlay::onMouseMove(int x, int y) {
         return;
     }
 
-    float nx = clamp01(static_cast<float>(x) / static_cast<float>(w));
-    float ny = clamp01(static_cast<float>(y) / static_cast<float>(h));
+    float liveNx = clamp01(static_cast<float>(x) / static_cast<float>(w));
+    float liveNy = clamp01(static_cast<float>(y) / static_cast<float>(h));
     Profile& p = host_->hudProfile();
+    float nx = liveNx, ny = liveNy;
+    ProfileDefaults::unmapEdgeAnchored(liveNx, liveNy, p.edgeAnchored, p.refAspect,
+                                       static_cast<float>(w) / static_cast<float>(h), nx, ny);
 
     switch (dragging_) {
         case DRAG_JOY:       p.joyX = nx; p.joyY = ny; break;

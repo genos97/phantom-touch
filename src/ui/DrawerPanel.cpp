@@ -58,11 +58,17 @@ enum DrawerActionId {
     DA_TOGGLE_KEYMAP_MODE,
     DA_LINK_CURRENT_APP,
     DA_UNLINK_APP,
+    DA_TOGGLE_EDGE_ANCHOR,
+    DA_CALIBRATE_ASPECT,
 
     // Device & Stream tab
     DA_STREAM_FPS,      // extra = 60/90/120
     DA_STREAM_BITRATE,  // extra = 8/12/16/24
     DA_STREAM_MAXSIZE,  // extra = 0/1600/1280
+    DA_TOGGLE_NATIVE_VIDEO,
+    DA_TOGGLE_VIRTUAL_DISPLAY,
+    DA_VD_PRESET,       // extra = 0 (1080p), 1 (720p), 2 (auto)
+    DA_TOGGLE_GAMEPAD,
     DA_TOGGLE_AUDIO,
     DA_TOGGLE_SCREEN_OFF,
     DA_TOGGLE_STAY_AWAKE,
@@ -677,7 +683,22 @@ int DrawerPanel::paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
         hotspots_.push_back(Hotspot{ rBlank, DA_CREATE_BLANK, 0 });
         hotspots_.push_back(Hotspot{ rClone, DA_CREATE_CLONE, 0 });
     }
-    y += 44;
+    y += 40;
+
+    // Shareable Edge-Anchored Aspect Scaling (survives 20:9 <-> 16:9 screens!)
+    char aspLbl[80];
+    std::snprintf(aspLbl, sizeof(aspLbl), "Edge-Anchored Layout (Ref %.2f:1)", p.refAspect);
+    drawToggleRow(g, x, y, w, aspLbl, p.edgeAnchored, Theme::ACCENT_CYAN, DA_TOGGLE_EDGE_ANCHOR, hoverX, hoverY);
+    y += 34;
+    RECT rCal = { x, y, x + w, y + 26 };
+    bool hovCal = ptIn(rCal, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rCal, 6.0f, hovCal ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "CALIBRATE REF ASPECT TO CURRENT SCREEN", static_cast<float>(x + w / 2),
+                            static_cast<float>(y + 13), 10.0f, true, Theme::TEXT_SECONDARY);
+    if (rCal.bottom > bodyClip_.top && rCal.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rCal, DA_CALIBRATE_ASPECT, 0 });
+    }
+    y += 36;
 
     GdiPlusDraw::textLeft(g, "SAVED CONFIGS (profiles\\*.cfg)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 22;
@@ -757,6 +778,18 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
 
     drawSeg3("VIDEO RESOLUTION", "Native", "1600px", "1280px", 0, 1600, 1280, s.mirrorMaxSize, DA_STREAM_MAXSIZE);
 
+    // Stage 2 & Stage 3 Renderer + Second-Phone Virtual Display controls
+    drawToggleRow(g, x, y, w, "Native D3D11 Single-Stream Video", s.useNativeVideo, Theme::ACCENT_CYAN, DA_TOGGLE_NATIVE_VIDEO, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "Second-Phone Virtual Display", s.virtualDisplayMode, Theme::ACCENT_PURPLE, DA_TOGGLE_VIRTUAL_DISPLAY, hoverX, hoverY); y += 34;
+
+    if (s.virtualDisplayMode) {
+        int curVd = 0;
+        if (s.virtualDisplaySpec == "1280x720/240") curVd = 1;
+        else if (s.virtualDisplaySpec == "auto") curVd = 2;
+        drawSeg3("VIRTUAL DISPLAY SIZE", "1080p PC", "720p Fast", "Auto", 0, 1, 2, curVd, DA_VD_PRESET);
+    }
+
+    drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Forward Phone Audio (scrcpy 5.0)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
@@ -1019,10 +1052,46 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
             case DA_UNLINK_APP:
                 out.requestUnlinkApp = true;
                 return true;
+            case DA_TOGGLE_EDGE_ANCHOR:
+                profile.edgeAnchored = !profile.edgeAnchored;
+                out.profileModified = true;
+                out.toastMessage = profile.edgeAnchored
+                    ? "Edge-Anchored Shareable Layout ON (20:9 <-> 16:9)"
+                    : "Edge-Anchored Layout OFF (raw normalized)";
+                return true;
+            case DA_CALIBRATE_ASPECT:
+                out.requestCalibrateAspect = true;
+                return true;
 
             case DA_STREAM_FPS:     settings.mirrorFps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_BITRATE: settings.mirrorBitrateMbps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_MAXSIZE: settings.mirrorMaxSize = hs.extra; out.settingsModified = true; return true;
+            case DA_TOGGLE_NATIVE_VIDEO:
+                settings.useNativeVideo = !settings.useNativeVideo;
+                if (!settings.useNativeVideo) settings.virtualDisplayMode = false;
+                out.settingsModified = true;
+                out.toastMessage = settings.useNativeVideo
+                    ? "Native D3D11 Single-Stream ON (click Apply & Reconnect)"
+                    : "Legacy scrcpy.exe Fallback ON (click Apply & Reconnect)";
+                return true;
+            case DA_TOGGLE_VIRTUAL_DISPLAY:
+                settings.virtualDisplayMode = !settings.virtualDisplayMode;
+                if (settings.virtualDisplayMode) settings.useNativeVideo = true;
+                out.settingsModified = true;
+                out.toastMessage = settings.virtualDisplayMode
+                    ? "Second-Phone Virtual Display ON (click Apply & Reconnect)"
+                    : "Second-Phone Virtual Display OFF (mirror main screen)";
+                return true;
+            case DA_VD_PRESET:
+                settings.virtualDisplaySpec = (hs.extra == 1) ? "1280x720/240"
+                                            : (hs.extra == 2) ? "auto" : "1920x1080/320";
+                out.settingsModified = true;
+                return true;
+            case DA_TOGGLE_GAMEPAD:
+                settings.gamepadEnabled = !settings.gamepadEnabled;
+                out.settingsModified = true;
+                out.toastMessage = settings.gamepadEnabled ? "XInput Gamepad: ON" : "XInput Gamepad: OFF";
+                return true;
             case DA_TOGGLE_AUDIO:      settings.mirrorAudio = !settings.mirrorAudio; out.settingsModified = true; return true;
             case DA_TOGGLE_SCREEN_OFF: settings.turnScreenOff = !settings.turnScreenOff; out.settingsModified = true; return true;
             case DA_TOGGLE_STAY_AWAKE: settings.stayAwake = !settings.stayAwake; out.settingsModified = true; return true;

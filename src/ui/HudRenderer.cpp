@@ -89,11 +89,15 @@ void HudRenderer::computeDeleteChipPos(float nodeCx, float nodeCy, float pillW, 
 }
 
 void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
-                                   const Profile& profile, const EngineTelemetry& tel,
+                                   const Profile& rawProfile, const EngineTelemetry& tel,
                                    bool editMode, bool demoMode,
                                    int selectedBtnIndex, int hoveredBtnIndex,
                                    bool hoverDeleteChip, bool waitingButtonRebind,
                                    float playOpacity) {
+    // Resolve edge-anchored coordinates (20:9 <-> 16:9) seamlessly for visual placement
+    Profile resolved = ProfileDefaults::resolveLayout(rawProfile, static_cast<uint32_t>(w > 0 ? w : 1920),
+                                                      static_cast<uint32_t>(h > 0 ? h : 1080));
+    const Profile& profile = resolved;
     // In Play Mode, obey user's HUD Opacity smoothly per-pixel; in Edit Mode keep crisp full clarity
     float op = editMode ? 1.0f : ((playOpacity < 0.15f) ? 0.15f : (playOpacity > 1.0f ? 1.0f : playOpacity));
     float fw = static_cast<float>(w);

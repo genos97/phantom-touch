@@ -1,6 +1,8 @@
 #include "config/Profile.hpp"
 
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 
 namespace {
 
@@ -179,4 +181,89 @@ bool ProfileDefaults::matchesPackage(const std::string& packageList, const std::
         pos = comma + 1;
     }
     return false;
+}
+
+void ProfileDefaults::mapEdgeAnchored(float nx, float ny, bool edgeAnchored,
+                                      float refAspect, float liveAspect,
+                                      float& outX, float& outY) {
+    outX = nx;
+    outY = ny;
+    if (!edgeAnchored || refAspect < 0.30f || liveAspect < 0.30f) return;
+    const bool refLand = (refAspect >= 1.0f);
+    const bool liveLand = (liveAspect >= 1.0f);
+    if (refLand != liveLand) return;
+    if (std::fabs(refAspect - liveAspect) < 0.02f) return;
+
+    float ratio = refAspect / liveAspect;
+    if (ratio < 0.60f) ratio = 0.60f;
+    if (ratio > 1.35f) ratio = 1.35f;
+
+    float mappedX = nx;
+    if (nx <= 0.35f) {
+        mappedX = nx * ratio;
+    } else if (nx >= 0.65f) {
+        mappedX = 1.0f - (1.0f - nx) * ratio;
+    } else {
+        float t = (nx - 0.35f) / 0.30f;
+        float leftEdge = 0.35f * ratio;
+        float rightEdge = 1.0f - 0.35f * ratio;
+        mappedX = leftEdge + t * (rightEdge - leftEdge);
+    }
+    if (mappedX < 0.01f) mappedX = 0.01f;
+    if (mappedX > 0.99f) mappedX = 0.99f;
+    outX = mappedX;
+}
+
+void ProfileDefaults::unmapEdgeAnchored(float liveX, float liveY, bool edgeAnchored,
+                                        float refAspect, float liveAspect,
+                                        float& outX, float& outY) {
+    outX = liveX;
+    outY = liveY;
+    if (!edgeAnchored || refAspect < 0.30f || liveAspect < 0.30f) return;
+    const bool refLand = (refAspect >= 1.0f);
+    const bool liveLand = (liveAspect >= 1.0f);
+    if (refLand != liveLand) return;
+    if (std::fabs(refAspect - liveAspect) < 0.02f) return;
+
+    float ratio = refAspect / liveAspect;
+    if (ratio < 0.60f) ratio = 0.60f;
+    if (ratio > 1.35f) ratio = 1.35f;
+
+    float leftEdge = 0.35f * ratio;
+    float rightEdge = 1.0f - 0.35f * ratio;
+    float origX = liveX;
+    if (liveX <= leftEdge) {
+        origX = liveX / ratio;
+    } else if (liveX >= rightEdge) {
+        origX = 1.0f - (1.0f - liveX) / ratio;
+    } else if (rightEdge > leftEdge + 0.005f) {
+        float t = (liveX - leftEdge) / (rightEdge - leftEdge);
+        origX = 0.35f + t * 0.30f;
+    }
+    if (origX < 0.01f) origX = 0.01f;
+    if (origX > 0.99f) origX = 0.99f;
+    outX = origX;
+}
+
+Profile ProfileDefaults::resolveLayout(const Profile& src, uint32_t screenW, uint32_t screenH) {
+    if (!src.edgeAnchored || screenW < 64 || screenH < 64) {
+        return src;
+    }
+    const float liveAspect = static_cast<float>(screenW) / static_cast<float>(screenH);
+    if (std::fabs(src.refAspect - liveAspect) < 0.02f) {
+        return src;
+    }
+
+    Profile out = src;
+    mapEdgeAnchored(src.aimX, src.aimY, true, src.refAspect, liveAspect, out.aimX, out.aimY);
+    mapEdgeAnchored(src.fireX, src.fireY, true, src.refAspect, liveAspect, out.fireX, out.fireY);
+    mapEdgeAnchored(src.leftFireX, src.leftFireY, true, src.refAspect, liveAspect, out.leftFireX, out.leftFireY);
+    mapEdgeAnchored(src.joyX, src.joyY, true, src.refAspect, liveAspect, out.joyX, out.joyY);
+    for (size_t i = 0; i < out.buttons.size(); ++i) {
+        mapEdgeAnchored(src.buttons[i].x, src.buttons[i].y, true, src.refAspect, liveAspect,
+                        out.buttons[i].x, out.buttons[i].y);
+        mapEdgeAnchored(src.buttons[i].x2, src.buttons[i].y2, true, src.refAspect, liveAspect,
+                        out.buttons[i].x2, out.buttons[i].y2);
+    }
+    return out;
 }

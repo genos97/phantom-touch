@@ -137,6 +137,8 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         if (key == "name") p.name = val;
         else if (key == "app_package") p.appPackage = val;
         else if (key == "keymap_enabled") p.keymapEnabled = (val == "1" || toUpper(val) == "TRUE");
+        else if (key == "edge_anchored") p.edgeAnchored = (val == "1" || toUpper(val) == "TRUE");
+        else if (key == "ref_aspect") p.refAspect = clampf(static_cast<float>(std::atof(val.c_str())), 0.40f, 3.50f);
         else if (key == "scrcpy_args") p.scrcpyArgs = val;
         else if (key == "control_max_size") p.controlMaxSize = clampi(std::atoi(val.c_str()), 0, 4096);
         else if (key == "poll_hz") p.pollHz = clampi(std::atoi(val.c_str()), 0, 1000);
@@ -276,6 +278,9 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "name = " << p.name << "\n";
     out << "app_package = " << p.appPackage << "\n";
     out << "keymap_enabled = " << (p.keymapEnabled ? 1 : 0) << "\n";
+    out << "edge_anchored = " << (p.edgeAnchored ? 1 : 0) << "\n";
+    std::snprintf(buf, sizeof(buf), "ref_aspect = %.4f\n", p.refAspect);
+    out << buf;
     out << "scrcpy_args = " << p.scrcpyArgs << "\n";
     out << "control_max_size = " << p.controlMaxSize << "\n";
     out << "poll_hz = " << p.pollHz << "\n";

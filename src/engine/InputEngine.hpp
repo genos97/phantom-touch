@@ -5,6 +5,7 @@
 #include "config/Profile.hpp"
 #include "engine/ActionDispatcher.hpp"
 #include "engine/FpsViewController.hpp"
+#include "engine/GamepadController.hpp"
 #include "engine/JoystickController.hpp"
 
 #include <cstdint>
@@ -17,6 +18,7 @@ struct EngineTelemetry {
     bool scopeActive = false;
     bool holdViewActive = false;
     bool joyDown = false;
+    bool gamepadConnected = false;
     float aimFingerNormX = 0.62f;
     float aimFingerNormY = 0.70f;
     float joyFingerNormX = 0.16f;
@@ -44,6 +46,7 @@ public:
 
     void setAimMode(bool enabled);
     bool isAimMode() const { return aimMode_ != 0; }
+    void setGamepadEnabled(bool enabled);
 
     // Non-blocking raw mouse & hook entry points (safe from WM_INPUT / WH_*_LL)
     void onRawMouseDelta(int dx, int dy);
@@ -114,7 +117,8 @@ private:
 
     mutable CRITICAL_SECTION lock_;      // Worker thread state & touch dispatch
     mutable CRITICAL_SECTION inputLock_; // Microsecond lock for non-blocking hook queues
-    Profile profile_;
+    Profile rawProfile_;                 // Authoring/stored reference profile
+    Profile profile_;                    // Active screen-resolved profile (edge-anchored when enabled)
 
     HANDLE thread_ = NULL;
     HANDLE wakeEvent_ = NULL;
@@ -158,6 +162,8 @@ private:
     // Modular sub-controllers & bounded 0..9 Android virtual finger pool
     TouchFingerPool fingerPool_;
     FpsViewStack viewStack_;
+    GamepadController gamepad_;
+    double lastTickMs_ = 0.0;
     JoystickController joystick_;
     ActionDispatcher actions_;
     uint32_t lastConfiguredW_ = 0;

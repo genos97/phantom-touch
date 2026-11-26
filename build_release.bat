@@ -1,6 +1,6 @@
 @echo off
 setlocal
-echo Packaging Phantom Touch v2.0 Production Release...
+echo Packaging Phantom Touch v2.1 Production Real-Phone Emulator Release...
 
 call build.bat
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%

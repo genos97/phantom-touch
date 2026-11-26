@@ -21,6 +21,10 @@ struct AppSettings {
     bool stayAwake = true;
     bool autoSwitchProfiles = true; // Auto-switch game/desktop profile by foreground Android app
     bool rightClickBack = true;     // Right-click inside phone in Cursor Mode -> Android Back
+    bool useNativeVideo = true;     // Stage 2: single-connection Media Foundation + D3D11 video
+    bool virtualDisplayMode = false; // Stage 3: "Second Phone" virtual screen (new_display)
+    std::string virtualDisplaySpec = "1920x1080/320"; // WxH/DPI or "auto"
+    bool gamepadEnabled = true;     // Stage 3: XInput gamepad-to-touch controller
     std::string lastWirelessAddr = "192.168.1.100:5555";
 
     std::string buildScrcpyArgs() const;

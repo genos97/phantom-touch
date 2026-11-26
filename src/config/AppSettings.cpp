@@ -81,6 +81,10 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "stay_awake") s.stayAwake = (v == "1");
         else if (k == "auto_switch_profiles") s.autoSwitchProfiles = (v == "1");
         else if (k == "right_click_back") s.rightClickBack = (v == "1");
+        else if (k == "use_native_video") s.useNativeVideo = (v == "1");
+        else if (k == "virtual_display_mode") s.virtualDisplayMode = (v == "1");
+        else if (k == "virtual_display_spec" && !v.empty()) s.virtualDisplaySpec = v;
+        else if (k == "gamepad_enabled") s.gamepadEnabled = (v == "1");
         else if (k == "last_wireless_addr" && !v.empty()) s.lastWirelessAddr = v;
     }
 
@@ -108,6 +112,10 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "stay_awake = " << (s.stayAwake ? 1 : 0) << "\n";
         out << "auto_switch_profiles = " << (s.autoSwitchProfiles ? 1 : 0) << "\n";
         out << "right_click_back = " << (s.rightClickBack ? 1 : 0) << "\n";
+        out << "use_native_video = " << (s.useNativeVideo ? 1 : 0) << "\n";
+        out << "virtual_display_mode = " << (s.virtualDisplayMode ? 1 : 0) << "\n";
+        out << "virtual_display_spec = " << s.virtualDisplaySpec << "\n";
+        out << "gamepad_enabled = " << (s.gamepadEnabled ? 1 : 0) << "\n";
         out << "last_wireless_addr = " << s.lastWirelessAddr << "\n";
         out.flush();
         if (!out.good()) return false;

@@ -34,9 +34,12 @@ struct IHudOverlayHost {
     virtual void hudOnToast(const std::string& msg, DWORD durationMs) = 0;
 };
 
-// Per-pixel premultiplied-alpha (UpdateLayeredWindow + GDI+ PARGB) owned overlay
-// pinned strictly to the embedded phone video rect.
-// Renders clean frosted-glass emulator keycaps with zero color-key halos or jagged edges.
+typedef void (*HudBitmapReadyFn)(void* ctx, const void* bgraPremulPixels, int width, int height);
+
+// Per-pixel premultiplied-alpha (GDI+ PARGB) HUD compositor:
+//   - In Stage 2 Native D3D11 Mode: renders directly into an in-memory PARGB surface and hands
+//     it to D3D11Renderer to draw in the EXACT SAME frame as the decoded phone video (zero floating window!).
+//   - In Offline Studio / Legacy scrcpy.exe Mode: presents via UpdateLayeredWindow owned popup.
 class HudOverlay {
 public:
     explicit HudOverlay(IHudOverlayHost* host);
@@ -44,6 +47,10 @@ public:
 
     bool create(HWND ownerShellHwnd, HINSTANCE hInst);
     void destroy();
+
+    // Enables/disables Stage 2 same-frame D3D11 compositing (hides the separate Win32 popup HWND!)
+    void setEmbeddedD3DMode(bool embedded, HudBitmapReadyFn cb = nullptr, void* ctx = nullptr);
+    bool isEmbeddedD3DMode() const { return embeddedD3DMode_; }
 
     HWND hwnd() const { return hwnd_; }
     void syncBounds(const RECT& videoScreenRect, bool visible);
@@ -61,9 +68,15 @@ public:
     void showToast(const std::string& msg, DWORD durationMs = 2000);
     bool checkToastExpired();
 
-    // Forwarded from ShellWindow if user presses a key/mouse while ShellWindow has focus
+    // Forwarded from ShellWindow / ViewportHost (coords relative to video rect top-left)
     bool handleKeyDown(int vk);
     bool handleMouseBind(int mouseVk);
+    void dispatchMouseDown(int x, int y, bool rightBtn);
+    void dispatchDoubleClick(int x, int y);
+    void dispatchMouseMove(int x, int y);
+    void dispatchMouseLeave();
+    void dispatchMouseUp();
+    void dispatchMouseWheel(int x, int y, int delta);
 
 private:
     enum DragTarget {
@@ -116,4 +129,8 @@ private:
     void* dibBits_ = NULL;
     int dibW_ = 0;
     int dibH_ = 0;
+
+    bool embeddedD3DMode_ = false;
+    HudBitmapReadyFn d3dBitmapCb_ = nullptr;
+    void* d3dBitmapCtx_ = nullptr;
 };

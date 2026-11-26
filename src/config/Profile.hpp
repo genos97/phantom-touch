@@ -2,6 +2,7 @@
 
 #include "config/KeyCodes.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,8 @@ struct Profile {
     std::string name = "Free Fire MAX (S21 FE)";
     std::string appPackage = "com.dts.freefiremax,com.dts.freefireth"; // Optional comma-separated Android package(s) for auto-switch
     bool keymapEnabled = true;       // false = Desktop Typing Mode (all PC keys type directly into Android!)
+    bool edgeAnchored = false;       // Stage 3: anchor left/right HUD nodes relative to screen edges (20:9 <-> 16:9 survival)
+    float refAspect = 2.1667f;       // Reference screen aspect ratio (W/H) where profile was calibrated (2340/1080)
     std::string scrcpyArgs = "--max-fps=90 --video-bit-rate=16M";
     int controlMaxSize = 0;          // 0 = native phone resolution
     int pollHz = 250;                // 125 / 250 / 500 Hz coalescing (0 = MAX 1000 Hz)
@@ -118,6 +121,13 @@ public:
     static Profile createBlank(const std::string& name);
     static Profile createDesktop(const std::string& name = "Desktop (Typing)");
     static bool matchesPackage(const std::string& packageList, const std::string& activePkg);
+    static void mapEdgeAnchored(float nx, float ny, bool edgeAnchored,
+                                float refAspect, float liveAspect,
+                                float& outX, float& outY);
+    static void unmapEdgeAnchored(float liveX, float liveY, bool edgeAnchored,
+                                  float refAspect, float liveAspect,
+                                  float& outX, float& outY);
+    static Profile resolveLayout(const Profile& src, uint32_t screenW, uint32_t screenH);
     static std::string actionTypeToName(KeyActionType action);
     static KeyActionType nameToActionType(const std::string& raw);
 };

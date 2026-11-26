@@ -27,6 +27,7 @@ struct DrawerActionResult {
     std::string wirelessAddr;
     bool requestLinkCurrentApp = false;
     bool requestUnlinkApp = false;
+    bool requestCalibrateAspect = false;
     std::string toastMessage;
 };
 

@@ -9,6 +9,7 @@
 #include "ui/SideRail.hpp"
 #include "ui/TopBar.hpp"
 #include "ui/ViewportHost.hpp"
+#include "video/H264Decoder.hpp"
 
 #include <string>
 #include <vector>
@@ -57,7 +58,14 @@ private:
     static DWORD WINAPI wirelessThreadProc(LPVOID param);
     static DWORD WINAPI appWatcherThreadProc(LPVOID param);
     static DWORD WINAPI dropWorkerThreadProc(LPVOID param);
+    static DWORD WINAPI qrPairThreadProc(LPVOID param);
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
+    static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
+                              uint64_t ptsUs, bool isConfig, bool isKeyFrame);
+    static void onDecodedFrame(void* ctx, const DecodedNV12Frame& frame);
+    static void onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h);
+
+    bool mapShellClientToVideoLocal(int mx, int my, int& outVx, int& outVy, bool requireInside) const;
 
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -74,6 +82,8 @@ private:
     void startAsyncConnect(const std::string& serial);
     void startAsyncWirelessConnect(const std::string& ipPort);
     void startAsyncDropTransfer(const std::vector<std::string>& files);
+    void startQrWirelessPairing();
+    void stopQrWirelessPairing();
     void refreshAdbDevices();
     void disconnectDevice(bool returnToHub);
     void takeScreenshot();
@@ -132,9 +142,17 @@ private:
     HANDLE connectThread_ = NULL;
     HANDLE appWatcherThread_ = NULL;
     HANDLE dropThread_ = NULL;
+    HANDLE qrPairThread_ = NULL;
     volatile LONG connecting_ = 0;
     volatile LONG stopAuxThreads_ = 0;
     volatile LONG dropping_ = 0;
+    volatile LONG stopQrPair_ = 0;
+    bool showingQrPair_ = false;
+    std::string qrServiceName_;
+    std::string qrPairPassword_;
+    std::string qrPairStatus_;
+    std::string qrAutoConnectAddr_;
+    QrMatrix qrMatrix_;
     std::string pendingSerial_;
     std::string pendingWirelessIp_;
     std::string asyncResultMsg_;
@@ -189,6 +207,10 @@ private:
     uint32_t lastPhoneH_ = 1080;
     DWORD lastTelemetryPaintTick_ = 0;
     bool sawEmbeddedMirror_ = false;
+    bool nativeVideoSession_ = false;
+    bool d3dHudDragging_ = false;
+    volatile LONG videoFramePending_ = 0;
+    H264Decoder h264Decoder_;
 
     // Double-buffered shell GDI surface
     HDC cacheDC_ = NULL;

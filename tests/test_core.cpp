@@ -1,3 +1,4 @@
+#include "bridge/QrCodeGen.hpp"
 #include "bridge/SpsParser.hpp"
 #include "bridge/TouchFingerPool.hpp"
 #include "bridge/ScrcpyBridge.hpp"
@@ -7,10 +8,13 @@
 #include "config/ProfileStore.hpp"
 #include "engine/ActionDispatcher.hpp"
 #include "engine/FpsViewController.hpp"
+#include "engine/GamepadController.hpp"
 #include "engine/InputEngine.hpp"
 #include "engine/JoystickController.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "video/D3D11Renderer.hpp"
+#include "video/H264Decoder.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -692,6 +696,168 @@ static void testStage1EmulatorFeatures() {
     std::printf("[Test] Stage 1 (Auto-Switch parser, Desktop Typing, Android KeyCodes, Ctrl+Wheel Pinch-Zoom) OK!\n");
 }
 
+static void testStage2VideoPipeline() {
+    // 1. Windows Media Foundation built-in H.264 Decoder MFT initialization (NV12)
+    H264Decoder dec;
+    std::string decErr;
+    bool decOk = dec.init(1280, 720, decErr);
+    assert(decOk && dec.isInitialized());
+    dec.shutdown();
+
+    // 2. NV12 -> BGRA BT.709 color conversion test (white Y=235, UV=128 -> near 255,255,255)
+    DecodedNV12Frame frame;
+    frame.width = 64;
+    frame.height = 64;
+    frame.stride = 64;
+    frame.surfaceH = 64;
+    frame.data.resize(64 * 64 * 3 / 2);
+    std::memset(frame.data.data(), 235, 64 * 64);          // Y = 235 (white)
+    std::memset(frame.data.data() + 64 * 64, 128, 64 * 32); // U=128, V=128 (neutral)
+
+    std::vector<uint8_t> bgra;
+    assert(D3D11Renderer::convertNV12ToBGRA(frame, bgra));
+    assert(bgra.size() == 64 * 64 * 4);
+    assert(bgra[0] >= 250 && bgra[1] >= 250 && bgra[2] >= 250 && bgra[3] == 255);
+
+    // 3. Real Direct3D 11 Renderer + HLSL shader compilation + same-frame HUD overlay + instant PNG screenshot
+    HWND tmpHwnd = CreateWindowExA(0, "STATIC", "D3D11Test", WS_POPUP, 0, 0, 320, 180, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    assert(tmpHwnd != NULL);
+    D3D11Renderer d3d;
+    std::string d3dErr;
+    assert(d3d.init(tmpHwnd, 320, 180, d3dErr));
+    assert(d3d.isInitialized());
+
+    d3d.submitNV12Frame(frame);
+    assert(d3d.hasVideoFrame());
+
+    std::vector<uint8_t> hudPix(64 * 64 * 4, 128);
+    d3d.updateHudBitmap(hudPix.data(), 64, 64);
+    ViewportRect vr;
+    vr.x = 0; vr.y = 0; vr.w = 320; vr.h = 180;
+    d3d.render(vr, true);
+
+    const std::string pngPath = "profiles\\_test_d3d11_snap.png";
+    std::string snapErr;
+    assert(d3d.saveLatestFramePng(pngPath, snapErr));
+    FILE* f = std::fopen(pngPath.c_str(), "rb");
+    assert(f != NULL);
+    unsigned char sig[8] = {0};
+    assert(std::fread(sig, 1, 8, f) == 8);
+    std::fclose(f);
+    assert(sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G');
+    std::remove(pngPath.c_str());
+
+    d3d.shutdown();
+    DestroyWindow(tmpHwnd);
+    std::printf("[Test] Stage 2 (Media Foundation H.264 MFT, Direct3D 11 NV12+HUD shader, instant PNG capture) OK!\n");
+}
+
+static void testStage3EmulatorFeatures() {
+    // 1. Edge-Anchored Shareable Profiles (20:9 <-> 16:9 survival + exact inverse round-trip!)
+    float mx = 0.0f, my = 0.0f;
+    // Left-edge joystick at 0.14 on 20:9 (2.222) -> 16:9 (1.778): ratio=1.25 -> 0.175
+    ProfileDefaults::mapEdgeAnchored(0.14f, 0.75f, true, 20.0f / 9.0f, 16.0f / 9.0f, mx, my);
+    assert(std::fabs(mx - 0.175f) < 0.002f && std::fabs(my - 0.75f) < 0.001f);
+    float ux = 0.0f, uy = 0.0f;
+    ProfileDefaults::unmapEdgeAnchored(mx, my, true, 20.0f / 9.0f, 16.0f / 9.0f, ux, uy);
+    assert(std::fabs(ux - 0.14f) < 0.002f);
+
+    // Right-edge Jump button at 0.94 on 20:9 -> 16:9: 1 - 0.06*1.25 = 0.925
+    ProfileDefaults::mapEdgeAnchored(0.94f, 0.65f, true, 20.0f / 9.0f, 16.0f / 9.0f, mx, my);
+    assert(std::fabs(mx - 0.925f) < 0.002f);
+    ProfileDefaults::unmapEdgeAnchored(mx, my, true, 20.0f / 9.0f, 16.0f / 9.0f, ux, uy);
+    assert(std::fabs(ux - 0.94f) < 0.002f);
+
+    // Center stays dead-center (0.50 -> 0.50)
+    ProfileDefaults::mapEdgeAnchored(0.50f, 0.50f, true, 20.0f / 9.0f, 16.0f / 9.0f, mx, my);
+    assert(std::fabs(mx - 0.50f) < 0.002f);
+
+    Profile edgeProf = ProfileDefaults::createFreeFire();
+    edgeProf.edgeAnchored = true;
+    edgeProf.refAspect = 20.0f / 9.0f;
+    const std::string tmpEdge = "profiles\\_test_edge_anchor.cfg";
+    assert(ProfileStore::save(tmpEdge, edgeProf));
+    Profile edgeLoaded;
+    assert(ProfileStore::load(tmpEdge, edgeLoaded));
+    assert(edgeLoaded.edgeAnchored && std::fabs(edgeLoaded.refAspect - (20.0f / 9.0f)) < 0.01f);
+    std::remove(tmpEdge.c_str());
+
+    Profile resolved169 = ProfileDefaults::resolveLayout(edgeLoaded, 1920, 1080);
+    assert(resolved169.joyX > edgeLoaded.joyX + 0.02f); // Left joystick shifts inward on narrower 16:9!
+    assert(resolved169.fireX < edgeLoaded.fireX - 0.01f); // Right fire button shifts inward on narrower 16:9!
+
+    // 2. AppSettings Stage 2 & 3 Virtual Display + Native Video + Gamepad round-trip
+    AppSettings as;
+    as.useNativeVideo = true;
+    as.virtualDisplayMode = true;
+    as.virtualDisplaySpec = "1280x720/240";
+    as.gamepadEnabled = false;
+    const std::string tmpS3 = "profiles\\_test_stage3_settings.cfg";
+    assert(AppSettingsStore::save(tmpS3, as));
+    AppSettings asL;
+    assert(AppSettingsStore::load(tmpS3, asL));
+    assert(asL.useNativeVideo && asL.virtualDisplayMode && asL.virtualDisplaySpec == "1280x720/240" && !asL.gamepadEnabled);
+    std::remove(tmpS3.c_str());
+
+    // 3. XInput Gamepad-to-Touch Controller (deadzone, 360° analog joystick, right-stick look, triggers & buttons)
+    float sx = 1.0f, sy = 1.0f;
+    GamepadController::normalizeStick(2000, -1500, 0.18f, sx, sy); // inside deadzone -> 0
+    assert(sx == 0.0f && sy == 0.0f);
+    GamepadController::normalizeStick(32767, 0, 0.18f, sx, sy);
+    assert(std::fabs(sx - 1.0f) < 0.01f && std::fabs(sy) < 0.01f);
+
+    std::vector<RecordedTouch> gpLog;
+    uint32_t gpPkts = 0;
+    GamepadController gp;
+    gp.setTouchSink(recordTouchCb, &gpLog);
+    Profile gpProf = ProfileDefaults::createFreeFire();
+
+    GamepadSnapshot snap;
+    snap.connected = true;
+    snap.lx = 0.0f; snap.ly = 0.95f; // Push left stick full UP -> sprint joystick up
+    snap.rx = 0.80f; snap.ry = 0.20f; // Right stick up-right -> lookDx > 0, lookDy < 0
+    snap.rt = 0.85f;                  // RT -> Fire (LMB)
+    snap.buttons = 0x1000;            // A button -> VK_SPACE (Jump)
+    GamepadFrameOutput gpOut;
+    gp.processSnapshot(snap, gpProf, 1920, 1080, 10.0, gpPkts, gpOut);
+    assert(gpOut.connected && gpOut.analogJoyActive && gp.isJoyDown());
+    assert(gpLog.size() == 2 && gpLog[0].action == TOUCH_DOWN && gpLog[1].action == TOUCH_MOVE && gpLog[1].py < gpLog[0].py);
+    assert(gpOut.lookDx > 1.0 && gpOut.lookDy < -0.2);
+    assert(gpOut.keyDeltaCount == 2); // Fire + Jump pressed
+
+    // Release sticks & buttons -> joystick lifts cleanly & buttons emit UP
+    GamepadSnapshot idle;
+    idle.connected = true;
+    gp.processSnapshot(idle, gpProf, 1920, 1080, 10.0, gpPkts, gpOut);
+    assert(!gp.isJoyDown() && gpLog.back().action == TOUCH_UP);
+    assert(gpOut.keyDeltaCount == 2 && !gpOut.keyDeltas[0].down && !gpOut.keyDeltas[1].down);
+
+    // 4. ISO/IEC 18004 QR Code Generator (Android 11+ Wireless ADB Pairing) + mDNS Parser
+    std::string qrPayload = QrCodeGen::buildAndroidAdbPairPayload("studio-PT4821", "938271");
+    assert(qrPayload == "WIFI:T:ADB;S:studio-PT4821;P:938271;;");
+    QrMatrix qm;
+    assert(QrCodeGen::encode(qrPayload, qm));
+    assert(qm.size == 29 || qm.size == 33);
+    // Verify top-left, top-right, bottom-left 7x7 finder outer ring & 3x3 dark core
+    assert(qm.at(0, 0) && qm.at(6, 0) && qm.at(0, 6) && qm.at(3, 3) && !qm.at(1, 1));
+    assert(qm.at(qm.size - 1, 0) && qm.at(qm.size - 7, 0) && qm.at(qm.size - 4, 3));
+    assert(qm.at(0, qm.size - 1) && qm.at(0, qm.size - 7) && qm.at(3, qm.size - 4));
+    // Verify timing patterns & mandatory dark module (8, size-8)
+    assert(qm.at(8, 6) && !qm.at(9, 6) && qm.at(10, 6));
+    assert(qm.at(8, qm.size - 8));
+
+    const std::string mdnsRaw =
+        "List of discovered mdns services\n"
+        "studio-PT4821\t_adb-tls-pairing._tcp\t192.168.1.42:37891\n"
+        "adb-RZCW401ABCD-xyz\t_adb-tls-connect._tcp\t192.168.1.42:41235\n";
+    std::vector<MdnsServiceInfo> svcs = ScrcpyBridge::parseMdnsServicesOutput(mdnsRaw);
+    assert(svcs.size() == 2);
+    assert(svcs[0].name == "studio-PT4821" && svcs[0].type == "_adb-tls-pairing._tcp" && svcs[0].addr == "192.168.1.42:37891");
+    assert(svcs[1].type == "_adb-tls-connect._tcp" && svcs[1].addr == "192.168.1.42:41235");
+
+    std::printf("[Test] Stage 3 (Edge-Anchored 20:9<->16:9, Virtual Display cfg, XInput Gamepad, ISO QR + mDNS) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -702,6 +868,8 @@ int main() {
     testFpsViewController();
     testInputEngineIntegration();
     testStage1EmulatorFeatures();
-    std::printf("ALL PRODUCTION EMULATOR SHELL & ENGINE TESTS PASSED!\n");
+    testStage2VideoPipeline();
+    testStage3EmulatorFeatures();
+    std::printf("ALL STAGE 1 + STAGE 2 + STAGE 3 REAL-PHONE EMULATOR TESTS PASSED!\n");
     return 0;
 }

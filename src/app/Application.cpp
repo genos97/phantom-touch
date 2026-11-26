@@ -24,13 +24,13 @@ void Application::enableDpiAwareness() {
     // Prefer Per-Monitor V2 DPI Awareness on Windows 10/11, fallback to system DPI aware
     typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
     SetProcessDpiAwarenessContextFn fnV2 = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
-        GetProcAddress(hUser32, "SetProcessDpiAwarenessContext"));
+        reinterpret_cast<void*>(GetProcAddress(hUser32, "SetProcessDpiAwarenessContext")));
     if (fnV2 && fnV2(reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-4)))) {
         return;
     }
     typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
     SetProcessDPIAwareFn fn = reinterpret_cast<SetProcessDPIAwareFn>(
-        GetProcAddress(hUser32, "SetProcessDPIAware"));
+        reinterpret_cast<void*>(GetProcAddress(hUser32, "SetProcessDPIAware")));
     if (fn) fn();
 }
 

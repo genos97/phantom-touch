@@ -31,7 +31,24 @@ struct AdbDeviceInfo {
     bool wireless = false;
 };
 
+struct MdnsServiceInfo {
+    std::string name;    // e.g. "studio-PhantomTouch" or "adb-RZCW401ABCD-xyz"
+    std::string type;    // "_adb-tls-pairing._tcp" or "_adb-tls-connect._tcp"
+    std::string addr;    // e.g. "192.168.1.42:37891"
+};
+
 typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
+typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
+                              uint64_t ptsUs, bool isConfig, bool isKeyFrame);
+
+struct BridgeStreamConfig {
+    int maxSize = 0;            // 0 = native phone resolution
+    int maxFps = 1;             // 1 for legacy metadata-only, 60/90/120 for native video
+    int bitrateMbps = 0;        // 0 = 100kbps metadata-only, 8..24 Mbps for native video
+    bool stayAwake = true;
+    bool virtualDisplay = false;
+    std::string virtualDisplaySpec; // e.g. "1920x1080/320", "1280x720/240", or "auto"
+};
 
 class ScrcpyBridge {
 public:
@@ -41,38 +58,47 @@ public:
     bool locateTools(ToolPaths& outPaths, std::string& outError);
     bool listDevices(const ToolPaths& tools, std::vector<AdbDeviceInfo>& outDevices);
     bool connectWireless(const ToolPaths& tools, const std::string& ipPort, std::string& outMsg);
+    bool pairWireless(const ToolPaths& tools, const std::string& ipPort, const std::string& pairCode, std::string& outMsg);
+    bool listMdnsServices(const ToolPaths& tools, std::vector<MdnsServiceInfo>& outServices);
 
     static std::vector<AdbDeviceInfo> parseAdbDevicesOutput(const std::string& raw);
+    static std::vector<MdnsServiceInfo> parseMdnsServicesOutput(const std::string& raw);
     static std::string parseForegroundPackage(const std::string& dumpsysRaw);
 
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,
                             bool borderless = false, const std::string& deviceSerial = "");
+    bool launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial, std::string& outError);
     void stopMirrorWindow();
 
     bool connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
                         const std::string& deviceSerial = "", bool stayAwake = true);
+    bool connectSession(const ToolPaths& tools, const BridgeStreamConfig& cfg,
+                        std::string& outError, const std::string& deviceSerial = "");
     void disconnect();
 
     bool isConnected() const { return connected_ != 0; }
     bool isMirrorRunning() const;
+    bool isVirtualDisplayActive() const { return virtualDisplayActive_; }
     DWORD mirrorProcessId() const { return mirrorPid_; }
     std::string activeSerial() const;
 
     std::string deviceName() const;
     void getScreenSize(uint32_t& outW, uint32_t& outH) const;
 
-    // Multi-touch, keyboard, text, clipboard, and display control over scrcpy control socket
+    // Multi-touch, keyboard, text, clipboard, app launcher, and display control over scrcpy control socket
     bool sendTouchPixels(TouchAction action, uint64_t pointerId, int32_t px, int32_t py, bool clampToScreen = true);
     bool sendTouchNorm(TouchAction action, uint64_t pointerId, float nx, float ny);
     bool sendKeycode(uint8_t action, uint32_t androidKeycode, uint32_t metastate = 0);
     bool sendText(const std::string& utf8Text);
     bool sendSetClipboard(const std::string& utf8Text, bool paste);
     bool sendGetClipboard(uint8_t copyKey); // 0=NONE, 1=COPY, 2=CUT
+    bool sendStartApp(const std::string& appName);
     void sendAndroidNav(uint32_t androidKeycode);
     bool setDisplayPower(bool on);
 
     void setClipboardCallback(DeviceClipboardFn fn, void* ctx);
+    void setVideoPacketCallback(VideoPacketFn fn, void* ctx);
 
     // Foreground app inspection & Drag-and-Drop file/APK helpers
     std::string queryForegroundPackage();
@@ -128,4 +154,7 @@ private:
     uint64_t clipSeq_ = 1;
     DeviceClipboardFn clipCb_ = nullptr;
     void* clipCbCtx_ = nullptr;
+    VideoPacketFn videoCb_ = nullptr;
+    void* videoCbCtx_ = nullptr;
+    bool virtualDisplayActive_ = false;
 };

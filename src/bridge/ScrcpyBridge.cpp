@@ -381,6 +381,85 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     return true;
 }
 
+bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial, std::string& outError) {
+    if (mirrorProc_ != NULL) return true;
+    std::string cmd = "\"" + tools.scrcpyExe + "\" --no-window --no-video --no-control";
+    if (!deviceSerial.empty()) {
+        cmd += " -s \"" + deviceSerial + "\"";
+    }
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    std::vector<char> mutableCmd(cmd.begin(), cmd.end());
+    mutableCmd.push_back('\0');
+    if (!CreateProcessA(NULL, mutableCmd.data(), NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        outError = "Failed to launch scrcpy audio-only relay.";
+        return false;
+    }
+    mirrorProc_ = pi.hProcess;
+    mirrorPid_ = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    appendLog("[Audio] Launched scrcpy audio-only relay (--no-window --no-video)");
+    return true;
+}
+
+bool ScrcpyBridge::pairWireless(const ToolPaths& tools, const std::string& ipPort,
+                                const std::string& pairCode, std::string& outMsg) {
+    outMsg.clear();
+    if (tools.adbExe.empty() || ipPort.empty() || pairCode.empty()) {
+        outMsg = "Enter pairing IP:port and 6-digit code.";
+        return false;
+    }
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture("\"" + tools.adbExe + "\" pair " + ipPort + " " + pairCode, raw, ec)) {
+        outMsg = "Failed to launch adb pair.";
+        return false;
+    }
+    while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n')) raw.pop_back();
+    outMsg = raw.empty() ? "ADB pairing finished." : raw;
+    appendLog("[Pair] " + outMsg);
+    return (ec == 0 && raw.find("Successfully paired") != std::string::npos);
+}
+
+std::vector<MdnsServiceInfo> ScrcpyBridge::parseMdnsServicesOutput(const std::string& raw) {
+    // Format from `adb mdns services`:
+    //   List of discovered mdns services
+    //   studio-PhantomTouch    _adb-tls-pairing._tcp   192.168.1.42:37891
+    //   adb-RZCW401ABCD-abc    _adb-tls-connect._tcp   192.168.1.42:41235
+    std::vector<MdnsServiceInfo> out;
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty() || line.find("List of ") == 0) continue;
+        std::istringstream ls(line);
+        MdnsServiceInfo info;
+        if (!(ls >> info.name >> info.type >> info.addr)) continue;
+        if (info.addr.find(':') == std::string::npos) continue;
+        out.push_back(info);
+    }
+    return out;
+}
+
+bool ScrcpyBridge::listMdnsServices(const ToolPaths& tools, std::vector<MdnsServiceInfo>& outServices) {
+    outServices.clear();
+    if (tools.adbExe.empty()) return false;
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture("\"" + tools.adbExe + "\" mdns services", raw, ec)) {
+        return false;
+    }
+    outServices = parseMdnsServicesOutput(raw);
+    return true;
+}
+
 void ScrcpyBridge::stopMirrorWindow() {
     if (mirrorProc_) {
         TerminateProcess(mirrorProc_, 0);
@@ -405,12 +484,24 @@ std::string ScrcpyBridge::activeSerial() const {
 
 bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
                                   const std::string& deviceSerial, bool stayAwake) {
+    BridgeStreamConfig cfg;
+    cfg.maxSize = controlMaxSize;
+    cfg.maxFps = 1;
+    cfg.bitrateMbps = 0;
+    cfg.stayAwake = stayAwake;
+    cfg.virtualDisplay = false;
+    return connectSession(tools, cfg, outError, deviceSerial);
+}
+
+bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConfig& cfg,
+                                  std::string& outError, const std::string& deviceSerial) {
     if (!wsaInit_) {
         outError = "Winsock initialization failed.";
         return false;
     }
 
     adbExe_ = tools.adbExe;
+    virtualDisplayActive_ = cfg.virtualDisplay;
     EnterCriticalSection(&metaLock_);
     activeSerial_ = deviceSerial;
     LeaveCriticalSection(&metaLock_);
@@ -479,7 +570,12 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
         return false;
     }
 
-    // 4. Launch scrcpy-server in low-FPS metadata + full multi-touch control mode
+    // 4. Launch scrcpy-server (either full native H.264 stream + control, or legacy 1 FPS metadata + control)
+    const int fps = (cfg.maxFps > 0) ? cfg.maxFps : 1;
+    const uint32_t bps = (cfg.bitrateMbps > 0) ? static_cast<uint32_t>(cfg.bitrateMbps) * 1000000u : 100000u;
+    char streamBuf[96];
+    std::snprintf(streamBuf, sizeof(streamBuf), " max_fps=%d video_bit_rate=%u", fps, bps);
+
     std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
@@ -487,9 +583,8 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
                          " video=true"
                          " audio=false"
                          " control=true"
-                         " video_codec=h264"
-                         " max_fps=1"
-                         " video_bit_rate=100000"
+                         " video_codec=h264" +
+                         std::string(streamBuf) +
                          " tunnel_forward=true"
                          " send_dummy_byte=true"
                          " send_device_meta=true"
@@ -497,12 +592,21 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
                          " send_frame_meta=true"
                          " clipboard_autosync=true"
                          " power_on=true"
-                         " stay_awake=" + std::string(stayAwake ? "true" : "false") +
+                         " stay_awake=" + std::string(cfg.stayAwake ? "true" : "false") +
                          " cleanup=false";
-    if (controlMaxSize > 0) {
+    if (cfg.maxSize > 0) {
         char szBuf[32];
-        std::snprintf(szBuf, sizeof(szBuf), " max_size=%d", controlMaxSize);
+        std::snprintf(szBuf, sizeof(szBuf), " max_size=%d", cfg.maxSize);
         srvCmd += szBuf;
+    }
+    if (cfg.virtualDisplay) {
+        // Stage 3 "Second Phone" Virtual Display Mode (keeps physical phone screen free!)
+        if (cfg.virtualDisplaySpec.empty() || cfg.virtualDisplaySpec == "auto") {
+            srvCmd += " new_display=";
+        } else {
+            srvCmd += " new_display=" + cfg.virtualDisplaySpec;
+        }
+        srvCmd += " flex_display=true vd_destroy_content=false";
     }
 
     STARTUPINFOA si;
@@ -569,6 +673,11 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
     BOOL nodelay = TRUE;
     setsockopt(controlSock_, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    setsockopt(videoSock_, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    int rcvBuf = 1024 * 1024;
+    setsockopt(videoSock_, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
 
     // 7. Read 64-byte device name + codec/session metadata on Video socket #1
     //    scrcpy v2/v3: [4B codec_id][4B width][4B height]
@@ -836,6 +945,28 @@ void ScrcpyBridge::setClipboardCallback(DeviceClipboardFn fn, void* ctx) {
     LeaveCriticalSection(&metaLock_);
 }
 
+void ScrcpyBridge::setVideoPacketCallback(VideoPacketFn fn, void* ctx) {
+    EnterCriticalSection(&metaLock_);
+    videoCb_ = fn;
+    videoCbCtx_ = ctx;
+    LeaveCriticalSection(&metaLock_);
+}
+
+bool ScrcpyBridge::sendStartApp(const std::string& appName) {
+    if (!connected_ || appName.empty()) return false;
+    // SC_CONTROL_MSG_TYPE_START_APP (type=16 in scrcpy 3.0+/5.0+): [16:1][len:1][utf8 name]
+    size_t len = appName.size();
+    if (len > 255) len = 255;
+    std::vector<uint8_t> msg(2 + len);
+    msg[0] = 16;
+    msg[1] = static_cast<uint8_t>(len);
+    std::memcpy(msg.data() + 2, appName.data(), len);
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
+}
+
 std::string ScrcpyBridge::parseForegroundPackage(const std::string& raw) {
     // Parses Android 8-16 dumpsys window / dumpsys activity lines such as:
     //   mCurrentFocus=Window{abc u0 com.dts.freefiremax/com.dts.freefireth.FFMainActivity}
@@ -1028,8 +1159,11 @@ void ScrcpyBridge::runVideoReader() {
             break;
         }
 
-        // Bit 63 (v2/v3) or Bit 62 (v4/v5) = SC_PACKET_FLAG_CONFIG (SPS/PPS)
-        const bool isConfig = (ptsAndFlags & (3ULL << 62)) != 0;
+        // Bit 63 = SC_PACKET_FLAG_CONFIG (SPS/PPS), Bit 62 = SC_PACKET_FLAG_KEY_FRAME (IDR)
+        const bool isConfig   = (ptsAndFlags & (1ULL << 63)) != 0;
+        const bool isKeyFrame = (ptsAndFlags & (1ULL << 62)) != 0;
+        const uint64_t ptsUs  = (ptsAndFlags & 0x3FFFFFFFFFFFFFFFULL);
+
         if (isConfig && pktSize > 4) {
             uint32_t newW = 0, newH = 0;
             if (SpsParser::parseH264Resolution(payload.data(), payload.size(), newW, newH)) {
@@ -1042,6 +1176,16 @@ void ScrcpyBridge::runVideoReader() {
                     std::printf("[Bridge] Screen rotation/resize (SPS): %ux%u\n", newW, newH);
                 }
             }
+        }
+
+        VideoPacketFn vcb = nullptr;
+        void* vctx = nullptr;
+        EnterCriticalSection(&metaLock_);
+        vcb = videoCb_;
+        vctx = videoCbCtx_;
+        LeaveCriticalSection(&metaLock_);
+        if (vcb && pktSize > 0) {
+            vcb(vctx, payload.data(), pktSize, ptsUs, isConfig, isKeyFrame);
         }
     }
     InterlockedExchange(&connected_, 0);

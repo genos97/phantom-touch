@@ -58,11 +58,13 @@ InputEngine::InputEngine(ScrcpyBridge* bridge)
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
 
-    profile_ = ProfileDefaults::createFreeFire();
+    rawProfile_ = ProfileDefaults::createFreeFire();
+    profile_ = rawProfile_;
 
     fingerPool_.setDownstreamSink(emitTouchToBridge, bridge_);
     viewStack_.setTouchSink(emitTouchThroughPool, this);
     joystick_.setTouchSink(emitTouchThroughPool, this);
+    gamepad_.setTouchSink(emitTouchThroughPool, this);
     actions_.setTouchSink(emitTouchThroughPool, this);
     actions_.resetForProfile(profile_.buttons.size());
 
@@ -108,6 +110,7 @@ void InputEngine::rebuildKeyRouteCacheLocked() {
 void InputEngine::syncFpsViewConfigLocked(uint32_t w, uint32_t h) {
     if (w == 0) w = 1920;
     if (h == 0) h = 1080;
+    profile_ = ProfileDefaults::resolveLayout(rawProfile_, w, h);
     double dw = static_cast<double>(w);
     double dh = static_cast<double>(h);
 
@@ -175,6 +178,7 @@ void InputEngine::stop() {
 void InputEngine::setProfile(const Profile& profile) {
     EnterCriticalSection(&lock_);
     releaseAllLocked();
+    rawProfile_ = profile;
     profile_ = profile;
     actions_.resetForProfile(profile_.buttons.size());
     uint32_t w = 1920, h = 1080;
@@ -192,9 +196,18 @@ void InputEngine::setProfile(const Profile& profile) {
 
 Profile InputEngine::getProfileCopy() const {
     EnterCriticalSection(&lock_);
-    Profile copy = profile_;
+    Profile copy = rawProfile_;
     LeaveCriticalSection(&lock_);
     return copy;
+}
+
+void InputEngine::setGamepadEnabled(bool enabled) {
+    EnterCriticalSection(&lock_);
+    gamepad_.setEnabled(enabled);
+    if (!enabled) {
+        gamepad_.releaseAll(packetsThisSec_);
+    }
+    LeaveCriticalSection(&lock_);
 }
 
 void InputEngine::setAimMode(bool enabled) {
@@ -757,6 +770,7 @@ void InputEngine::releaseMouseTouchesLocked() {
 void InputEngine::releaseAllLocked() {
     releaseMouseTouchesLocked();
     joystick_.release(packetsThisSec_);
+    gamepad_.releaseAll(packetsThisSec_);
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     actions_.releaseButtons(profile_, false, packetsThisSec_);
     // Final bounded-pool safety sweep: guarantees 0 active touches left on the phone
@@ -830,6 +844,21 @@ void InputEngine::processTick(double nowMs) {
     actions_.tick(profile_, nowMs, packetsThisSec_);
     joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
 
+    // Stage 3: XInput Gamepad-to-Touch polling (360° analog left stick + right stick look + buttons/triggers)
+    double dtMs = (lastTickMs_ > 0.0) ? clampd(nowMs - lastTickMs_, 0.5, 40.0) : 4.0;
+    lastTickMs_ = nowMs;
+    GamepadFrameOutput gpOut;
+    if (profile_.keymapEnabled && !joystick_.isDown()) {
+        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut);
+    } else if (profile_.keymapEnabled) {
+        // Keyboard WASD currently holds joystick; still poll gamepad buttons & right stick
+        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut);
+    }
+    for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
+        processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs);
+    }
+    bool hasGpLook = (std::fabs(gpOut.lookDx) > 0.001 || std::fabs(gpOut.lookDy) > 0.001);
+
     if (cursorScrollDown_ && (aimMode_ || nowMs >= cursorScrollReleaseAtMs_)) {
         releaseCursorScrollLocked();
     }
@@ -846,18 +875,21 @@ void InputEngine::processTick(double nowMs) {
         aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
     }
 
-    if (!aimMode_ || pendingFireDown_) {
+    if ((!aimMode_ && !hasGpLook && !viewStack_.mainView().isFingerPlaced()) || pendingFireDown_) {
         LeaveCriticalSection(&lock_);
         return;
     }
 
-    double rawDx = 0.0, rawDy = 0.0;
-    EnterCriticalSection(&inputLock_);
-    rawDx = accumRawDx_;
-    rawDy = accumRawDy_;
-    accumRawDx_ = 0.0;
-    accumRawDy_ = 0.0;
-    LeaveCriticalSection(&inputLock_);
+    double rawDx = gpOut.lookDx;
+    double rawDy = gpOut.lookDy;
+    if (aimMode_) {
+        EnterCriticalSection(&inputLock_);
+        rawDx += accumRawDx_;
+        rawDy += accumRawDy_;
+        accumRawDx_ = 0.0;
+        accumRawDy_ = 0.0;
+        LeaveCriticalSection(&inputLock_);
+    }
 
     if (w != lastConfiguredW_ || h != lastConfiguredH_) {
         syncFpsViewConfigLocked(w, h);
@@ -1018,7 +1050,8 @@ EngineTelemetry InputEngine::getTelemetry() const {
     bool ovDown = viewStack_.isOverlayActive() && viewStack_.overlayView().isFingerPlaced();
     t.aimFingerDown = mainDown || ovDown || (profile_.fireMode != FIRE_MODE_CLAW_LEFT && fireDown_);
     t.fireHeld = fireHeld_;
-    t.joyDown = joystick_.isDown();
+    t.joyDown = joystick_.isDown() || gamepad_.isJoyDown();
+    t.gamepadConnected = gamepad_.isConnected();
     if (ovDown) {
         t.aimFingerNormX = static_cast<float>(clampd(viewStack_.overlayView().curX() / static_cast<double>(w), 0.0, 1.0));
         t.aimFingerNormY = static_cast<float>(clampd(viewStack_.overlayView().curY() / static_cast<double>(h), 0.0, 1.0));

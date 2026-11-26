@@ -33,6 +33,8 @@ static const UINT MSG_DEVICE_CLIPBOARD   = WM_APP + 15;
 static const UINT MSG_FOREGROUND_APP     = WM_APP + 16;
 static const UINT MSG_DROP_TOAST         = WM_APP + 17;
 static const UINT MSG_ANDROID_BACK       = WM_APP + 18;
+static const UINT MSG_VIDEO_FRAME_READY  = WM_APP + 19;
+static const UINT MSG_QR_PAIR_UPDATE     = WM_APP + 20;
 
 LRESULT CALLBACK shellMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (g_shellInstance) return g_shellInstance->handleLowLevelMouse(nCode, wParam, lParam);
@@ -91,13 +93,16 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     profile_ = engine_->getProfileCopy();
     if (profile_.keymapEnabled) lastGameProfilePath_ = profilePath_;
     AppSettingsStore::load(settingsPath_, settings_);
+    engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
 }
 
 ShellWindow::~ShellWindow() {
     InterlockedExchange(&stopAuxThreads_, 1);
+    stopQrWirelessPairing();
     bridge_->setClipboardCallback(nullptr, nullptr);
+    bridge_->setVideoPacketCallback(nullptr, nullptr);
     flushOnExit();
     setAimMode(false);
     removeHooks();
@@ -116,6 +121,8 @@ ShellWindow::~ShellWindow() {
         CloseHandle(connectThread_);
         connectThread_ = NULL;
     }
+    bridge_->disconnect();
+    h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     hudOverlay_.destroy();
     if (cacheDC_) {
@@ -354,7 +361,7 @@ void ShellWindow::syncHudAndVideo() {
             viewportHost_.updateVideoLayout(pw, ph);
             invalidateShell();
         }
-        if (!noMirror_ && !viewportHost_.isMirrorEmbedded() && bridge_->isMirrorRunning()) {
+        if (!nativeVideoSession_ && !noMirror_ && !viewportHost_.isMirrorEmbedded() && bridge_->isMirrorRunning()) {
             if (viewportHost_.tryEmbedMirror(mirrorTitle_, bridge_->mirrorProcessId(), pw, ph)) {
                 sawEmbeddedMirror_ = true;
                 layoutChildren();
@@ -420,23 +427,104 @@ void ShellWindow::refreshAdbDevices() {
     invalidateShell();
 }
 
+void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
+                                uint64_t ptsUs, bool isConfig, bool isKeyFrame) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || !self->nativeVideoSession_ || !data || size == 0) return;
+
+    if (!self->h264Decoder_.isInitialized()) {
+        uint32_t pw = 1920, ph = 1080;
+        self->bridge_->getScreenSize(pw, ph);
+        std::string err;
+        if (!self->h264Decoder_.init(pw, ph, err)) {
+            self->bridge_->appendLog("[Video] H.264 MFT init failed: " + err);
+            self->nativeVideoSession_ = false;
+            return;
+        }
+        self->h264Decoder_.setFrameCallback(ShellWindow::onDecodedFrame, self);
+    }
+    self->h264Decoder_.decodePacket(data, size, ptsUs, isConfig, isKeyFrame);
+}
+
+void ShellWindow::onDecodedFrame(void* ctx, const DecodedNV12Frame& frame) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self) return;
+    self->viewportHost_.submitDecodedFrame(frame);
+    if (self->hwnd_ && InterlockedCompareExchange(&self->videoFramePending_, 1, 0) == 0) {
+        PostMessageA(self->hwnd_, MSG_VIDEO_FRAME_READY, 0, 0);
+    }
+}
+
+void ShellWindow::onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || !self->viewportHost_.isNativeVideoActive()) return;
+    self->viewportHost_.updateEmbeddedHud(bgraPremulPixels, w, h);
+    self->viewportHost_.renderNativeFrame(true);
+}
+
+bool ShellWindow::mapShellClientToVideoLocal(int mx, int my, int& outVx, int& outVy, bool requireInside) const {
+    ViewportRect vr = viewportHost_.activeVideoClientRect();
+    int left = viewportRc_.left + vr.x;
+    int top  = viewportRc_.top  + vr.y;
+    outVx = mx - left;
+    outVy = my - top;
+    if (!requireInside) return (vr.w > 0 && vr.h > 0);
+    return (outVx >= 0 && outVx < vr.w && outVy >= 0 && outVy < vr.h);
+}
+
 DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
     ShellWindow* self = static_cast<ShellWindow*>(param);
     std::string err;
-    bool ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
-                                            self->pendingSerial_, self->settings_.stayAwake);
-    if (ok) {
-        if (self->settings_.turnScreenOff) {
-            self->bridge_->setDisplayPower(false);
+    bool ok = false;
+
+    if (self->settings_.useNativeVideo && !self->noMirror_) {
+        // Stage 2 Single-Connection Mode: ONE scrcpy-server on phone delivers full FPS H.264 + touch/keyboard/clipboard!
+        self->nativeVideoSession_ = true;
+        self->bridge_->setVideoPacketCallback(ShellWindow::onVideoPacket, self);
+
+        BridgeStreamConfig cfg;
+        cfg.maxSize = self->settings_.mirrorMaxSize;
+        cfg.maxFps = self->settings_.mirrorFps;
+        cfg.bitrateMbps = self->settings_.mirrorBitrateMbps;
+        cfg.stayAwake = self->settings_.stayAwake;
+        cfg.virtualDisplay = self->settings_.virtualDisplayMode;
+        cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
+
+        ok = self->bridge_->connectSession(self->tools_, cfg, err, self->pendingSerial_);
+        if (ok) {
+            if (self->settings_.turnScreenOff && !cfg.virtualDisplay) {
+                self->bridge_->setDisplayPower(false);
+            }
+            if (self->settings_.mirrorAudio) {
+                std::string aErr;
+                if (!self->bridge_->launchAudioOnlyRelay(self->tools_, self->bridge_->activeSerial(), aErr)) {
+                    self->bridge_->appendLog("[Audio] " + aErr);
+                }
+            }
+        } else {
+            self->nativeVideoSession_ = false;
+            self->bridge_->setVideoPacketCallback(nullptr, nullptr);
         }
-        if (!self->noMirror_) {
-            std::string mErr;
-            std::string args = self->settings_.buildScrcpyArgs();
-            if (!self->bridge_->launchMirrorWindow(self->tools_, args, self->mirrorTitle_, mErr, true, self->bridge_->activeSerial())) {
-                self->bridge_->appendLog("[Mirror] " + mErr);
+    } else {
+        // Legacy fallback: 1 FPS control bridge + separate scrcpy.exe embedded window
+        self->nativeVideoSession_ = false;
+        self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+        ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
+                                           self->pendingSerial_, self->settings_.stayAwake);
+        if (ok) {
+            if (self->settings_.turnScreenOff) {
+                self->bridge_->setDisplayPower(false);
+            }
+            if (!self->noMirror_) {
+                std::string mErr;
+                std::string args = self->settings_.buildScrcpyArgs();
+                if (!self->bridge_->launchMirrorWindow(self->tools_, args, self->mirrorTitle_, mErr, true, self->bridge_->activeSerial())) {
+                    self->bridge_->appendLog("[Mirror] " + mErr);
+                }
             }
         }
     }
+
     self->asyncResultOk_ = ok;
     self->asyncResultMsg_ = ok ? ("Connected to " + self->bridge_->deviceName()) : err;
     InterlockedExchange(&self->connecting_, 0);
@@ -446,18 +534,25 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
 
 void ShellWindow::startAsyncConnect(const std::string& serial) {
     if (!toolsReady_ || connecting_) return;
+    stopQrWirelessPairing();
     if (connectThread_) {
         WaitForSingleObject(connectThread_, 1000);
         CloseHandle(connectThread_);
         connectThread_ = NULL;
     }
     setAimMode(false);
+    hudOverlay_.setEmbeddedD3DMode(false);
     viewportHost_.detachMirror();
+    bridge_->setVideoPacketCallback(nullptr, nullptr);
     bridge_->disconnect();
+    h264Decoder_.shutdown();
     demoMode_ = false;
     sawEmbeddedMirror_ = false;
+    nativeVideoSession_ = false;
     pendingSerial_ = serial;
-    hubStatusMsg_ = "Connecting to device & launching embedded stream...";
+    hubStatusMsg_ = settings_.virtualDisplayMode
+        ? "Launching Second-Phone Virtual Display stream..."
+        : "Connecting single-stream D3D11 phone viewport...";
     InterlockedExchange(&connecting_, 1);
     connectThread_ = CreateThread(NULL, 0, connectThreadProc, this, 0, NULL);
     invalidateShell();
@@ -476,6 +571,7 @@ DWORD WINAPI ShellWindow::wirelessThreadProc(LPVOID param) {
 
 void ShellWindow::startAsyncWirelessConnect(const std::string& ipPort) {
     if (!toolsReady_ || connecting_ || ipPort.empty()) return;
+    stopQrWirelessPairing();
     if (connectThread_) {
         WaitForSingleObject(connectThread_, 1000);
         CloseHandle(connectThread_);
@@ -490,12 +586,104 @@ void ShellWindow::startAsyncWirelessConnect(const std::string& ipPort) {
     invalidateShell();
 }
 
+DWORD WINAPI ShellWindow::qrPairThreadProc(LPVOID param) {
+    ShellWindow* self = static_cast<ShellWindow*>(param);
+    auto setStatus = [&](const std::string& st, const std::string& autoAddr = "") {
+        EnterCriticalSection(&self->auxLock_);
+        self->qrPairStatus_ = st;
+        if (!autoAddr.empty()) self->qrAutoConnectAddr_ = autoAddr;
+        LeaveCriticalSection(&self->auxLock_);
+        if (self->hwnd_) PostMessageA(self->hwnd_, MSG_QR_PAIR_UPDATE, 0, 0);
+    };
+
+    bool paired = false;
+    while (!self->stopQrPair_ && !self->stopAuxThreads_) {
+        std::vector<MdnsServiceInfo> svcs;
+        if (self->bridge_->listMdnsServices(self->tools_, svcs)) {
+            if (!paired) {
+                for (size_t i = 0; i < svcs.size(); ++i) {
+                    if (svcs[i].type.find("_adb-tls-pairing") != std::string::npos &&
+                        (svcs[i].name == self->qrServiceName_ || svcs[i].name.find(self->qrServiceName_) != std::string::npos)) {
+                        setStatus("Phone scanned QR! Pairing " + svcs[i].addr + "...");
+                        std::string pairMsg;
+                        if (self->bridge_->pairWireless(self->tools_, svcs[i].addr, self->qrPairPassword_, pairMsg)) {
+                            paired = true;
+                            setStatus("Paired! Looking for Wireless ADB connect port...");
+                        } else {
+                            setStatus("Pair attempt: " + pairMsg);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (paired) {
+                for (size_t i = 0; i < svcs.size(); ++i) {
+                    if (svcs[i].type.find("_adb-tls-connect") != std::string::npos) {
+                        setStatus("Connecting wirelessly to " + svcs[i].addr + "...", svcs[i].addr);
+                        return 0;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < 10 && !self->stopQrPair_ && !self->stopAuxThreads_; ++i) {
+            Sleep(100);
+        }
+    }
+    return 0;
+}
+
+void ShellWindow::startQrWirelessPairing() {
+    if (!toolsReady_) {
+        hubStatusMsg_ = "ADB tools not ready yet.";
+        invalidateShell();
+        return;
+    }
+    stopQrWirelessPairing();
+
+    std::srand(static_cast<unsigned int>(std::time(NULL) ^ GetTickCount()));
+    int code = 100000 + (std::rand() % 900000);
+    int tag  = 1000 + (std::rand() % 9000);
+    char sbuf[48], pbuf[16];
+    std::snprintf(sbuf, sizeof(sbuf), "studio-PT%d", tag);
+    std::snprintf(pbuf, sizeof(pbuf), "%06d", code);
+    qrServiceName_ = sbuf;
+    qrPairPassword_ = pbuf;
+
+    std::string payload = QrCodeGen::buildAndroidAdbPairPayload(qrServiceName_, qrPairPassword_);
+    QrCodeGen::encode(payload, qrMatrix_);
+
+    EnterCriticalSection(&auxLock_);
+    qrPairStatus_ = "Scan QR from Wireless Debugging (Code: " + qrPairPassword_ + ")";
+    qrAutoConnectAddr_.clear();
+    LeaveCriticalSection(&auxLock_);
+
+    showingQrPair_ = true;
+    InterlockedExchange(&stopQrPair_, 0);
+    qrPairThread_ = CreateThread(NULL, 0, qrPairThreadProc, this, 0, NULL);
+    invalidateShell();
+}
+
+void ShellWindow::stopQrWirelessPairing() {
+    InterlockedExchange(&stopQrPair_, 1);
+    if (qrPairThread_) {
+        WaitForSingleObject(qrPairThread_, 1500);
+        CloseHandle(qrPairThread_);
+        qrPairThread_ = NULL;
+    }
+    showingQrPair_ = false;
+}
+
 void ShellWindow::disconnectDevice(bool returnToHub) {
     setAimMode(false);
     engine_->releaseAllTouches();
+    hudOverlay_.setEmbeddedD3DMode(false);
     viewportHost_.detachMirror();
+    bridge_->setVideoPacketCallback(nullptr, nullptr);
     bridge_->disconnect();
+    h264Decoder_.shutdown();
     sawEmbeddedMirror_ = false;
+    nativeVideoSession_ = false;
+    d3dHudDragging_ = false;
     if (returnToHub) {
         demoMode_ = false;
         setEditMode(false);
@@ -517,7 +705,15 @@ void ShellWindow::takeScreenshot() {
                   tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
     std::string fullPath = dir + "\\" + fname;
     std::string err;
-    if (bridge_->captureScreenshot(fullPath, err)) {
+    bool ok = false;
+    if (viewportHost_.isNativeVideoActive() && viewportHost_.hasNativeVideoFrame()) {
+        // Zero-latency screenshot straight from our own decoded D3D11 frame (works in Virtual Display mode too!)
+        ok = viewportHost_.captureNativeScreenshot(fullPath, err);
+    }
+    if (!ok) {
+        ok = bridge_->captureScreenshot(fullPath, err);
+    }
+    if (ok) {
         hudOverlay_.showToast(std::string("Screenshot saved -> screenshots\\") + fname, 2400);
     } else {
         hudOverlay_.showToast("Screenshot failed: " + err, 2400);
@@ -1023,8 +1219,9 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     }
     if (res.settingsModified) {
         saveSettings();
+        engine_->setGamepadEnabled(settings_.gamepadEnabled);
         // Apply Turn Phone Screen Off immediately via control socket without restarting video!
-        if (bridge_->isConnected()) {
+        if (bridge_->isConnected() && !bridge_->isVirtualDisplayActive()) {
             bridge_->setDisplayPower(!settings_.turnScreenOff);
         }
     }
@@ -1048,6 +1245,14 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         profile_.appPackage.clear();
         applyProfileToEngine(true);
         hudOverlay_.showToast("Unlinked app auto-switch for '" + profile_.name + "'", 2000);
+    }
+    if (res.requestCalibrateAspect && lastPhoneW_ >= 64 && lastPhoneH_ >= 64) {
+        profile_.refAspect = static_cast<float>(lastPhoneW_) / static_cast<float>(lastPhoneH_);
+        profile_.edgeAnchored = true;
+        applyProfileToEngine(true);
+        char b[96];
+        std::snprintf(b, sizeof(b), "Calibrated Ref Aspect -> %.2f:1 (%ux%u)", profile_.refAspect, lastPhoneW_, lastPhoneH_);
+        hudOverlay_.showToast(b, 2200);
     }
     if (res.requestAddNode) {
         KeyNode n;
@@ -1490,9 +1695,52 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case MSG_CONNECT_DONE: {
             hubStatusMsg_ = asyncResultOk_ ? "" : asyncResultMsg_;
-            if (!asyncResultOk_) refreshAdbDevices();
+            if (!asyncResultOk_) {
+                refreshAdbDevices();
+            } else if (nativeVideoSession_) {
+                uint32_t pw = 1920, ph = 1080;
+                bridge_->getScreenSize(pw, ph);
+                lastPhoneW_ = pw;
+                lastPhoneH_ = ph;
+                std::string d3dErr;
+                if (viewportHost_.enableNativeVideo(pw, ph, d3dErr)) {
+                    hudOverlay_.setEmbeddedD3DMode(true, ShellWindow::onHudBitmapReady, this);
+                    sawEmbeddedMirror_ = true;
+                    layoutChildren();
+                    std::string modeTag = bridge_->isVirtualDisplayActive()
+                        ? "Second-Phone Virtual Display (D3D11)"
+                        : "Native D3D11 Single-Connection Stream";
+                    hudOverlay_.showToast(modeTag + " · F2 Studio | " + KeyCodes::toName(profile_.toggleAimVk) + "/F1 Aim", 3600);
+                } else {
+                    bridge_->appendLog("[D3D11] Fallback to scrcpy.exe: " + d3dErr);
+                    nativeVideoSession_ = false;
+                    bridge_->setVideoPacketCallback(nullptr, nullptr);
+                    std::string mErr;
+                    bridge_->launchMirrorWindow(tools_, settings_.buildScrcpyArgs(), mirrorTitle_, mErr, true, bridge_->activeSerial());
+                }
+            }
             layoutChildren();
             invalidateShell();
+            return 0;
+        }
+        case MSG_VIDEO_FRAME_READY: {
+            InterlockedExchange(&videoFramePending_, 0);
+            if (viewportHost_.isNativeVideoActive()) {
+                viewportHost_.renderNativeFrame(true);
+            }
+            return 0;
+        }
+        case MSG_QR_PAIR_UPDATE: {
+            std::string autoAddr;
+            EnterCriticalSection(&auxLock_);
+            autoAddr = qrAutoConnectAddr_;
+            qrAutoConnectAddr_.clear();
+            LeaveCriticalSection(&auxLock_);
+            if (!autoAddr.empty()) {
+                startAsyncWirelessConnect(autoAddr);
+            } else {
+                invalidateShell();
+            }
             return 0;
         }
         case MSG_WIRELESS_DONE: {
@@ -1622,6 +1870,13 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 if (drawerPanel_.onMouseMove(mx, my, profile_, hudOverlay_.selectedBtnIndex(), res)) {
                     handleDrawerResult(res);
                 }
+            } else if (editMode_ && viewportHost_.isNativeVideoActive()) {
+                int vx = 0, vy = 0;
+                if (mapShellClientToVideoLocal(mx, my, vx, vy, !d3dHudDragging_)) {
+                    hudOverlay_.dispatchMouseMove(vx, vy);
+                } else if (!d3dHudDragging_) {
+                    hudOverlay_.dispatchMouseLeave();
+                }
             }
             invalidateShell();
             return 0;
@@ -1630,8 +1885,24 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_MOUSELEAVE:
             hoverX_ = -1;
             hoverY_ = -1;
+            if (editMode_ && viewportHost_.isNativeVideoActive() && !d3dHudDragging_) {
+                hudOverlay_.dispatchMouseLeave();
+            }
             invalidateShell();
             return 0;
+
+        case WM_LBUTTONDBLCLK: {
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
+            if (editMode_ && viewportHost_.isNativeVideoActive()) {
+                int vx = 0, vy = 0;
+                if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
+                    hudOverlay_.dispatchDoubleClick(vx, vy);
+                    return 0;
+                }
+            }
+            break;
+        }
 
         case WM_LBUTTONDOWN: {
             int mx = static_cast<short>(LOWORD(lParam));
@@ -1660,7 +1931,17 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     return 0;
                 }
             }
-            // 4. Device Hub inside ViewportHost (when disconnected)
+            // 4. Native D3D11 Embedded Edit Mode Canvas (same-frame HUD interaction!)
+            if (editMode_ && viewportHost_.isNativeVideoActive()) {
+                int vx = 0, vy = 0;
+                if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
+                    d3dHudDragging_ = true;
+                    SetCapture(hwnd);
+                    hudOverlay_.dispatchMouseDown(vx, vy, false);
+                    return 0;
+                }
+            }
+            // 5. Device Hub inside ViewportHost (when disconnected)
             if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
                 HubClickResult hr = viewportHost_.hitTestHub(mx, my);
                 if (hr.action == HUB_REFRESH_DEVICES) {
@@ -1673,7 +1954,11 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     invalidateShell();
                 } else if (hr.action == HUB_CONNECT_WIFI) {
                     startAsyncWirelessConnect(settings_.lastWirelessAddr);
+                } else if (hr.action == HUB_TOGGLE_QR_PAIR) {
+                    if (showingQrPair_) { stopQrWirelessPairing(); refreshAdbDevices(); }
+                    else startQrWirelessPairing();
                 } else if (hr.action == HUB_START_OFFLINE_STUDIO) {
+                    stopQrWirelessPairing();
                     demoMode_ = true;
                     setDrawerState(true, 0);
                     hudOverlay_.showToast("Offline Keymap Studio active! Changes auto-save to " + profile_.name, 3000);
@@ -1685,6 +1970,11 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_LBUTTONUP: {
             if (GetCapture() == hwnd) ReleaseCapture();
+            if (d3dHudDragging_) {
+                d3dHudDragging_ = false;
+                hudOverlay_.dispatchMouseUp();
+                return 0;
+            }
             if (drawerOpen_ && drawerPanel_.onMouseUp()) {
                 applyProfileToEngine(true);
             }
@@ -1706,10 +1996,20 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             break;
         }
 
-        case WM_RBUTTONDOWN:
+        case WM_RBUTTONDOWN: {
             if (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind()) { hudOnMouseBindToDrawer(VK_RBUTTON); return 0; }
             if (hudOverlay_.rebindTarget() != HUD_REBIND_NONE && hudOverlay_.handleMouseBind(VK_RBUTTON)) return 0;
+            if (editMode_ && viewportHost_.isNativeVideoActive()) {
+                int mx = static_cast<short>(LOWORD(lParam));
+                int my = static_cast<short>(HIWORD(lParam));
+                int vx = 0, vy = 0;
+                if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
+                    hudOverlay_.dispatchMouseDown(vx, vy, true);
+                    return 0;
+                }
+            }
             break;
+        }
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -1722,6 +2022,13 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             POINT pt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
             ScreenToClient(hwnd, &pt);
+            if (editMode_ && viewportHost_.isNativeVideoActive()) {
+                int vx = 0, vy = 0;
+                if (mapShellClientToVideoLocal(pt.x, pt.y, vx, vy, true)) {
+                    hudOverlay_.dispatchMouseWheel(vx, vy, delta);
+                    return 0;
+                }
+            }
             if (drawerOpen_ && drawerPanel_.onMouseWheel(pt.x, pt.y, delta)) {
                 invalidateShell();
                 return 0;
@@ -1863,17 +2170,22 @@ void ShellWindow::onPaint(HDC hdc) {
         bool connected = bridge_->isConnected();
         std::string devLabel = bridge_->deviceName();
         if (connected) {
-            char dbuf[96];
-            std::snprintf(dbuf, sizeof(dbuf), "%s · %ux%u",
+            char dbuf[112];
+            std::snprintf(dbuf, sizeof(dbuf), "%s%s · %ux%u",
                           devLabel.empty() ? "Android" : devLabel.c_str(),
+                          bridge_->isVirtualDisplayActive() ? " [2ND]" : "",
                           lastPhoneW_, lastPhoneH_);
             devLabel = dbuf;
         }
 
-        // 1. Center Viewport backdrop / Device Hub
+        // 1. Center Viewport backdrop / Device Hub (with Android 11+ QR Wireless Pairing)
+        std::string qrSt;
+        EnterCriticalSection(&auxLock_);
+        qrSt = qrPairStatus_;
+        LeaveCriticalSection(&auxLock_);
         viewportHost_.paint(g, viewportRc_, connected, demoMode_, (connecting_ != 0),
                             hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
-                            editingHubWireless_, hoverX_, hoverY_);
+                            editingHubWireless_, showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
 
         if (!fullscreen_) {
             // 2. TopBar
