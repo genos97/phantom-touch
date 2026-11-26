@@ -66,6 +66,9 @@ int Application::run(int argc, char** argv) {
     bool probeOnConnect = false;
     bool startFullscreen = false;
     int probeSamples = 60;
+    bool forceAudio = false;
+    std::string forceAudioCodec;
+    int forceAudioBufferMs = 0;
     std::string profilePath;
 
     for (int i = 1; i < argc; ++i) {
@@ -80,6 +83,19 @@ int Application::run(int argc, char** argv) {
             probeOnConnect = true;
         } else if (arg == "--fullscreen") {
             startFullscreen = true;
+        } else if (arg == "--audio") {
+            forceAudio = true;
+        } else if (arg.find("--audio-codec=") == 0) {
+            std::string ac = arg.substr(14);
+            if (ac == "raw" || ac == "aac") {
+                forceAudioCodec = ac;
+                forceAudio = true;
+            }
+        } else if (arg.find("--audio-buffer=") == 0) {
+            int ms = std::atoi(arg.c_str() + 15);
+            if (ms >= 15 && ms <= 100) {
+                forceAudioBufferMs = ms;
+            }
         } else if (arg.find("--probe-samples=") == 0) {
             int n = std::atoi(arg.c_str() + 16);
             if (n >= 5 && n <= 200) probeSamples = n;
@@ -150,7 +166,8 @@ int Application::run(int argc, char** argv) {
     engine.start();
 
     ShellWindow shell(&bridge, &engine, exeDir, profilesDir, profilePath, settingsPath, demoMode, noMirror);
-    shell.setLaunchOptions(showConsole, probeOnConnect, probeSamples, startFullscreen);
+    shell.setLaunchOptions(showConsole, probeOnConnect, probeSamples, startFullscreen,
+                           forceAudio, forceAudioCodec, forceAudioBufferMs);
     int exitCode = 1;
     if (shell.create(GetModuleHandleA(NULL))) {
         exitCode = shell.runMessageLoop();

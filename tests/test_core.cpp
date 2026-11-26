@@ -1,3 +1,4 @@
+#include "audio/AudioPlayer.hpp"
 #include "bridge/ConnectionState.hpp"
 #include "bridge/QrCodeGen.hpp"
 #include "bridge/SpsParser.hpp"
@@ -2071,6 +2072,202 @@ static void testSprint4aMobaAndGamepadV2() {
     std::printf("[Test] Sprint 4A (F5 MOBA/E12 + F6 Gamepad v2 UHID) OK!\n");
 }
 
+static void testSprint4bInAppAudio() {
+    std::printf("[Test] Sprint 4B (F7 In-App WASAPI Audio + MF AAC)...\n");
+
+    // 1. ScrcpyBridge audio codec auto-selection (USB -> raw, Wi-Fi -> aac) & 4cc parsing
+    assert(ScrcpyBridge::selectAudioCodec("R5CRC0RS88Y") == "raw");
+    assert(ScrcpyBridge::selectAudioCodec("") == "raw");
+    assert(ScrcpyBridge::selectAudioCodec("192.168.1.50:5555") == "aac");
+
+    assert(ScrcpyBridge::parseAudioCodecId(0x00726177u) == AUDIO_CODEC_RAW);
+    assert(ScrcpyBridge::parseAudioCodecId(0x00616163u) == AUDIO_CODEC_AAC);
+    assert(ScrcpyBridge::parseAudioCodecId(0u) == AUDIO_CODEC_NONE);
+    assert(ScrcpyBridge::parseAudioCodecId(1u) == AUDIO_CODEC_NONE);
+    assert(ScrcpyBridge::parseAudioCodecId(0x6f707573u) == AUDIO_CODEC_NONE);
+
+    // 2. ScrcpyBridge 12-byte audio packet header parser (v4/v5 and v2/v3)
+    auto writeHdr = [](uint8_t out[12], uint64_t f, uint32_t sz) {
+        for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>((f >> (56 - i * 8)) & 0xFFu);
+        out[8]  = static_cast<uint8_t>((sz >> 24) & 0xFFu);
+        out[9]  = static_cast<uint8_t>((sz >> 16) & 0xFFu);
+        out[10] = static_cast<uint8_t>((sz >> 8) & 0xFFu);
+        out[11] = static_cast<uint8_t>(sz & 0xFFu);
+    };
+    {
+        uint8_t hdr[12];
+        uint64_t pts = 99;
+        uint32_t sz = 0;
+        bool cfg = false;
+        writeHdr(hdr, (1ULL << 62), 2u);
+        assert(ScrcpyBridge::parseAudioPacketHeader(hdr, true, pts, sz, cfg));
+        assert(cfg && pts == 0u && sz == 2u);
+
+        writeHdr(hdr, (1ULL << 61) | 1234567ULL, 4096u);
+        assert(ScrcpyBridge::parseAudioPacketHeader(hdr, true, pts, sz, cfg));
+        assert(!cfg && pts == 1234567ULL && sz == 4096u);
+
+        writeHdr(hdr, (1ULL << 63), 2u);
+        assert(ScrcpyBridge::parseAudioPacketHeader(hdr, false, pts, sz, cfg));
+        assert(cfg && pts == 0u && sz == 2u);
+
+        writeHdr(hdr, (1ULL << 62) | 987654ULL, 512u);
+        assert(ScrcpyBridge::parseAudioPacketHeader(hdr, false, pts, sz, cfg));
+        assert(!cfg && pts == 987654ULL && sz == 512u);
+
+        writeHdr(hdr, 0ULL, 0u);
+        assert(!ScrcpyBridge::parseAudioPacketHeader(hdr, true, pts, sz, cfg));
+        writeHdr(hdr, 0ULL, 2u * 1024u * 1024u);
+        assert(!ScrcpyBridge::parseAudioPacketHeader(hdr, true, pts, sz, cfg));
+    }
+
+    // 3. AudioDriftRegulator: pre-roll, S16LE conversion, steady-state, +/- drift compensation, overflow & discontinuity
+    {
+        AudioDriftRegulator reg;
+        reg.configure(48000u, 30u);
+        assert(reg.targetFrames() == 1440u);
+
+        std::vector<int16_t> s16In(1024u * 2u, 16384);
+        std::vector<float> outBuf(480u * 2u, -1.0f);
+
+        reg.pushInterleavedS16(s16In.data(), 1024u, 0ULL);
+        assert(!reg.isPrimed());
+        assert(!reg.pullInterleavedFloat(outBuf.data(), 480u));
+        assert(reg.underflowFrames() == 0u);
+        assert(std::fabs(outBuf[0]) < 1e-6f);
+
+        reg.pushInterleavedS16(s16In.data(), 1024u, 21333ULL);
+        assert(reg.bufferedFrames() >= 1440u);
+        assert(reg.pullInterleavedFloat(outBuf.data(), 480u));
+        assert(reg.isPrimed());
+        assert(reg.underflowFrames() == 0u);
+        // After 16-frame fade-in, sample reaches 0.5f (= 16384 / 32768)
+        assert(std::fabs(outBuf[400u * 2u] - 0.5f) < 0.01f);
+
+        // Steady-state streaming over 200 pulls of 480 frames
+        reg.configure(48000u, 30u);
+        uint64_t produced = 0, consumed = 0, pts = 0;
+        for (int k = 0; k < 2; ++k) {
+            reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+            produced += 1024u;
+            pts += 21333ULL;
+        }
+        for (int cyc = 0; cyc < 200; ++cyc) {
+            while (produced < consumed + 1440u) {
+                reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+                produced += 1024u;
+                pts += 21333ULL;
+            }
+            assert(reg.pullInterleavedFloat(outBuf.data(), 480u));
+            consumed += 480u;
+        }
+        assert(reg.underflowFrames() == 0u);
+        assert(reg.droppedFrames() == 0u);
+
+        // Positive clock drift (+1% faster producer): driftRate > 1.0, zero drops
+        reg.configure(48000u, 30u);
+        produced = 0; consumed = 0; pts = 0;
+        for (int k = 0; k < 2; ++k) {
+            reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+            produced += 1024u;
+            pts += 21333ULL;
+        }
+        for (int cyc = 0; cyc < 300; ++cyc) {
+            const uint64_t wantProd = static_cast<uint64_t>(static_cast<double>(consumed) * 1.01) + 1440ULL;
+            while (produced < wantProd) {
+                reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+                produced += 1024u;
+                pts += 21333ULL;
+            }
+            reg.pullInterleavedFloat(outBuf.data(), 480u);
+            consumed += 480u;
+        }
+        assert(reg.currentRate() > 1.0);
+        assert(reg.droppedFrames() == 0u);
+
+        // Negative clock drift (-0.8% slower producer): driftRate < 1.0, zero underflow
+        reg.configure(48000u, 40u);
+        produced = 0; consumed = 0; pts = 0;
+        for (int k = 0; k < 2; ++k) {
+            reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+            produced += 1024u;
+            pts += 21333ULL;
+        }
+        for (int cyc = 0; cyc < 250; ++cyc) {
+            const uint64_t wantProd = static_cast<uint64_t>(static_cast<double>(consumed) * 0.992) + 1920ULL;
+            while (produced < wantProd) {
+                reg.pushInterleavedS16(s16In.data(), 1024u, pts);
+                produced += 1024u;
+                pts += 21333ULL;
+            }
+            reg.pullInterleavedFloat(outBuf.data(), 480u);
+            consumed += 480u;
+        }
+        assert(reg.currentRate() < 1.0);
+        assert(reg.underflowFrames() == 0u);
+
+        // Hard overflow protection when producer runs unchecked
+        reg.configure(48000u, 25u);
+        reg.pushInterleavedS16(s16In.data(), 1024u, 0ULL);
+        reg.pushInterleavedS16(s16In.data(), 1024u, 21333ULL);
+        reg.pullInterleavedFloat(outBuf.data(), 480u); // prime
+        for (int k = 0; k < 20; ++k) {
+            reg.pushInterleavedS16(s16In.data(), 1024u, static_cast<uint64_t>(k + 2) * 21333ULL);
+        }
+        assert(reg.droppedFrames() > 0u);
+        assert(reg.bufferedFrames() <= 4080u);
+
+        // PTS discontinuity > 100ms inserts target silence and resets drift
+        reg.configure(48000u, 30u);
+        reg.pushInterleavedS16(s16In.data(), 480u, 0ULL);
+        reg.pushInterleavedS16(s16In.data(), 480u, 500000ULL);
+        assert(reg.bufferedFrames() >= 1440u);
+        assert(reg.currentRate() == 1.0);
+    }
+
+    // 4. AAC AudioSpecificConfig parser, MF HEAACWAVEINFO blob & live CMSAACDecMFT probe
+    {
+        const uint8_t asc48[2] = { 0x11, 0x90 };
+        uint32_t sr = 0, ch = 0;
+        assert(AudioPlayer::parseAacAudioSpecificConfig(asc48, sizeof(asc48), sr, ch));
+        assert(sr == 48000u && ch == 2u);
+
+        const uint8_t asc44[2] = { 0x12, 0x10 };
+        assert(AudioPlayer::parseAacAudioSpecificConfig(asc44, sizeof(asc44), sr, ch));
+        assert(sr == 44100u && ch == 2u);
+
+        std::vector<uint8_t> ud = AudioPlayer::buildMfAacUserData(asc48, sizeof(asc48));
+        assert(ud.size() == 14u);
+        assert(ud[0] == 0u && ud[1] == 0u && ud[2] == 0xFEu && ud[3] == 0u);
+        assert(ud[12] == 0x11u && ud[13] == 0x90u);
+
+        std::string aacErr;
+        assert(AudioPlayer::probeMfAacDecoderInit(asc48, sizeof(asc48), aacErr));
+    }
+
+    // 5. ThreadScheduling::enableMmcssAudio + AudioPlayer WASAPI lifecycle smoke test
+    {
+        DWORD taskIdx = 0;
+        HANDLE avrt = ThreadScheduling::enableMmcssAudio(taskIdx);
+        ThreadScheduling::disableMmcss(avrt);
+
+        AudioPlayer ap;
+        ap.prepareForSession();
+        std::string apErr;
+        ap.start(AUDIO_CODEC_RAW, 25, apErr);
+        std::vector<int16_t> pcm(1024u * 2u, 100);
+        ap.onAudioPacket(AUDIO_CODEC_RAW, reinterpret_cast<const uint8_t*>(pcm.data()),
+                         pcm.size() * sizeof(int16_t), 0ULL, false);
+        AudioStats st = ap.getStats();
+        assert(st.packetsReceived == 1u && st.framesPushed == 1024u);
+        ap.requestStop();
+        ap.stop();
+        assert(!ap.isRunning());
+    }
+
+    std::printf("[Test] Sprint 4B (F7 In-App WASAPI Audio + MF AAC) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -2092,6 +2289,8 @@ int main() {
     testSprint3bPolishCommandPaletteMotionAndA11y();
     std::fflush(stdout);
     testSprint4aMobaAndGamepadV2();
-    std::printf("ALL SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint4bInAppAudio();
+    std::printf("ALL SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

@@ -58,6 +58,18 @@ HANDLE enableMmcssGames(DWORD& outTaskIdx) {
     return api.setChars(L"Games", &outTaskIdx);
 }
 
+HANDLE enableMmcssAudio(DWORD& outTaskIdx) {
+    outTaskIdx = 0;
+    AvrtApi& api = getAvrtApi();
+    if (!api.setChars) return NULL;
+    HANDLE h = api.setChars(L"Pro Audio", &outTaskIdx);
+    if (!h) {
+        outTaskIdx = 0;
+        h = api.setChars(L"Audio", &outTaskIdx);
+    }
+    return h;
+}
+
 void disableMmcss(HANDLE avrtHandle) {
     if (!avrtHandle) return;
     AvrtApi& api = getAvrtApi();

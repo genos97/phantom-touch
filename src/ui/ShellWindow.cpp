@@ -212,12 +212,15 @@ ShellWindow::~ShellWindow() {
     bridge_->setClipboardCallback(nullptr, nullptr);
     bridge_->setConnectStepCallback(nullptr, nullptr);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
+    bridge_->setAudioPacketCallback(nullptr, nullptr);
+    audioPlayer_.requestStop();
     viewportHost_.setProbeFrameEvent(NULL);
     viewportHost_.setProbeSampleRect(false, 0.5f, 0.5f);
     flushOnExit();
     setAimMode(false);
     hookThread_.stop();
     bridge_->disconnect();
+    audioPlayer_.stop();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     hudOverlay_.destroy();
@@ -989,6 +992,30 @@ void ShellWindow::onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8
     }
 }
 
+void ShellWindow::onAudioPacket(void* ctx, AudioCodecId codec,
+                                const uint8_t* data, size_t size,
+                                uint64_t ptsUs, bool isConfig) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || !self->nativeVideoSession_ || self->audioPlayer_.isStopRequested() || !data || size == 0) {
+        return;
+    }
+    if (!self->audioPlayer_.isRunning()) {
+        const int bufMs = (self->forceAudioBufferMs_ >= 15 && self->forceAudioBufferMs_ <= 100)
+            ? self->forceAudioBufferMs_
+            : self->settings_.audioBufferMs;
+        std::string aErr;
+        if (self->audioPlayer_.start(codec, bufMs, aErr)) {
+            char abuf[96];
+            std::snprintf(abuf, sizeof(abuf), "[Audio] WASAPI playback started (%s, %dms buffer)",
+                          (codec == AUDIO_CODEC_RAW) ? "raw PCM" : "AAC", bufMs);
+            self->bridge_->appendLog(abuf);
+        } else if (!aErr.empty()) {
+            self->bridge_->appendLog("[Audio] WASAPI start failed: " + aErr);
+        }
+    }
+    self->audioPlayer_.onAudioPacket(codec, data, size, ptsUs, isConfig);
+}
+
 void ShellWindow::onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->viewportHost_.isNativeVideoActive()) return;
@@ -1038,7 +1065,10 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
 
     // S1: always tear down any previous session off the UI thread!
     self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+    self->bridge_->setAudioPacketCallback(nullptr, nullptr);
+    self->audioPlayer_.requestStop();
     self->bridge_->disconnect();
+    self->audioPlayer_.stop();
     self->telemetry_.reset();
 
     if (self->settings_.useNativeVideo && !self->noMirror_) {
@@ -1046,9 +1076,14 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         if (!self->viewportHost_.ensureNativeDeviceInitialized(d3dInitErr, self->settings_.vsyncEnabled)) {
             self->bridge_->appendLog("[D3D11] Pre-init skipped: " + d3dInitErr);
         }
-        // Stage 2 Single-Connection Mode: ONE scrcpy-server on phone delivers full FPS H.264 + touch/keyboard/clipboard!
+        // Stage 2 + F7 Single-Connection Mode: ONE scrcpy-server delivers video + audio + control!
+        const bool wantAudio = (self->settings_.mirrorAudio || self->forceAudioOn_);
         self->nativeVideoSession_ = true;
         self->bridge_->setVideoPacketCallback(ShellWindow::onVideoPacket, self);
+        if (wantAudio) {
+            self->audioPlayer_.prepareForSession();
+            self->bridge_->setAudioPacketCallback(ShellWindow::onAudioPacket, self);
+        }
 
         std::vector<VideoEncoderInfo> probedEncs;
         std::string chosenEnc = self->settings_.encoderForDevice(job->arg);
@@ -1069,6 +1104,8 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.maxFps = self->settings_.mirrorFps;
         cfg.bitrateMbps = self->settings_.mirrorBitrateMbps;
         cfg.stayAwake = self->settings_.stayAwake;
+        cfg.enableAudio = wantAudio;
+        cfg.audioCodec = self->forceAudioCodec_;
         cfg.virtualDisplay = self->settings_.virtualDisplayMode;
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
         cfg.videoCodecOptions = self->settings_.videoCodecOptions;
@@ -1103,21 +1140,16 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
             if (self->settings_.turnScreenOff && !cfg.virtualDisplay) {
                 self->bridge_->setDisplayPower(false);
             }
-            if (self->settings_.mirrorAudio) {
-                std::string aErr;
-                if (!self->bridge_->launchAudioOnlyRelay(self->tools_, self->bridge_->activeSerial(),
-                                                         self->settings_.audioBufferMs,
-                                                         self->settings_.audioRawCodec, aErr)) {
-                    self->bridge_->appendLog("[Audio] " + aErr);
-                }
-            }
         } else {
             self->nativeVideoSession_ = false;
             self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+            self->bridge_->setAudioPacketCallback(nullptr, nullptr);
+            self->audioPlayer_.stop();
         }
     } else {
         self->nativeVideoSession_ = false;
         self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+        self->bridge_->setAudioPacketCallback(nullptr, nullptr);
         ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
                                            job->arg, self->settings_.stayAwake);
         if (ok) {
@@ -1148,7 +1180,10 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
 DWORD WINAPI ShellWindow::disconnectThreadProc(LPVOID param) {
     SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
     ShellWindow* self = job->shell;
+    self->bridge_->setAudioPacketCallback(nullptr, nullptr);
+    self->audioPlayer_.requestStop();
     self->bridge_->disconnect();
+    self->audioPlayer_.stop();
     std::vector<AdbDeviceInfo> devs;
     if (job->intArg != 0 && self->toolsReady_) {
         self->bridge_->listDevices(self->tools_, devs);
@@ -1167,7 +1202,10 @@ DWORD WINAPI ShellWindow::legacyFallbackThreadProc(LPVOID param) {
     ShellWindow* self = job->shell;
     std::string serial = self->bridge_->activeSerial();
     self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+    self->bridge_->setAudioPacketCallback(nullptr, nullptr);
+    self->audioPlayer_.requestStop();
     self->bridge_->disconnect();
+    self->audioPlayer_.stop();
 
     self->nativeVideoSession_ = false;
     std::string err;
@@ -1202,6 +1240,8 @@ void ShellWindow::startAsyncLegacyFallback(const std::string& reason) {
     setAimMode(false);
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
+    bridge_->setAudioPacketCallback(nullptr, nullptr);
+    audioPlayer_.requestStop();
     h264Decoder_.shutdown();
     viewportHost_.disableNativeVideo();
     nativeVideoSession_ = false;
@@ -1227,6 +1267,8 @@ void ShellWindow::startAsyncConnect(const std::string& serial) {
     setAimMode(false);
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
+    bridge_->setAudioPacketCallback(nullptr, nullptr);
+    audioPlayer_.requestStop();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     demoMode_ = false;
@@ -1398,6 +1440,8 @@ void ShellWindow::disconnectDevice(bool returnToHub, bool userInitiated) {
     engine_->releaseAllTouches();
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
+    bridge_->setAudioPacketCallback(nullptr, nullptr);
+    audioPlayer_.requestStop();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     sawEmbeddedMirror_ = false;
@@ -1651,6 +1695,22 @@ DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
                       self->viewportHost_.presentationModeLabel().c_str());
         res.valid = false;
         res.summaryLine = line;
+    }
+    if (self->settings_.mirrorAudio || self->forceAudioOn_) {
+        AudioStats astats = self->audioPlayer_.getStats();
+        const char* acName = (astats.codec == AUDIO_CODEC_RAW) ? "raw"
+                           : (astats.codec == AUDIO_CODEC_AAC) ? "aac" : "none";
+        char abuf[160];
+        std::snprintf(abuf, sizeof(abuf),
+                      " | aud=%s pkt=%llu pf=%llu uf=%llu drp=%llu buf=%.1fms wasapi=%d",
+                      acName,
+                      static_cast<unsigned long long>(astats.packetsReceived),
+                      static_cast<unsigned long long>(astats.framesPushed),
+                      static_cast<unsigned long long>(astats.underflowFrames),
+                      static_cast<unsigned long long>(astats.droppedFrames),
+                      astats.bufferedMs,
+                      astats.wasapiActive ? 1 : 0);
+        res.summaryLine += abuf;
     }
     self->bridge_->appendLog("[Probe] " + res.summaryLine);
     {

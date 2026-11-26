@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio/AudioPlayer.hpp"
 #include "bridge/ConnectionState.hpp"
 #include "bridge/ScrcpyBridge.hpp"
 #include "config/AppSettings.hpp"
@@ -36,11 +37,22 @@ public:
                 bool startDemo, bool noMirror);
     ~ShellWindow();
 
-    void setLaunchOptions(bool consoleEnabled, bool probeOnConnect, int probeSamples, bool startFullscreen = false) {
+    void setLaunchOptions(bool consoleEnabled, bool probeOnConnect, int probeSamples,
+                          bool startFullscreen = false,
+                          bool forceAudio = false,
+                          const std::string& forceAudioCodec = "",
+                          int forceAudioBufferMs = 0) {
         consoleEnabled_ = consoleEnabled;
         autoProbeOnConnect_ = probeOnConnect;
         autoProbeSamples_ = probeSamples;
         autoFullscreen_ = startFullscreen;
+        forceAudioOn_ = forceAudio;
+        forceAudioCodec_ = forceAudioCodec;
+        forceAudioBufferMs_ = forceAudioBufferMs;
+        if (forceAudioOn_) settings_.mirrorAudio = true;
+        if (forceAudioBufferMs_ >= 15 && forceAudioBufferMs_ <= 100) {
+            settings_.audioBufferMs = forceAudioBufferMs_;
+        }
         if (autoProbeOnConnect_) showOnboarding_ = false;
     }
 
@@ -94,6 +106,9 @@ private:
     static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
                               bool present, int64_t qpcPktRecv);
+    static void onAudioPacket(void* ctx, AudioCodecId codec,
+                              const uint8_t* data, size_t size,
+                              uint64_t ptsUs, bool isConfig);
     static void onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
                                   uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
                                   const FrameTiming& timing);
@@ -341,6 +356,9 @@ private:
     bool consoleEnabled_ = false;
     bool autoProbeOnConnect_ = false;
     bool autoFullscreen_ = false;
+    bool forceAudioOn_ = false;
+    std::string forceAudioCodec_;
+    int forceAudioBufferMs_ = 0;
     int autoProbeSamples_ = 60;
     bool autoProbeArmed_ = false;
     DWORD autoProbeDueTick_ = 0;
@@ -356,6 +374,7 @@ private:
     volatile LONG reinitDecoderFlag_ = 0;
     volatile LONG fallbackPending_ = 0;
     H264Decoder h264Decoder_;
+    AudioPlayer audioPlayer_;
 
     struct HudVisualSig {
         bool valid = false;

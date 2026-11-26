@@ -677,6 +677,29 @@ PhoneThermalInfo ScrcpyBridge::parseThermalTelemetry(const std::string& combined
     return info;
 }
 
+std::string ScrcpyBridge::selectAudioCodec(const std::string& deviceSerial) {
+    return (deviceSerial.find(':') != std::string::npos) ? "aac" : "raw";
+}
+
+AudioCodecId ScrcpyBridge::parseAudioCodecId(uint32_t rawBeId) {
+    if (rawBeId == 0x00726177u) return AUDIO_CODEC_RAW; // "raw"
+    if (rawBeId == 0x00616163u) return AUDIO_CODEC_AAC; // "aac"
+    return AUDIO_CODEC_NONE;
+}
+
+bool ScrcpyBridge::parseAudioPacketHeader(const uint8_t hdr[12], bool isV4Proto,
+                                          uint64_t& outPtsUs, uint32_t& outSize, bool& outIsConfig) {
+    if (!hdr) return false;
+    const uint64_t ptsAndFlags = readU64BE(hdr);
+    const uint32_t sz = readU32BE(hdr + 8);
+    outIsConfig = isV4Proto ? ((ptsAndFlags & (1ULL << 62)) != 0)
+                            : ((ptsAndFlags & (1ULL << 63)) != 0);
+    outPtsUs = isV4Proto ? (ptsAndFlags & 0x1FFFFFFFFFFFFFFFULL)
+                         : (ptsAndFlags & 0x3FFFFFFFFFFFFFFFULL);
+    outSize = sz;
+    return (sz > 0 && sz <= 1024u * 1024u);
+}
+
 bool ScrcpyBridge::listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial,
                                       std::vector<VideoEncoderInfo>& outEncoders) {
     outEncoders.clear();
@@ -788,45 +811,6 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     mirrorPid_ = pi.dwProcessId;
     CloseHandle(pi.hThread);
     appendLog("[Mirror] Launched scrcpy (" + (borderless ? std::string("embedded") : std::string("windowed")) + ")");
-    return true;
-}
-
-bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial,
-                                        int audioBufferMs, bool rawCodec, std::string& outError) {
-    if (mirrorProc_ != NULL) return true;
-    if (audioBufferMs < 15) audioBufferMs = 15;
-    if (audioBufferMs > 100) audioBufferMs = 100;
-    char abuf[48];
-    std::snprintf(abuf, sizeof(abuf), " --audio-buffer=%d", audioBufferMs);
-    std::string cmd = "\"" + tools.scrcpyExe + "\" --no-window --no-video --no-control" + abuf;
-    const bool isUsb = (!deviceSerial.empty() && deviceSerial.find(':') == std::string::npos);
-    if (rawCodec && isUsb) {
-        cmd += " --audio-codec=raw";
-    }
-    if (!deviceSerial.empty()) {
-        cmd += " -s \"" + deviceSerial + "\"";
-    }
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-    std::wstring wcmd = utf8ToWide(cmd);
-    std::vector<wchar_t> mutableCmd(wcmd.begin(), wcmd.end());
-    mutableCmd.push_back(L'\0');
-    if (wcmd.empty() || !CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, FALSE,
-                                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        outError = "Failed to launch scrcpy audio-only relay.";
-        return false;
-    }
-    mirrorProc_ = pi.hProcess;
-    mirrorPid_ = pi.dwProcessId;
-    CloseHandle(pi.hThread);
-    appendLog(std::string("[Audio] Launched scrcpy audio relay (--no-window --no-video") + abuf +
-              ((rawCodec && isUsb) ? " --audio-codec=raw)" : ")"));
     return true;
 }
 
@@ -1031,12 +1015,20 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     }
 
     const bool isV4OrNewer = (parseMajorVersion(tools.scrcpyVersion) >= 4);
+    const bool wantAudio = (cfg.enableAudio && !cfg.metadataOnly);
+    std::string aCodec = cfg.audioCodec.empty()
+        ? selectAudioCodec(chosenSerial)
+        : sanitizeServerOption(cfg.audioCodec);
+    if (aCodec != "raw" && aCodec != "aac") {
+        aCodec = selectAudioCodec(chosenSerial);
+    }
+
     std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
                          " log_level=info"
-                         " video=true"
-                         " audio=false"
+                         " video=true" +
+                         (wantAudio ? (" audio=true audio_codec=" + aCodec) : std::string(" audio=false")) +
                          " control=true"
                          " video_codec=h264" +
                          streamOpts +
@@ -1137,7 +1129,23 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
         return false;
     }
 
-    // 6. Connect Control socket #2 (TCP_NODELAY for ultra-low input latency!)
+    // 6. Connect Audio socket #2 (if enabled) and Control socket (TCP_NODELAY)
+    if (wantAudio) {
+        audioSock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (audioSock_ == INVALID_SOCKET ||
+            connect(audioSock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            outError = "Failed to connect to scrcpy audio socket.";
+            disconnect();
+            return false;
+        }
+        BOOL nodelayA = TRUE;
+        setsockopt(audioSock_, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&nodelayA), sizeof(nodelayA));
+        int aRcvBuf = 256 * 1024;
+        setsockopt(audioSock_, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&aRcvBuf), sizeof(aRcvBuf));
+    }
+
     controlSock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (controlSock_ == INVALID_SOCKET ||
         connect(controlSock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
@@ -1211,6 +1219,9 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     controlSenderThread_ = CreateThread(NULL, 0, controlSenderProc, this, 0, NULL);
     if (controlSenderThread_) SetThreadPriority(controlSenderThread_, THREAD_PRIORITY_HIGHEST);
     videoThread_ = CreateThread(NULL, 0, videoReaderProc, this, 0, NULL);
+    if (audioSock_ != INVALID_SOCKET) {
+        audioThread_ = CreateThread(NULL, 0, audioReaderProc, this, 0, NULL);
+    }
     controlThread_ = CreateThread(NULL, 0, controlReaderProc, this, 0, NULL);
 
     char logBuf[160];
@@ -1230,6 +1241,11 @@ void ScrcpyBridge::disconnect() {
         closesocket(videoSock_);
         videoSock_ = INVALID_SOCKET;
     }
+    if (audioSock_ != INVALID_SOCKET) {
+        shutdown(audioSock_, SD_BOTH);
+        closesocket(audioSock_);
+        audioSock_ = INVALID_SOCKET;
+    }
     if (controlSock_ != INVALID_SOCKET) {
         shutdown(controlSock_, SD_BOTH);
         closesocket(controlSock_);
@@ -1245,6 +1261,11 @@ void ScrcpyBridge::disconnect() {
         WaitForSingleObject(videoThread_, 1000);
         CloseHandle(videoThread_);
         videoThread_ = NULL;
+    }
+    if (audioThread_) {
+        WaitForSingleObject(audioThread_, 1000);
+        CloseHandle(audioThread_);
+        audioThread_ = NULL;
     }
     if (controlThread_) {
         WaitForSingleObject(controlThread_, 1000);
@@ -1448,6 +1469,13 @@ void ScrcpyBridge::setVideoPacketCallback(VideoPacketFn fn, void* ctx) {
     EnterCriticalSection(&metaLock_);
     videoCb_ = fn;
     videoCbCtx_ = ctx;
+    LeaveCriticalSection(&metaLock_);
+}
+
+void ScrcpyBridge::setAudioPacketCallback(AudioPacketFn fn, void* ctx) {
+    EnterCriticalSection(&metaLock_);
+    audioCb_ = fn;
+    audioCbCtx_ = ctx;
     LeaveCriticalSection(&metaLock_);
 }
 
@@ -1673,6 +1701,79 @@ bool ScrcpyBridge::captureScreenshot(const std::string& savePath, std::string& o
 DWORD WINAPI ScrcpyBridge::videoReaderProc(LPVOID param) {
     static_cast<ScrcpyBridge*>(param)->runVideoReader();
     return 0;
+}
+
+DWORD WINAPI ScrcpyBridge::audioReaderProc(LPVOID param) {
+    static_cast<ScrcpyBridge*>(param)->runAudioReader();
+    return 0;
+}
+
+void ScrcpyBridge::runAudioReader() {
+    DWORD taskIdx = 0;
+    HANDLE avrt = ThreadScheduling::enableMmcssAudio(taskIdx);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    uint8_t idBuf[4] = {0};
+    if (!recvAll(audioSock_, idBuf, 4)) {
+        ThreadScheduling::disableMmcss(avrt);
+        return;
+    }
+
+    const uint32_t rawCodecId = readU32BE(idBuf);
+    if (rawCodecId == 0u) {
+        appendLog("[Audio] Stream disabled by device (Android <11 or capture denied); continuing video-only.");
+        ThreadScheduling::disableMmcss(avrt);
+        return;
+    }
+    if (rawCodecId == 1u) {
+        appendLog("[Audio] Device audio configuration error; continuing video-only.");
+        ThreadScheduling::disableMmcss(avrt);
+        return;
+    }
+
+    const AudioCodecId codec = parseAudioCodecId(rawCodecId);
+    if (codec == AUDIO_CODEC_NONE) {
+        char msg[80];
+        std::snprintf(msg, sizeof(msg), "[Audio] Unknown audio codec 0x%08X; continuing video-only.",
+                      static_cast<unsigned>(rawCodecId));
+        appendLog(msg);
+        ThreadScheduling::disableMmcss(avrt);
+        return;
+    }
+
+    appendLog(codec == AUDIO_CODEC_RAW
+        ? "[Audio] Native in-app stream active (raw PCM 48kHz stereo)"
+        : "[Audio] Native in-app stream active (AAC 48kHz stereo)");
+
+    std::vector<uint8_t> payload;
+    while (!stopThreads_) {
+        uint8_t hdr[12];
+        if (!recvAll(audioSock_, hdr, 12)) break;
+
+        uint64_t ptsUs = 0;
+        uint32_t pktSize = 0;
+        bool isConfig = false;
+        if (!parseAudioPacketHeader(hdr, isV4Proto_, ptsUs, pktSize, isConfig)) {
+            break;
+        }
+
+        payload.resize(pktSize);
+        if (!recvAll(audioSock_, payload.data(), static_cast<int>(pktSize))) {
+            break;
+        }
+
+        AudioPacketFn acb = nullptr;
+        void* actx = nullptr;
+        EnterCriticalSection(&metaLock_);
+        acb = audioCb_;
+        actx = audioCbCtx_;
+        LeaveCriticalSection(&metaLock_);
+        if (acb && pktSize > 0) {
+            acb(actx, codec, payload.data(), pktSize, ptsUs, isConfig);
+        }
+    }
+
+    ThreadScheduling::disableMmcss(avrt);
 }
 
 DWORD WINAPI ScrcpyBridge::controlReaderProc(LPVOID param) {

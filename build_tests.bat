@@ -31,6 +31,7 @@ if defined MINGW64_BIN (
     src\bridge\QrCodeGen.cpp ^
     src\bridge\ConnectionState.cpp ^
     src\bridge\ScrcpyBridge.cpp ^
+    src\audio\AudioPlayer.cpp ^
     src\video\H264Decoder.cpp ^
     src\video\D3D11Renderer.cpp ^
     src\video\LatencyTelemetry.cpp ^

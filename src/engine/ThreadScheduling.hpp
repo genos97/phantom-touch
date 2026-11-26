@@ -12,6 +12,7 @@
 namespace ThreadScheduling {
 
 HANDLE enableMmcssGames(DWORD& outTaskIdx);
+HANDLE enableMmcssAudio(DWORD& outTaskIdx);
 void disableMmcss(HANDLE avrtHandle);
 bool disableProcessEcoQoS();
 

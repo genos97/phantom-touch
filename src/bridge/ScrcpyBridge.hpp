@@ -11,6 +11,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
+#include "audio/AudioPlayer.hpp"
 #include "bridge/TouchTypes.hpp"
 
 #include <cstdint>
@@ -74,6 +75,9 @@ typedef void (*ConnectStepFn)(void* ctx, int step);
 typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
                               bool present, int64_t qpcPktRecv);
+typedef void (*AudioPacketFn)(void* ctx, AudioCodecId codec,
+                              const uint8_t* data, size_t size,
+                              uint64_t ptsUs, bool isConfig);
 
 struct BridgeStreamConfig {
     int maxSize = 0;            // 0 = native phone resolution
@@ -81,10 +85,12 @@ struct BridgeStreamConfig {
     int bitrateMbps = 16;       // Video bitrate in Mbps (metadataOnly forces 100kbps)
     bool metadataOnly = false;  // True for legacy 1 FPS control-only mode
     bool stayAwake = true;
+    bool enableAudio = false;   // F7: request audio=true on native scrcpy session
     bool virtualDisplay = false;
     std::string virtualDisplaySpec; // e.g. "1920x1080/320", "1280x720/240", or "auto"
     std::string videoCodecOptions;  // LATENCY 2.2: MediaCodec key=val pairs
     std::string videoEncoder;       // LATENCY 2.3: preferred HW H.264 encoder name
+    std::string audioCodec;         // F7: "raw" (USB) or "aac" (Wi-Fi); empty = auto from serial
 };
 
 class ScrcpyBridge {
@@ -118,6 +124,10 @@ public:
     static std::vector<VideoEncoderInfo> parseH264Encoders(const std::string& raw);
     static std::string pickBestHardwareH264Encoder(const std::vector<VideoEncoderInfo>& encoders);
     static PhoneThermalInfo parseThermalTelemetry(const std::string& combinedRaw);
+    static std::string selectAudioCodec(const std::string& deviceSerial);
+    static AudioCodecId parseAudioCodecId(uint32_t rawBeId);
+    static bool parseAudioPacketHeader(const uint8_t hdr[12], bool isV4Proto,
+                                       uint64_t& outPtsUs, uint32_t& outSize, bool& outIsConfig);
 
     bool listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial, std::vector<VideoEncoderInfo>& outEncoders);
     bool queryThermalTelemetry(PhoneThermalInfo& outInfo);
@@ -125,8 +135,6 @@ public:
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,
                             bool borderless = false, const std::string& deviceSerial = "");
-    bool launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial,
-                              int audioBufferMs, bool rawCodec, std::string& outError);
     void stopMirrorWindow();
     void triggerVideoStallTest() { InterlockedExchange(&injectVideoStall_, 1); }
     bool runAdbShell(const std::string& shellArgs, std::string& outText, DWORD timeoutMs = 5000);
@@ -169,6 +177,7 @@ public:
     void setClipboardCallback(DeviceClipboardFn fn, void* ctx);
     void setConnectStepCallback(ConnectStepFn fn, void* ctx);
     void setVideoPacketCallback(VideoPacketFn fn, void* ctx);
+    void setAudioPacketCallback(AudioPacketFn fn, void* ctx);
 
     // Foreground app inspection & Drag-and-Drop file/APK helpers
     bool queryForegroundInfo(std::string& outPackage, bool& outSecure);
@@ -185,9 +194,11 @@ public:
 
 private:
     static DWORD WINAPI videoReaderProc(LPVOID param);
+    static DWORD WINAPI audioReaderProc(LPVOID param);
     static DWORD WINAPI controlReaderProc(LPVOID param);
     static DWORD WINAPI controlSenderProc(LPVOID param);
     void runVideoReader();
+    void runAudioReader();
     void runControlReader();
     void runControlSender();
     bool enqueueControlPacket(std::vector<uint8_t>&& pkt, bool highPrio);
@@ -204,9 +215,11 @@ private:
     volatile LONG injectVideoStall_ = 0;
 
     SOCKET videoSock_ = INVALID_SOCKET;
+    SOCKET audioSock_ = INVALID_SOCKET;
     SOCKET controlSock_ = INVALID_SOCKET;
 
     HANDLE videoThread_ = NULL;
+    HANDLE audioThread_ = NULL;
     HANDLE controlThread_ = NULL;
     HANDLE controlSenderThread_ = NULL;
     HANDLE controlSendEvent_ = NULL;
@@ -237,5 +250,7 @@ private:
     void* stepCbCtx_ = nullptr;
     VideoPacketFn videoCb_ = nullptr;
     void* videoCbCtx_ = nullptr;
+    AudioPacketFn audioCb_ = nullptr;
+    void* audioCbCtx_ = nullptr;
     bool virtualDisplayActive_ = false;
 };

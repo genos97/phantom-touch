@@ -1205,10 +1205,13 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    drawToggleRow(g, x, y, w, "Forward Phone Audio (scrcpy 5.0)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "In-App Phone Audio (WASAPI)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
     if (s.mirrorAudio) {
-        drawSeg3("AUDIO RELAY BUFFER (1.6)", "20ms", "25ms", "30ms", 20, 25, 30, s.audioBufferMs, DA_AUDIO_BUFFER);
-        drawToggleRow(g, x, y, w, "Raw PCM Audio (USB Low-Latency)", s.audioRawCodec, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO_RAW, hoverX, hoverY); y += 36;
+        drawSeg3("IN-APP AUDIO BUFFER (F7)", "20ms", "25ms", "30ms", 20, 25, 30, s.audioBufferMs, DA_AUDIO_BUFFER);
+        GdiPlusDraw::textLeft(g, "Auto codec: Raw PCM (USB) / MF AAC (Wi-Fi)",
+                              static_cast<float>(x + 4), static_cast<float>(y + 10),
+                              10.5f, false, Theme::TEXT_MUTED);
+        y += 24;
     }
     y += 4;
 
