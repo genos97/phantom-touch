@@ -78,6 +78,21 @@ LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_MOUSEACTIVATE:
+            if (parentHwnd_) {
+                SetFocus(parentHwnd_);
+            }
+            return MA_ACTIVATE;
+        case WM_KEYDOWN:
+        case WM_KEYUP:
+        case WM_CHAR:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
+        case WM_SYSCHAR:
+            if (parentHwnd_) {
+                return SendMessageA(parentHwnd_, msg, wParam, lParam);
+            }
+            break;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK:
         case WM_LBUTTONUP:

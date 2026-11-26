@@ -66,6 +66,7 @@ private:
     static void onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h);
 
     bool mapShellClientToVideoLocal(int mx, int my, int& outVx, int& outVy, bool requireInside) const;
+    bool mapShellClientToVideoNorm(int mx, int my, float& outNx, float& outNy, bool requireInside) const;
 
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -209,6 +210,7 @@ private:
     bool sawEmbeddedMirror_ = false;
     bool nativeVideoSession_ = false;
     bool d3dHudDragging_ = false;
+    bool lastAppliedScreenOff_ = false;
     volatile LONG videoFramePending_ = 0;
     H264Decoder h264Decoder_;
 

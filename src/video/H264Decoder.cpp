@@ -318,6 +318,8 @@ bool H264Decoder::decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
     safeRelease(inSample);
 
     if (FAILED(hr)) {
+        std::printf("[H264] ProcessInput FAILED hr=0x%08lX (sz=%u key=%d)\n",
+                    static_cast<unsigned long>(hr), static_cast<unsigned>(size), isKeyFrame ? 1 : 0);
         return decodedAny;
     }
 
@@ -328,6 +330,13 @@ bool H264Decoder::decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
 
 bool H264Decoder::drainOutputs(bool& decodedAny) {
     for (int iter = 0; iter < 16; ++iter) {
+        if (!mftProvidesSamples_ && reusableOutSample_) {
+            IMFMediaBuffer* b = nullptr;
+            if (SUCCEEDED(reusableOutSample_->GetBufferByIndex(0, &b)) && b) {
+                b->SetCurrentLength(0);
+                b->Release();
+            }
+        }
         MFT_OUTPUT_DATA_BUFFER outData;
         ZeroMemory(&outData, sizeof(outData));
         outData.dwStreamID = 0;
@@ -348,6 +357,8 @@ bool H264Decoder::drainOutputs(bool& decodedAny) {
             continue;
         }
         if (FAILED(hr)) {
+            std::printf("[H264] ProcessOutput FAILED hr=0x%08lX (provides=%d)\n",
+                        static_cast<unsigned long>(hr), mftProvidesSamples_ ? 1 : 0);
             break;
         }
 

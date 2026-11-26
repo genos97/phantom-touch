@@ -93,6 +93,7 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     profile_ = engine_->getProfileCopy();
     if (profile_.keymapEnabled) lastGameProfilePath_ = profilePath_;
     AppSettingsStore::load(settingsPath_, settings_);
+    lastAppliedScreenOff_ = settings_.turnScreenOff;
     engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
@@ -470,6 +471,25 @@ bool ShellWindow::mapShellClientToVideoLocal(int mx, int my, int& outVx, int& ou
     outVy = my - top;
     if (!requireInside) return (vr.w > 0 && vr.h > 0);
     return (outVx >= 0 && outVx < vr.w && outVy >= 0 && outVy < vr.h);
+}
+
+bool ShellWindow::mapShellClientToVideoNorm(int mx, int my, float& outNx, float& outNy, bool requireInside) const {
+    ViewportRect vr = viewportHost_.activeVideoClientRect();
+    if (vr.w <= 0 || vr.h <= 0) return false;
+    int vx = mx - (viewportRc_.left + vr.x);
+    int vy = my - (viewportRc_.top  + vr.y);
+    if (requireInside && (vx < 0 || vx >= vr.w || vy < 0 || vy >= vr.h)) {
+        return false;
+    }
+    float nx = static_cast<float>(vx) / static_cast<float>(vr.w);
+    float ny = static_cast<float>(vy) / static_cast<float>(vr.h);
+    if (nx < 0.0f) nx = 0.0f;
+    if (nx > 1.0f) nx = 1.0f;
+    if (ny < 0.0f) ny = 0.0f;
+    if (ny > 1.0f) ny = 1.0f;
+    outNx = nx;
+    outNy = ny;
+    return true;
 }
 
 DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
@@ -1220,9 +1240,12 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     if (res.settingsModified) {
         saveSettings();
         engine_->setGamepadEnabled(settings_.gamepadEnabled);
-        // Apply Turn Phone Screen Off immediately via control socket without restarting video!
-        if (bridge_->isConnected() && !bridge_->isVirtualDisplayActive()) {
-            bridge_->setDisplayPower(!settings_.turnScreenOff);
+        // Apply Turn Phone Screen Off only when that toggle actually changed (never spam on bitrate/FPS edits!)
+        if (settings_.turnScreenOff != lastAppliedScreenOff_) {
+            lastAppliedScreenOff_ = settings_.turnScreenOff;
+            if (bridge_->isConnected() && !bridge_->isVirtualDisplayActive()) {
+                bridge_->setDisplayPower(!settings_.turnScreenOff);
+            }
         }
     }
     if (res.requestSave) {
@@ -1427,35 +1450,40 @@ LRESULT ShellWindow::handleLowLevelMouse(int nCode, WPARAM wParam, LPARAM lParam
             if (consumed) return 1;
         }
 
-        if (wParam == WM_LBUTTONDOWN && inVideo && isAppForeground()) {
-            cursorDirectDragging_ = true;
-            engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
-            return 1;
-        } else if (wParam == WM_MOUSEMOVE && cursorDirectDragging_) {
-            if (inVideo) engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
-        } else if (wParam == WM_LBUTTONUP && cursorDirectDragging_) {
-            cursorDirectDragging_ = false;
-            engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
-            return 1;
-        } else if (wParam == WM_RBUTTONDOWN && settings_.rightClickBack && inVideo && isAppForeground()) {
-            rightClickBackSwallowUp_ = true;
-            PostMessageA(hwnd_, MSG_ANDROID_BACK, 0, 0);
-            return 1;
-        } else if (wParam == WM_RBUTTONUP && rightClickBackSwallowUp_) {
-            rightClickBackSwallowUp_ = false;
-            return 1;
-        } else if (wParam == WM_MOUSEWHEEL && inVideo && isAppForeground()) {
-            short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
-            int notches = rawDelta / WHEEL_DELTA;
-            if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
-            if (notches != 0) {
-                bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                if (ctrlHeld) {
-                    engine_->onDirectCursorPinch(nx, ny, notches);
-                } else {
-                    engine_->onDirectCursorScroll(nx, ny, notches);
-                }
+        // In Stage 2 Native D3D11 Mode, ViewportHost is our own native Win32 window:
+        // let WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP / WM_RBUTTONDOWN / WM_MOUSEWHEEL flow
+        // straight to ShellWindow::handleMessage() so first-click activation, DPI coords, and keyboard focus NEVER fail!
+        if (!viewportHost_.isNativeVideoActive()) {
+            if (wParam == WM_LBUTTONDOWN && inVideo && isAppForeground()) {
+                cursorDirectDragging_ = true;
+                engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
                 return 1;
+            } else if (wParam == WM_MOUSEMOVE && cursorDirectDragging_) {
+                if (inVideo) engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
+            } else if (wParam == WM_LBUTTONUP && cursorDirectDragging_) {
+                cursorDirectDragging_ = false;
+                engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
+                return 1;
+            } else if (wParam == WM_RBUTTONDOWN && settings_.rightClickBack && inVideo && isAppForeground()) {
+                rightClickBackSwallowUp_ = true;
+                PostMessageA(hwnd_, MSG_ANDROID_BACK, 0, 0);
+                return 1;
+            } else if (wParam == WM_RBUTTONUP && rightClickBackSwallowUp_) {
+                rightClickBackSwallowUp_ = false;
+                return 1;
+            } else if (wParam == WM_MOUSEWHEEL && inVideo && isAppForeground()) {
+                short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
+                int notches = rawDelta / WHEEL_DELTA;
+                if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
+                if (notches != 0) {
+                    bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                    if (ctrlHeld) {
+                        engine_->onDirectCursorPinch(nx, ny, notches);
+                    } else {
+                        engine_->onDirectCursorScroll(nx, ny, notches);
+                    }
+                    return 1;
+                }
             }
         }
     }
@@ -1870,6 +1898,12 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 if (drawerPanel_.onMouseMove(mx, my, profile_, hudOverlay_.selectedBtnIndex(), res)) {
                     handleDrawerResult(res);
                 }
+            } else if (cursorDirectDragging_ && !editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, false)) {
+                    engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
+                }
+                return 0;
             } else if (editMode_ && viewportHost_.isNativeVideoActive()) {
                 int vx = 0, vy = 0;
                 if (mapShellClientToVideoLocal(mx, my, vx, vy, !d3dHudDragging_)) {
@@ -1891,6 +1925,14 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             invalidateShell();
             return 0;
 
+        case WM_CAPTURECHANGED:
+            if (cursorDirectDragging_) {
+                cursorDirectDragging_ = false;
+                engine_->onDirectCursorTouch(TOUCH_UP, 0.5f, 0.5f);
+            }
+            d3dHudDragging_ = false;
+            return 0;
+
         case WM_LBUTTONDBLCLK: {
             int mx = static_cast<short>(LOWORD(lParam));
             int my = static_cast<short>(HIWORD(lParam));
@@ -1898,6 +1940,17 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 int vx = 0, vy = 0;
                 if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
                     hudOverlay_.dispatchDoubleClick(vx, vy);
+                    return 0;
+                }
+            } else if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+                    SetFocus(hwnd);
+                    drawerPanel_.clearFocus();
+                    editingHubWireless_ = false;
+                    cursorDirectDragging_ = true;
+                    SetCapture(hwnd);
+                    engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
                     return 0;
                 }
             }
@@ -1931,6 +1984,11 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     return 0;
                 }
             }
+            // Clicking outside drawer clears drawer text/rebind focus so keyboard typing targets the phone!
+            if (drawerOpen_) {
+                drawerPanel_.clearFocus();
+                invalidateShell();
+            }
             // 4. Native D3D11 Embedded Edit Mode Canvas (same-frame HUD interaction!)
             if (editMode_ && viewportHost_.isNativeVideoActive()) {
                 int vx = 0, vy = 0;
@@ -1941,7 +1999,17 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     return 0;
                 }
             }
-            // 5. Device Hub inside ViewportHost (when disconnected)
+            // 5. Direct Cursor-Mode Touch on Phone Screen (Native D3D11 Viewport!)
+            if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+                    cursorDirectDragging_ = true;
+                    SetCapture(hwnd);
+                    engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
+                    return 0;
+                }
+            }
+            // 6. Device Hub inside ViewportHost (when disconnected)
             if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
                 HubClickResult hr = viewportHost_.hitTestHub(mx, my);
                 if (hr.action == HUB_REFRESH_DEVICES) {
@@ -1969,7 +2037,16 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
 
         case WM_LBUTTONUP: {
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
             if (GetCapture() == hwnd) ReleaseCapture();
+            if (cursorDirectDragging_) {
+                cursorDirectDragging_ = false;
+                float nx = 0.5f, ny = 0.5f;
+                mapShellClientToVideoNorm(mx, my, nx, ny, false);
+                engine_->onDirectCursorTouch(TOUCH_UP, nx, ny);
+                return 0;
+            }
             if (d3dHudDragging_) {
                 d3dHudDragging_ = false;
                 hudOverlay_.dispatchMouseUp();
@@ -1999,12 +2076,20 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_RBUTTONDOWN: {
             if (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind()) { hudOnMouseBindToDrawer(VK_RBUTTON); return 0; }
             if (hudOverlay_.rebindTarget() != HUD_REBIND_NONE && hudOverlay_.handleMouseBind(VK_RBUTTON)) return 0;
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
             if (editMode_ && viewportHost_.isNativeVideoActive()) {
-                int mx = static_cast<short>(LOWORD(lParam));
-                int my = static_cast<short>(HIWORD(lParam));
                 int vx = 0, vy = 0;
                 if (mapShellClientToVideoLocal(mx, my, vx, vy, true)) {
                     hudOverlay_.dispatchMouseDown(vx, vy, true);
+                    return 0;
+                }
+            } else if (!editMode_ && !aimMode_ && bridge_->isConnected() && settings_.rightClickBack) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(mx, my, nx, ny, true)) {
+                    SetFocus(hwnd);
+                    if (drawerOpen_) { drawerPanel_.clearFocus(); invalidateShell(); }
+                    bridge_->sendAndroidNav(4 /* KEYCODE_BACK */);
                     return 0;
                 }
             }
@@ -2032,6 +2117,19 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (drawerOpen_ && drawerPanel_.onMouseWheel(pt.x, pt.y, delta)) {
                 invalidateShell();
                 return 0;
+            }
+            if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
+                float nx = 0.0f, ny = 0.0f;
+                if (mapShellClientToVideoNorm(pt.x, pt.y, nx, ny, true)) {
+                    int notches = delta / WHEEL_DELTA;
+                    if (notches == 0 && delta != 0) notches = (delta > 0) ? 1 : -1;
+                    if (notches != 0) {
+                        bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                        if (ctrlHeld) engine_->onDirectCursorPinch(nx, ny, notches);
+                        else          engine_->onDirectCursorScroll(nx, ny, notches);
+                        return 0;
+                    }
+                }
             }
             break;
         }

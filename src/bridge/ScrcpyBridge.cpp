@@ -576,6 +576,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     char streamBuf[96];
     std::snprintf(streamBuf, sizeof(streamBuf), " max_fps=%d video_bit_rate=%u", fps, bps);
 
+    const bool isV4OrNewer = (!tools.scrcpyVersion.empty() && tools.scrcpyVersion[0] >= '4');
     std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
@@ -587,8 +588,8 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
                          std::string(streamBuf) +
                          " tunnel_forward=true"
                          " send_dummy_byte=true"
-                         " send_device_meta=true"
-                         " send_codec_meta=true"
+                         " send_device_meta=true" +
+                         std::string(isV4OrNewer ? "" : " send_codec_meta=true") +
                          " send_frame_meta=true"
                          " clipboard_autosync=true"
                          " power_on=true"
@@ -1159,12 +1160,18 @@ void ScrcpyBridge::runVideoReader() {
             break;
         }
 
-        // Bit 63 = SC_PACKET_FLAG_CONFIG (SPS/PPS), Bit 62 = SC_PACKET_FLAG_KEY_FRAME (IDR)
-        const bool isConfig   = (ptsAndFlags & (1ULL << 63)) != 0;
-        const bool isKeyFrame = (ptsAndFlags & (1ULL << 62)) != 0;
-        const uint64_t ptsUs  = (ptsAndFlags & 0x3FFFFFFFFFFFFFFFULL);
+        // scrcpy v2/v3: Bit 63 = CONFIG, Bit 62 = KEY_FRAME, Bits 61..0 = PTS
+        // scrcpy v4/v5: Bit 63 = SESSION_META, Bit 62 = CONFIG, Bit 61 = KEY_FRAME, Bits 60..0 = PTS
+        const bool isConfig   = isV4Proto_ ? ((ptsAndFlags & (1ULL << 62)) != 0)
+                                           : ((ptsAndFlags & (1ULL << 63)) != 0);
+        const bool isKeyFrame = isV4Proto_ ? ((ptsAndFlags & (1ULL << 61)) != 0)
+                                           : ((ptsAndFlags & (1ULL << 62)) != 0);
+        const uint64_t ptsUs  = isV4Proto_ ? (ptsAndFlags & 0x1FFFFFFFFFFFFFFFULL)
+                                           : (ptsAndFlags & 0x3FFFFFFFFFFFFFFFULL);
 
-        if (isConfig && pktSize > 4) {
+        // On scrcpy v4/v5+, writeSessionMeta [0x80000000][W][H] is the exact authoritative videoSize
+        // required by PositionMapper.map() — NEVER overwrite it with coded/cropped H.264 SPS dimensions!
+        if (!isV4Proto_ && isConfig && pktSize > 4) {
             uint32_t newW = 0, newH = 0;
             if (SpsParser::parseH264Resolution(payload.data(), payload.size(), newW, newH)) {
                 EnterCriticalSection(&metaLock_);
