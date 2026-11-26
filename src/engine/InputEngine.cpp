@@ -249,6 +249,10 @@ void InputEngine::updateTuning(const Profile& profile) {
         dst.tapJitterPx        = profile.tapJitterPx;
         dst.rememberCursorPos  = profile.rememberCursorPos;
         dst.cursorScrollStepPx = profile.cursorScrollStepPx;
+        dst.joyWalkRadius      = profile.joyWalkRadius;
+        dst.joySteppedGlide    = profile.joySteppedGlide;
+        dst.fireBoxHalfW       = profile.fireBoxHalfW;
+        dst.fireBoxHalfH       = profile.fireBoxHalfH;
     };
     copyTuning(rawProfile_);
     copyTuning(profile_);

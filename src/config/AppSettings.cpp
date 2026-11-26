@@ -155,6 +155,25 @@ void AppSettings::setEncoderForDevice(const std::string& serial, const std::stri
     }
 }
 
+bool AppSettings::hasPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
+                                          const std::string& serial) {
+    if (live.mirrorFps != applied.mirrorFps) return true;
+    if (live.mirrorBitrateMbps != applied.mirrorBitrateMbps) return true;
+    if (live.mirrorMaxSize != applied.mirrorMaxSize) return true;
+    if (live.videoCodecOptions != applied.videoCodecOptions) return true;
+    if (live.encoderForDevice(serial) != applied.encoderForDevice(serial)) return true;
+    if (live.useNativeVideo != applied.useNativeVideo) return true;
+    if (live.virtualDisplayMode != applied.virtualDisplayMode) return true;
+    if (live.virtualDisplayMode && live.virtualDisplaySpec != applied.virtualDisplaySpec) return true;
+    if (live.mirrorAudio != applied.mirrorAudio) return true;
+    if (live.mirrorAudio && (live.audioBufferMs != applied.audioBufferMs ||
+                             live.audioRawCodec != applied.audioRawCodec)) {
+        return true;
+    }
+    if (live.stayAwake != applied.stayAwake) return true;
+    return false;
+}
+
 bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
     std::ifstream in(path.c_str());
     if (!in.is_open()) return false;
@@ -202,6 +221,7 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "virtual_display_mode") s.virtualDisplayMode = (v == "1");
         else if (k == "virtual_display_spec" && !v.empty()) s.virtualDisplaySpec = v;
         else if (k == "gamepad_enabled") s.gamepadEnabled = (v == "1");
+        else if (k == "onboarding_done") s.onboardingDone = (v == "1");
         else if (k == "last_wireless_addr" && !v.empty()) s.lastWirelessAddr = v;
         else if (k == "last_game_profile" && !v.empty()) s.lastGameProfile = v;
     }
@@ -246,6 +266,7 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "virtual_display_mode = " << (s.virtualDisplayMode ? 1 : 0) << "\n";
         out << "virtual_display_spec = " << s.virtualDisplaySpec << "\n";
         out << "gamepad_enabled = " << (s.gamepadEnabled ? 1 : 0) << "\n";
+        out << "onboarding_done = " << (s.onboardingDone ? 1 : 0) << "\n";
         out << "last_wireless_addr = " << s.lastWirelessAddr << "\n";
         if (!s.lastGameProfile.empty()) {
             out << "last_game_profile = " << s.lastGameProfile << "\n";

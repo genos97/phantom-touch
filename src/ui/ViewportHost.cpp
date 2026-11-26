@@ -424,13 +424,12 @@ RECT ViewportHost::activeVideoScreenRect() const {
 }
 
 void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
-                         bool connected, bool demoMode, bool connecting,
-                         const std::string& statusMsg,
-                         const std::vector<AdbDeviceInfo>& devices,
-                         const std::string& wirelessAddr, bool editingWirelessAddr,
-                         bool showingQrPair, const QrMatrix* qrMatrix, const std::string& qrStatus,
+                         bool connected, bool demoMode,
+                         const HubViewState& hub,
                          int hoverX, int hoverY) {
     hotspots_.clear();
+    ZeroMemory(&hubDeviceListRc_, sizeof(hubDeviceListRc_));
+    hubDeviceMaxScrollY_ = 0;
     GdiPlusDraw::fillRect(g, clientRc, Theme::BG_CANVAS);
 
     if (connected) {
@@ -445,7 +444,8 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
         if (!isMirrorEmbedded() && !isNativeVideoActive()) {
             float cx = static_cast<float>(clientRc.left + clientRc.right) * 0.5f;
             float cy = static_cast<float>(clientRc.top + clientRc.bottom) * 0.5f;
-            GdiPlusDraw::textCenter(g, "Starting single-connection video stream...", cx, cy, 14.0f, true, Theme::ACCENT_CYAN);
+            GdiPlusDraw::textCenter(g, ConnectionStateMachine::stepLabel(hub.connectStep), cx, cy,
+                                    14.0f, true, Theme::ACCENT_CYAN);
         }
         return;
     }
@@ -469,20 +469,18 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
                        static_cast<float>(vid.right - 2), static_cast<float>(gy));
         }
         float cx = static_cast<float>(vid.left + vid.right) * 0.5f;
-        float cy = static_cast<float>(vid.top + vid.bottom) * 0.5f;
         GdiPlusDraw::textCenter(g, "OFFLINE KEYMAP STUDIO CANVAS", cx, static_cast<float>(vid.top + 24),
                                 12.0f, true, Theme::TEXT_MUTED);
         GdiPlusDraw::textCenter(g, "Drag keys directly here  |  Right-Click to add  |  Double-Click to replace  |  Use Right Drawer for settings",
                                 cx, static_cast<float>(vid.bottom - 20), 11.5f, false, Theme::TEXT_MUTED);
-        (void)cy;
         return;
     }
 
-    // Disconnected State: Production Device Hub Card centered inside ViewportHost
-    int cardW = GdiPlusDraw::dp(540);
-    int cardH = GdiPlusDraw::dp(420);
-    int availW = clientRc.right - clientRc.left - GdiPlusDraw::dp(32);
-    int availH = clientRc.bottom - clientRc.top - GdiPlusDraw::dp(32);
+    // Disconnected / X2 / F3 Connection Hub Card centered inside ViewportHost
+    int cardW = GdiPlusDraw::dp(560);
+    int cardH = GdiPlusDraw::dp(468);
+    int availW = clientRc.right - clientRc.left - GdiPlusDraw::dp(28);
+    int availH = clientRc.bottom - clientRc.top - GdiPlusDraw::dp(28);
     if (cardW > availW) cardW = availW;
     if (cardH > availH) cardH = availH;
     if (cardW < GdiPlusDraw::dp(340)) cardW = GdiPlusDraw::dp(340);
@@ -492,72 +490,77 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     int cy = (clientRc.top + clientRc.bottom) / 2;
     RECT card = { cx - cardW / 2, cy - cardH / 2, cx + cardW / 2, cy + cardH / 2 };
 
-    GdiPlusDraw::roundedCard(g, card, 14.0f, Theme::BG_DRAWER, Theme::BORDER_STRONG, 1.5f);
+    GdiPlusDraw::roundedCard(g, card, GdiPlusDraw::dpf(14.0f), Theme::BG_DRAWER, Theme::BORDER_STRONG, 1.5f);
 
-    int x = card.left + 24;
-    int w = cardW - 48;
-    int y = card.top + 26;
+    int padX = GdiPlusDraw::dp(22);
+    int x = card.left + padX;
+    int w = cardW - padX * 2;
+    int y = card.top + GdiPlusDraw::dp(22);
 
     // Header
-    GdiPlusDraw::drawIcon(g, ICON_LOGO, static_cast<float>(x + 12), static_cast<float>(y + 10), 22.0f, Theme::ACCENT_CYAN);
-    GdiPlusDraw::textLeft(g, showingQrPair ? "Wireless QR Pairing (Android 11+)" : "Phantom Touch Device Hub",
-                          static_cast<float>(x + 34), static_cast<float>(y + 8), 18.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 130));
-    GdiPlusDraw::textLeft(g, showingQrPair ? "Developer options -> Wireless debugging -> Pair device with QR code"
-                                           : "Connect an Android phone via USB debugging or Wireless ADB",
-                          static_cast<float>(x + 34), static_cast<float>(y + 28), 11.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 130));
+    GdiPlusDraw::drawIcon(g, ICON_LOGO, static_cast<float>(x + GdiPlusDraw::dp(12)),
+                          static_cast<float>(y + GdiPlusDraw::dp(11)), GdiPlusDraw::dpf(22.0f), Theme::ACCENT_CYAN);
+    GdiPlusDraw::textLeft(g, hub.showingQrPair ? "Wireless QR Pairing (Android 11+)" : "Phantom Touch Device Hub",
+                          static_cast<float>(x + GdiPlusDraw::dp(34)), static_cast<float>(y + GdiPlusDraw::dp(8)),
+                          17.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - GdiPlusDraw::dp(135)));
+    GdiPlusDraw::textLeft(g, hub.showingQrPair ? "Developer options -> Wireless debugging -> Pair device with QR code"
+                                               : "Auto-detecting USB debugging & Wireless ADB devices",
+                          static_cast<float>(x + GdiPlusDraw::dp(34)), static_cast<float>(y + GdiPlusDraw::dp(27)),
+                          11.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - GdiPlusDraw::dp(135)));
 
-    RECT rRef = { card.right - 24 - 92, y + 2, card.right - 24, y + 32 };
+    RECT rRef = { card.right - padX - GdiPlusDraw::dp(92), y + GdiPlusDraw::dp(2), card.right - padX, y + GdiPlusDraw::dp(32) };
     bool hovRef = ptIn(rRef, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rRef, 8.0f, hovRef ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+    GdiPlusDraw::roundedCard(g, rRef, GdiPlusDraw::dpf(8.0f), hovRef ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovRef ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
-    if (showingQrPair) {
+    if (hub.showingQrPair) {
         GdiPlusDraw::textCenter(g, "BACK", static_cast<float>(rRef.left + rRef.right) * 0.5f,
                                 static_cast<float>(rRef.top + rRef.bottom) * 0.5f, 12.0f, true, Theme::ACCENT_CYAN);
         hotspots_.push_back(HubHotspot{ rRef, HUB_TOGGLE_QR_PAIR, 0 });
     } else {
-        GdiPlusDraw::drawIcon(g, ICON_REFRESH, static_cast<float>(rRef.left + 16), static_cast<float>(rRef.top + 15), 12.0f, Theme::ACCENT_CYAN);
-        GdiPlusDraw::textLeft(g, "Refresh", static_cast<float>(rRef.left + 30), static_cast<float>(rRef.top + 15), 12.0f, true, Theme::TEXT_PRIMARY, 58.0f);
+        GdiPlusDraw::drawIcon(g, ICON_REFRESH, static_cast<float>(rRef.left + GdiPlusDraw::dp(16)),
+                              static_cast<float>(rRef.top + GdiPlusDraw::dp(15)), GdiPlusDraw::dpf(12.0f), Theme::ACCENT_CYAN);
+        GdiPlusDraw::textLeft(g, "Refresh", static_cast<float>(rRef.left + GdiPlusDraw::dp(30)),
+                              static_cast<float>(rRef.top + GdiPlusDraw::dp(15)), 11.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(GdiPlusDraw::dp(58)));
         hotspots_.push_back(HubHotspot{ rRef, HUB_REFRESH_DEVICES, 0 });
     }
-    y += 50;
+    y += GdiPlusDraw::dp(48);
 
-    if (showingQrPair) {
-        // Render crisp cached QR bitmap (S2(c): avoids per-hover module loops)
+    if (hub.showingQrPair) {
         const int qrBoxSz = GdiPlusDraw::dp(196);
         int qx = cx - qrBoxSz / 2;
-        int qy = y + 4;
+        int qy = y + GdiPlusDraw::dp(4);
         RECT rQrBg = { qx, qy, qx + qrBoxSz, qy + qrBoxSz };
-        GdiPlusDraw::roundedCard(g, rQrBg, 10.0f, 0xFFFFFFFFu, Theme::ACCENT_CYAN, 2.0f);
+        GdiPlusDraw::roundedCard(g, rQrBg, GdiPlusDraw::dpf(10.0f), 0xFFFFFFFFu, Theme::ACCENT_CYAN, 2.0f);
 
-        if (qrMatrix && qrMatrix->size > 0) {
+        if (hub.qrMatrix && hub.qrMatrix->size > 0) {
             const int quiet = 3;
-            const int totalMod = qrMatrix->size + quiet * 2;
-            const int cellPx = (qrBoxSz - 12) / totalMod;
+            const int totalMod = hub.qrMatrix->size + quiet * 2;
+            const int cellPx = (qrBoxSz - GdiPlusDraw::dp(12)) / totalMod;
             if (cellPx >= 2) {
-                uint32_t qhash = static_cast<uint32_t>(qrMatrix->size);
-                for (int r = 0; r < qrMatrix->size; ++r) {
-                    for (int c = 0; c < qrMatrix->size; ++c) {
-                        qhash = (qhash * 131u) + (qrMatrix->at(c, r) ? 1u : 0u);
+                uint32_t qhash = static_cast<uint32_t>(hub.qrMatrix->size);
+                for (int r = 0; r < hub.qrMatrix->size; ++r) {
+                    for (int c = 0; c < hub.qrMatrix->size; ++c) {
+                        qhash = (qhash * 131u) + (hub.qrMatrix->at(c, r) ? 1u : 0u);
                     }
                 }
-                const int drawSz = cellPx * qrMatrix->size;
-                if (!cachedQrBmp_ || cachedQrSize_ != qrMatrix->size ||
+                const int drawSz = cellPx * hub.qrMatrix->size;
+                if (!cachedQrBmp_ || cachedQrSize_ != hub.qrMatrix->size ||
                     cachedQrCellPx_ != cellPx || cachedQrHash_ != qhash) {
                     delete cachedQrBmp_;
                     cachedQrBmp_ = new Gdiplus::Bitmap(drawSz, drawSz, PixelFormat32bppPARGB);
                     Gdiplus::Graphics qg(cachedQrBmp_);
                     qg.Clear(Gdiplus::Color(0, 0, 0, 0));
                     Gdiplus::SolidBrush darkBr(Gdiplus::Color(255, 10, 14, 22));
-                    for (int r = 0; r < qrMatrix->size; ++r) {
-                        for (int c = 0; c < qrMatrix->size; ++c) {
-                            if (qrMatrix->at(c, r)) {
+                    for (int r = 0; r < hub.qrMatrix->size; ++r) {
+                        for (int c = 0; c < hub.qrMatrix->size; ++c) {
+                            if (hub.qrMatrix->at(c, r)) {
                                 qg.FillRectangle(&darkBr, static_cast<INT>(c * cellPx),
                                                  static_cast<INT>(r * cellPx),
                                                  static_cast<INT>(cellPx), static_cast<INT>(cellPx));
                             }
                         }
                     }
-                    cachedQrSize_ = qrMatrix->size;
+                    cachedQrSize_ = hub.qrMatrix->size;
                     cachedQrCellPx_ = cellPx;
                     cachedQrHash_ = qhash;
                 }
@@ -568,15 +571,15 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
             }
         }
 
-        int sy = qy + qrBoxSz + 18;
-        GdiPlusDraw::textCenter(g, qrStatus.empty() ? "Waiting for phone to scan QR code over Wi-Fi..." : qrStatus,
+        int sy = qy + qrBoxSz + GdiPlusDraw::dp(18);
+        GdiPlusDraw::textCenter(g, hub.qrStatus.empty() ? "Waiting for phone to scan QR code over Wi-Fi..." : hub.qrStatus,
                                 static_cast<float>(cx), static_cast<float>(sy), 12.5f, true, Theme::ACCENT_CYAN);
         GdiPlusDraw::textCenter(g, "Both PC and phone must be on the same Wi-Fi network (mDNS auto-pair + connect).",
-                                static_cast<float>(cx), static_cast<float>(sy + 20), 11.0f, false, Theme::TEXT_MUTED);
+                                static_cast<float>(cx), static_cast<float>(sy + GdiPlusDraw::dp(20)), 11.0f, false, Theme::TEXT_MUTED);
 
-        RECT rBack = { x, card.bottom - 52, x + w, card.bottom - 18 };
+        RECT rBack = { x, card.bottom - GdiPlusDraw::dp(50), x + w, card.bottom - GdiPlusDraw::dp(16) };
         bool hovB = ptIn(rBack, hoverX, hoverY);
-        GdiPlusDraw::roundedCard(g, rBack, 8.0f, hovB ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+        GdiPlusDraw::roundedCard(g, rBack, GdiPlusDraw::dpf(8.0f), hovB ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                                  hovB ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.0f);
         GdiPlusDraw::textCenter(g, "Return to USB / Wireless Device List",
                                 static_cast<float>(rBack.left + rBack.right) * 0.5f,
@@ -585,95 +588,252 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
         return;
     }
 
-    if (!statusMsg.empty()) {
-        RECT rSt = { x, y, x + w, y + 32 };
-        uint32_t bg = connecting ? Theme::ACCENT_CYAN_BG : Theme::ACCENT_AMBER_BG;
-        uint32_t bd = connecting ? Theme::ACCENT_CYAN : Theme::ACCENT_AMBER;
-        GdiPlusDraw::roundedCard(g, rSt, 8.0f, bg, bd, 1.0f);
-        GdiPlusDraw::textLeft(g, statusMsg, static_cast<float>(x + 12), static_cast<float>(y + 16), 11.5f, true,
-                              connecting ? Theme::ACCENT_CYAN : Theme::ACCENT_AMBER, static_cast<float>(w - 24));
-        y += 42;
+    // X2 State Card (clear message + single primary action)
+    auto drawStateCard = [&](uint32_t bg, uint32_t bd, uint32_t titleCol,
+                             const std::string& headline, const std::string& sub,
+                             const char* priLabel, HubActionType priAct,
+                             const char* secLabel, HubActionType secAct) {
+        const int cardBoxH = GdiPlusDraw::dp(62);
+        RECT rSt = { x, y, x + w, y + cardBoxH };
+        GdiPlusDraw::roundedCard(g, rSt, GdiPlusDraw::dpf(9.0f), bg, bd, 1.2f);
+        int textMaxW = w - GdiPlusDraw::dp(secLabel ? 210 : (priLabel ? 132 : 24));
+        GdiPlusDraw::textLeft(g, headline, static_cast<float>(x + GdiPlusDraw::dp(12)),
+                              static_cast<float>(y + GdiPlusDraw::dp(21)), 12.5f, true, titleCol, static_cast<float>(textMaxW));
+        GdiPlusDraw::textLeft(g, sub, static_cast<float>(x + GdiPlusDraw::dp(12)),
+                              static_cast<float>(y + GdiPlusDraw::dp(41)), 10.5f, false, Theme::TEXT_SECONDARY, static_cast<float>(textMaxW));
+
+        int rightCursor = rSt.right - GdiPlusDraw::dp(10);
+        if (priLabel && priAct != HUB_NONE) {
+            int pw = GdiPlusDraw::dp(106);
+            RECT rPri = { rightCursor - pw, y + GdiPlusDraw::dp(16), rightCursor, y + GdiPlusDraw::dp(46) };
+            bool hovP = ptIn(rPri, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, rPri, GdiPlusDraw::dpf(7.0f), hovP ? bd : Theme::BG_CARD, bd, 1.2f);
+            GdiPlusDraw::textCenter(g, priLabel, static_cast<float>(rPri.left + rPri.right) * 0.5f,
+                                    static_cast<float>(rPri.top + rPri.bottom) * 0.5f,
+                                    11.0f, true, hovP ? 0xFF081018u : Theme::TEXT_PRIMARY);
+            hotspots_.push_back(HubHotspot{ rPri, priAct, 0 });
+            rightCursor = rPri.left - GdiPlusDraw::dp(6);
+        }
+        if (secLabel && secAct != HUB_NONE) {
+            int sw = GdiPlusDraw::dp(80);
+            RECT rSec = { rightCursor - sw, y + GdiPlusDraw::dp(16), rightCursor, y + GdiPlusDraw::dp(46) };
+            bool hovS = ptIn(rSec, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, rSec, GdiPlusDraw::dpf(7.0f), hovS ? Theme::BG_CARD_HOVER : Theme::BG_INPUT,
+                                     Theme::BORDER_STRONG, 1.0f);
+            GdiPlusDraw::textCenter(g, secLabel, static_cast<float>(rSec.left + rSec.right) * 0.5f,
+                                    static_cast<float>(rSec.top + rSec.bottom) * 0.5f,
+                                    10.5f, true, Theme::TEXT_SECONDARY);
+            hotspots_.push_back(HubHotspot{ rSec, secAct, 0 });
+        }
+        y += cardBoxH + GdiPlusDraw::dp(10);
+    };
+
+    if (hub.connState == CONN_NO_TOOLS) {
+        drawStateCard(Theme::ACCENT_RED_BG, Theme::ACCENT_RED, Theme::ACCENT_RED,
+                      "Phantom Touch needs its phone tools.",
+                      "adb.exe, scrcpy-server, and scrcpy.exe were not found in .\\scrcpy\\.",
+                      "Repair", HUB_REPAIR_TOOLS, "Re-check", HUB_REFRESH_DEVICES);
+    } else if (hub.connState == CONN_CONNECTING) {
+        const int progH = GdiPlusDraw::dp(76);
+        RECT rPr = { x, y, x + w, y + progH };
+        GdiPlusDraw::roundedCard(g, rPr, GdiPlusDraw::dpf(9.0f), Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.2f);
+        static const char* kStepNames[3] = { "1. Push server", "2. Start", "3. Video" };
+        int segW = (w - GdiPlusDraw::dp(32)) / 3;
+        int curStepIdx = static_cast<int>(hub.connectStep);
+        for (int s = 0; s < 3; ++s) {
+            RECT rs = { x + GdiPlusDraw::dp(10) + s * (segW + GdiPlusDraw::dp(6)),
+                        y + GdiPlusDraw::dp(10),
+                        x + GdiPlusDraw::dp(10) + s * (segW + GdiPlusDraw::dp(6)) + segW,
+                        y + GdiPlusDraw::dp(36) };
+            bool done = (s < curStepIdx);
+            bool active = (s == curStepIdx);
+            uint32_t sBg = done ? Theme::ACCENT_GREEN_BG : (active ? Theme::ACCENT_CYAN_BG : Theme::BG_INPUT);
+            uint32_t sBd = done ? Theme::ACCENT_GREEN : (active ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE);
+            uint32_t sFg = done ? Theme::ACCENT_GREEN : (active ? Theme::ACCENT_CYAN : Theme::TEXT_MUTED);
+            GdiPlusDraw::roundedCard(g, rs, GdiPlusDraw::dpf(6.0f), sBg, sBd, active ? 1.4f : 1.0f);
+            GdiPlusDraw::textCenter(g, kStepNames[s], static_cast<float>(rs.left + rs.right) * 0.5f,
+                                    static_cast<float>(rs.top + rs.bottom) * 0.5f, 10.5f, true, sFg);
+        }
+        GdiPlusDraw::textLeft(g, hub.statusMsg.empty() ? ConnectionStateMachine::stepLabel(hub.connectStep) : hub.statusMsg,
+                              static_cast<float>(x + GdiPlusDraw::dp(12)),
+                              static_cast<float>(y + GdiPlusDraw::dp(55)),
+                              11.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - GdiPlusDraw::dp(24)));
+        y += progH + GdiPlusDraw::dp(10);
+    } else if (hub.connState == CONN_RECONNECTING) {
+        char head[96];
+        std::snprintf(head, sizeof(head), "Reconnecting in %ds (attempt %d/%d)...",
+                      hub.reconnectCountdownSec > 0 ? hub.reconnectCountdownSec : 1,
+                      hub.reconnectAttempt > 0 ? hub.reconnectAttempt : 1,
+                      hub.maxReconnectAttempts > 0 ? hub.maxReconnectAttempts : 5);
+        drawStateCard(Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, Theme::ACCENT_AMBER,
+                      head, "Plug your USB cable back in or keep Wi-Fi active — profile will resume automatically.",
+                      "Cancel", HUB_CANCEL_RECONNECT, "Retry Now", HUB_RETRY_RECONNECT);
+    } else if (hub.connState == CONN_LOST) {
+        drawStateCard(Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, Theme::ACCENT_AMBER,
+                      "Connection lost.",
+                      hub.statusMsg.empty() ? "Auto-reconnect timed out. Reconnect or pick another device below." : hub.statusMsg,
+                      "Reconnect", HUB_RETRY_RECONNECT, "Devices", HUB_CANCEL_RECONNECT);
+    } else if (hub.connState == CONN_ERROR) {
+        drawStateCard(Theme::ACCENT_RED_BG, Theme::ACCENT_RED, Theme::ACCENT_RED,
+                      hub.statusMsg.empty() ? "Could not start phone mirror session." : hub.statusMsg,
+                      "Verify USB debugging is enabled, or copy details for the log.",
+                      "Copy details", HUB_COPY_ERROR, "Retry", HUB_REFRESH_DEVICES);
+    } else if (hub.connState == CONN_UNAUTHORIZED) {
+        drawStateCard(Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, Theme::ACCENT_AMBER,
+                      "Tap Allow on your phone.",
+                      "Unlock your phone and accept the 'Allow USB debugging' prompt (auto-retries every 2s).",
+                      "Retry", HUB_REFRESH_DEVICES, nullptr, HUB_NONE);
+    } else if (hub.connState == CONN_NO_DEVICE) {
+        drawStateCard(Theme::BG_CARD, Theme::BORDER_STRONG, Theme::TEXT_PRIMARY,
+                      "Plug in your phone with USB debugging on.",
+                      "Connect via USB cable or Wireless ADB below.",
+                      "How to enable", HUB_OPEN_ONBOARDING, nullptr, HUB_NONE);
     }
 
-    // Section 1: Detected USB / ADB Devices
-    GdiPlusDraw::textLeft(g, "DETECTED DEVICES", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
-    y += 22;
+    // Reserve fixed footer heights: Wireless ADB (64dp) + Offline Studio (48dp)
+    int footerH = GdiPlusDraw::dp(116);
+    int listAvailH = (card.bottom - footerH) - (y + GdiPlusDraw::dp(20));
+    if (listAvailH < GdiPlusDraw::dp(58)) listAvailH = GdiPlusDraw::dp(58);
+
+    // Section 1: Detected USB / ADB Devices (F3: scrollable, NO 3-device limit!)
+    std::vector<AdbDeviceInfo> emptyDevs;
+    const std::vector<AdbDeviceInfo>& devices = hub.devices ? *hub.devices : emptyDevs;
+    char devHdr[64];
+    std::snprintf(devHdr, sizeof(devHdr), "DETECTED DEVICES (%zu)", devices.size());
+    GdiPlusDraw::textLeft(g, devHdr, static_cast<float>(x), static_cast<float>(y + GdiPlusDraw::dp(7)), 10.5f, true, Theme::TEXT_MUTED);
+    y += GdiPlusDraw::dp(20);
+
+    hubDeviceListRc_ = { x, y, x + w, y + listAvailH };
 
     if (devices.empty()) {
-        RECT rEmpty = { x, y, x + w, y + 66 };
-        GdiPlusDraw::roundedCard(g, rEmpty, 10.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
-        GdiPlusDraw::drawIcon(g, ICON_USB, static_cast<float>(x + 26), static_cast<float>(y + 33), 20.0f, Theme::TEXT_MUTED);
-        GdiPlusDraw::textLeft(g, "No Android devices detected yet", static_cast<float>(x + 50), static_cast<float>(y + 24), 13.0f, true, Theme::TEXT_PRIMARY);
-        GdiPlusDraw::textLeft(g, "Enable USB Debugging on your phone, plug in cable, and click Refresh.", static_cast<float>(x + 50), static_cast<float>(y + 44), 11.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 60));
-        y += 78;
+        RECT rEmpty = { x, y, x + w, y + (listAvailH < GdiPlusDraw::dp(62) ? listAvailH : GdiPlusDraw::dp(62)) };
+        GdiPlusDraw::roundedCard(g, rEmpty, GdiPlusDraw::dpf(9.0f), Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        int midY = (rEmpty.top + rEmpty.bottom) / 2;
+        GdiPlusDraw::drawIcon(g, ICON_USB, static_cast<float>(x + GdiPlusDraw::dp(24)), static_cast<float>(midY),
+                              GdiPlusDraw::dpf(18.0f), Theme::TEXT_MUTED);
+        GdiPlusDraw::textLeft(g, "Waiting for USB or Wireless ADB devices...",
+                              static_cast<float>(x + GdiPlusDraw::dp(46)), static_cast<float>(midY - GdiPlusDraw::dp(8)),
+                              12.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - GdiPlusDraw::dp(56)));
+        GdiPlusDraw::textLeft(g, "New devices appear automatically when plugged in.",
+                              static_cast<float>(x + GdiPlusDraw::dp(46)), static_cast<float>(midY + GdiPlusDraw::dp(9)),
+                              10.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - GdiPlusDraw::dp(56)));
     } else {
-        int shown = 0;
-        for (size_t i = 0; i < devices.size() && shown < 3; ++i, ++shown) {
-            const AdbDeviceInfo& d = devices[i];
-            bool ready = (d.state == "device");
-            RECT rDev = { x, y, x + w, y + 48 };
-            GdiPlusDraw::roundedCard(g, rDev, 10.0f, Theme::BG_CARD, ready ? Theme::BORDER_STRONG : Theme::ACCENT_AMBER, 1.0f);
-            GdiPlusDraw::drawIcon(g, d.wireless ? ICON_WIFI : ICON_USB, static_cast<float>(x + 22), static_cast<float>(y + 24), 16.0f,
-                                  ready ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER);
-            GdiPlusDraw::textLeft(g, d.model, static_cast<float>(x + 42), static_cast<float>(y + 17), 13.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 155));
-            std::string sub = d.serial + "  ·  " + (ready ? "Ready" : d.state);
-            GdiPlusDraw::textLeft(g, sub, static_cast<float>(x + 42), static_cast<float>(y + 34), 11.0f, false,
-                                  ready ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER, static_cast<float>(w - 155));
+        const int rowH = GdiPlusDraw::dp(46);
+        const int rowGap = GdiPlusDraw::dp(6);
+        const int totalH = static_cast<int>(devices.size()) * (rowH + rowGap) - rowGap;
+        hubDeviceMaxScrollY_ = (totalH > listAvailH) ? (totalH - listAvailH) : 0;
+        if (hubDeviceScrollY_ < 0) hubDeviceScrollY_ = 0;
+        if (hubDeviceScrollY_ > hubDeviceMaxScrollY_) hubDeviceScrollY_ = hubDeviceMaxScrollY_;
 
-            RECT rBtn = { rDev.right - 102, y + 9, rDev.right - 10, y + 39 };
-            bool hovB = ready && ptIn(rBtn, hoverX, hoverY);
-            GdiPlusDraw::roundedCard(g, rBtn, 8.0f,
+        const int sbW = (hubDeviceMaxScrollY_ > 0) ? GdiPlusDraw::dp(8) : 0;
+        Gdiplus::GraphicsState gSt = g.Save();
+        g.SetClip(Gdiplus::Rect(hubDeviceListRc_.left, hubDeviceListRc_.top,
+                                hubDeviceListRc_.right - hubDeviceListRc_.left,
+                                hubDeviceListRc_.bottom - hubDeviceListRc_.top));
+
+        for (size_t i = 0; i < devices.size(); ++i) {
+            const AdbDeviceInfo& d = devices[i];
+            int ry = y + static_cast<int>(i) * (rowH + rowGap) - hubDeviceScrollY_;
+            RECT rDev = { x, ry, x + w - sbW - (sbW > 0 ? GdiPlusDraw::dp(4) : 0), ry + rowH };
+            if (rDev.bottom <= hubDeviceListRc_.top || rDev.top >= hubDeviceListRc_.bottom) continue;
+
+            bool ready = (d.state == "device");
+            GdiPlusDraw::roundedCard(g, rDev, GdiPlusDraw::dpf(9.0f), Theme::BG_CARD,
+                                     ready ? Theme::BORDER_STRONG : Theme::ACCENT_AMBER, 1.0f);
+            GdiPlusDraw::drawIcon(g, d.wireless ? ICON_WIFI : ICON_USB,
+                                  static_cast<float>(rDev.left + GdiPlusDraw::dp(20)),
+                                  static_cast<float>(ry + rowH / 2),
+                                  GdiPlusDraw::dpf(15.0f), ready ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER);
+
+            std::string title = (d.model.empty() ? std::string("Android Device") : d.model) +
+                                (d.wireless ? "  [Wi-Fi]" : "  [USB]");
+            GdiPlusDraw::textLeft(g, title,
+                                  static_cast<float>(rDev.left + GdiPlusDraw::dp(38)),
+                                  static_cast<float>(ry + GdiPlusDraw::dp(15)),
+                                  12.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - GdiPlusDraw::dp(155)));
+            std::string sub = d.serial + "  ·  " + (ready ? "Ready" : d.state);
+            GdiPlusDraw::textLeft(g, sub,
+                                  static_cast<float>(rDev.left + GdiPlusDraw::dp(38)),
+                                  static_cast<float>(ry + GdiPlusDraw::dp(32)),
+                                  10.5f, false, ready ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER,
+                                  static_cast<float>(w - GdiPlusDraw::dp(155)));
+
+            RECT rBtn = { rDev.right - GdiPlusDraw::dp(96), ry + GdiPlusDraw::dp(8), rDev.right - GdiPlusDraw::dp(8), ry + rowH - GdiPlusDraw::dp(8) };
+            bool hovB = ready && ptIn(rBtn, hoverX, hoverY) && ptIn(hubDeviceListRc_, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, rBtn, GdiPlusDraw::dpf(7.0f),
                                      ready ? (hovB ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG) : Theme::BG_TRACK,
                                      ready ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.2f);
             GdiPlusDraw::textCenter(g, ready ? "LAUNCH" : "ALLOW USB",
                                     static_cast<float>(rBtn.left + rBtn.right) * 0.5f,
                                     static_cast<float>(rBtn.top + rBtn.bottom) * 0.5f,
-                                    11.5f, true, hovB ? 0xFF081018u : (ready ? Theme::TEXT_PRIMARY : Theme::TEXT_MUTED));
+                                    11.0f, true, hovB ? 0xFF081018u : (ready ? Theme::TEXT_PRIMARY : Theme::TEXT_MUTED));
             if (ready) {
-                hotspots_.push_back(HubHotspot{ rBtn, HUB_CONNECT_DEVICE, static_cast<int>(i) });
+                RECT hit = rBtn;
+                if (hit.top < hubDeviceListRc_.top) hit.top = hubDeviceListRc_.top;
+                if (hit.bottom > hubDeviceListRc_.bottom) hit.bottom = hubDeviceListRc_.bottom;
+                if (hit.bottom > hit.top) {
+                    hotspots_.push_back(HubHotspot{ hit, HUB_CONNECT_DEVICE, static_cast<int>(i) });
+                }
             }
-            y += 54;
+        }
+        g.Restore(gSt);
+
+        if (hubDeviceMaxScrollY_ > 0) {
+            RECT rTrack = { x + w - GdiPlusDraw::dp(6), hubDeviceListRc_.top, x + w, hubDeviceListRc_.bottom };
+            GdiPlusDraw::roundedCard(g, rTrack, GdiPlusDraw::dpf(3.0f), Theme::BG_TRACK, Theme::BG_TRACK, 0.0f);
+            int th = (listAvailH * listAvailH) / totalH;
+            if (th < GdiPlusDraw::dp(20)) th = GdiPlusDraw::dp(20);
+            int ty = hubDeviceListRc_.top + (hubDeviceScrollY_ * (listAvailH - th)) / hubDeviceMaxScrollY_;
+            RECT rThumb = { rTrack.left, ty, rTrack.right, ty + th };
+            GdiPlusDraw::roundedCard(g, rThumb, GdiPlusDraw::dpf(3.0f), Theme::BORDER_STRONG, Theme::BORDER_STRONG, 0.0f);
         }
     }
 
     // Section 2: Wireless ADB Quick Connect + Android 11+ QR Code Pairing
-    y += 6;
-    GdiPlusDraw::textLeft(g, "WIRELESS ADB (TCP/IP & ANDROID 11+ QR PAIRING)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
-    y += 22;
+    y = hubDeviceListRc_.bottom + GdiPlusDraw::dp(12);
+    GdiPlusDraw::textLeft(g, "WIRELESS ADB (TCP/IP & ANDROID 11+ QR PAIRING)", static_cast<float>(x), static_cast<float>(y + GdiPlusDraw::dp(7)), 10.5f, true, Theme::TEXT_MUTED);
+    y += GdiPlusDraw::dp(20);
 
-    RECT rInp = { x, y, x + w - 194, y + 34 };
-    GdiPlusDraw::roundedCard(g, rInp, 8.0f, Theme::BG_INPUT,
-                             editingWirelessAddr ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG,
-                             editingWirelessAddr ? 1.6f : 1.0f);
-    GdiPlusDraw::drawIcon(g, ICON_WIFI, static_cast<float>(rInp.left + 16), static_cast<float>(y + 17), 13.0f, Theme::TEXT_MUTED);
-    std::string dispAddr = wirelessAddr + (editingWirelessAddr ? "_" : "");
-    GdiPlusDraw::textLeft(g, dispAddr, static_cast<float>(rInp.left + 32), static_cast<float>(y + 17), 12.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(rInp.right - rInp.left - 36));
+    int btnConnW = GdiPlusDraw::dp(88);
+    int btnQrW = GdiPlusDraw::dp(84);
+    RECT rInp = { x, y, x + w - btnConnW - btnQrW - GdiPlusDraw::dp(12), y + GdiPlusDraw::dp(34) };
+    GdiPlusDraw::roundedCard(g, rInp, GdiPlusDraw::dpf(8.0f), Theme::BG_INPUT,
+                             hub.editingWirelessAddr ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG,
+                             hub.editingWirelessAddr ? 1.6f : 1.0f);
+    GdiPlusDraw::drawIcon(g, ICON_WIFI, static_cast<float>(rInp.left + GdiPlusDraw::dp(16)),
+                          static_cast<float>(y + GdiPlusDraw::dp(17)), GdiPlusDraw::dpf(13.0f), Theme::TEXT_MUTED);
+    std::string dispAddr = hub.wirelessAddr + (hub.editingWirelessAddr ? "_" : "");
+    GdiPlusDraw::textLeft(g, dispAddr, static_cast<float>(rInp.left + GdiPlusDraw::dp(32)),
+                          static_cast<float>(y + GdiPlusDraw::dp(17)), 12.0f, false, Theme::TEXT_PRIMARY,
+                          static_cast<float>(rInp.right - rInp.left - GdiPlusDraw::dp(36)));
     hotspots_.push_back(HubHotspot{ rInp, HUB_FOCUS_WIFI_ADDR, 0 });
 
-    RECT rWBtn = { rInp.right + 6, y, rInp.right + 96, y + 34 };
+    RECT rWBtn = { rInp.right + GdiPlusDraw::dp(6), y, rInp.right + GdiPlusDraw::dp(6) + btnConnW, y + GdiPlusDraw::dp(34) };
     bool hovW = ptIn(rWBtn, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rWBtn, 8.0f, hovW ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+    GdiPlusDraw::roundedCard(g, rWBtn, GdiPlusDraw::dpf(8.0f), hovW ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovW ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.0f);
-    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWBtn.left + rWBtn.right) * 0.5f, static_cast<float>(y + 17), 11.5f, true, Theme::ACCENT_CYAN);
+    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWBtn.left + rWBtn.right) * 0.5f,
+                            static_cast<float>(y + GdiPlusDraw::dp(17)), 11.0f, true, Theme::ACCENT_CYAN);
     hotspots_.push_back(HubHotspot{ rWBtn, HUB_CONNECT_WIFI, 0 });
 
-    RECT rQrBtn = { rWBtn.right + 6, y, x + w, y + 34 };
+    RECT rQrBtn = { rWBtn.right + GdiPlusDraw::dp(6), y, x + w, y + GdiPlusDraw::dp(34) };
     bool hovQr = ptIn(rQrBtn, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rQrBtn, 8.0f, hovQr ? Theme::ACCENT_PURPLE : Theme::ACCENT_PURPLE_BG,
+    GdiPlusDraw::roundedCard(g, rQrBtn, GdiPlusDraw::dpf(8.0f), hovQr ? Theme::ACCENT_PURPLE : Theme::ACCENT_PURPLE_BG,
                              Theme::ACCENT_PURPLE, 1.1f);
-    GdiPlusDraw::textCenter(g, "QR PAIR", static_cast<float>(rQrBtn.left + rQrBtn.right) * 0.5f, static_cast<float>(y + 17), 11.5f, true,
+    GdiPlusDraw::textCenter(g, "QR PAIR", static_cast<float>(rQrBtn.left + rQrBtn.right) * 0.5f,
+                            static_cast<float>(y + GdiPlusDraw::dp(17)), 11.0f, true,
                             hovQr ? 0xFFFFFFFFu : Theme::ACCENT_PURPLE);
     hotspots_.push_back(HubHotspot{ rQrBtn, HUB_TOGGLE_QR_PAIR, 0 });
 
     // Bottom Offline Keymap Studio Button
-    RECT rOff = { x, card.bottom - 52, x + w, card.bottom - 18 };
+    RECT rOff = { x, card.bottom - GdiPlusDraw::dp(48), x + w, card.bottom - GdiPlusDraw::dp(14) };
     bool hovOff = ptIn(rOff, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rOff, 8.0f, hovOff ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+    GdiPlusDraw::roundedCard(g, rOff, GdiPlusDraw::dpf(8.0f), hovOff ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovOff ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
     GdiPlusDraw::textCenter(g, "Open Offline Keymap Studio (Edit Configs Without Phone)",
                             static_cast<float>(rOff.left + rOff.right) * 0.5f,
                             static_cast<float>(rOff.top + rOff.bottom) * 0.5f,
-                            12.0f, true, Theme::TEXT_SECONDARY);
+                            11.5f, true, Theme::TEXT_SECONDARY);
     hotspots_.push_back(HubHotspot{ rOff, HUB_START_OFFLINE_STUDIO, 0 });
 }
 
@@ -689,10 +849,29 @@ HubClickResult ViewportHost::hitTestHub(int x, int y) const {
     return res;
 }
 
+bool ViewportHost::onHubMouseWheel(int x, int y, int delta) {
+    if (hubDeviceMaxScrollY_ <= 0 || !ptIn(hubDeviceListRc_, x, y)) return false;
+    int step = (delta > 0) ? -GdiPlusDraw::dp(36) : GdiPlusDraw::dp(36);
+    hubDeviceScrollY_ += step;
+    if (hubDeviceScrollY_ < 0) hubDeviceScrollY_ = 0;
+    if (hubDeviceScrollY_ > hubDeviceMaxScrollY_) hubDeviceScrollY_ = hubDeviceMaxScrollY_;
+    return true;
+}
+
 bool ViewportHost::hoverHubAt(int x, int y, int& outId, RECT& outRc) const {
     for (size_t i = 0; i < hotspots_.size(); ++i) {
         if (ptIn(hotspots_[i].rc, x, y)) {
             outId = (static_cast<int>(hotspots_[i].act) << 8) ^ (hotspots_[i].extra & 0xFF);
+            outRc = hotspots_[i].rc;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ViewportHost::rectForHubAction(HubActionType act, int extra, RECT& outRc) const {
+    for (size_t i = 0; i < hotspots_.size(); ++i) {
+        if (hotspots_[i].act == act && (extra == -1 || hotspots_[i].extra == extra)) {
             outRc = hotspots_[i].rc;
             return true;
         }

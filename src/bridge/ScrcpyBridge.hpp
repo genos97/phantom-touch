@@ -70,6 +70,7 @@ struct PhoneThermalInfo {
 };
 
 typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
+typedef void (*ConnectStepFn)(void* ctx, int step);
 typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
                               bool present, int64_t qpcPktRecv);
@@ -100,6 +101,7 @@ public:
     static std::vector<AdbDeviceInfo> parseAdbDevicesOutput(const std::string& raw);
     static std::vector<MdnsServiceInfo> parseMdnsServicesOutput(const std::string& raw);
     static std::string parseForegroundPackage(const std::string& dumpsysRaw);
+    static bool parseWindowSecureFlag(const std::string& dumpsysRaw);
     static int parseMajorVersion(const std::string& versionStr);
     static bool parseV4SessionHeader(const uint8_t hdr[12], uint32_t& outW, uint32_t& outH, bool& outClientResized);
     static size_t serializeResizeDisplay(uint8_t* buf, uint16_t width, uint16_t height);
@@ -126,6 +128,9 @@ public:
                         const std::string& deviceSerial = "", bool stayAwake = true);
     bool connectSession(const ToolPaths& tools, const BridgeStreamConfig& cfg,
                         std::string& outError, const std::string& deviceSerial = "");
+    bool reconnect(const ToolPaths& tools, const BridgeStreamConfig& cfg,
+                   bool useNativeVideo, int controlMaxSize,
+                   std::string& outError, const std::string& deviceSerial = "");
     void disconnect();
 
     bool isConnected() const { return connected_ != 0; }
@@ -151,9 +156,11 @@ public:
     bool setDisplayPower(bool on);
 
     void setClipboardCallback(DeviceClipboardFn fn, void* ctx);
+    void setConnectStepCallback(ConnectStepFn fn, void* ctx);
     void setVideoPacketCallback(VideoPacketFn fn, void* ctx);
 
     // Foreground app inspection & Drag-and-Drop file/APK helpers
+    bool queryForegroundInfo(std::string& outPackage, bool& outSecure);
     std::string queryForegroundPackage();
     bool installApk(const std::string& localApkPath, std::string& outMsg);
     bool pushFileToDownloads(const std::string& localFilePath, std::string& outMsg);
@@ -215,6 +222,8 @@ private:
     uint64_t clipSeq_ = 1;
     DeviceClipboardFn clipCb_ = nullptr;
     void* clipCbCtx_ = nullptr;
+    ConnectStepFn stepCb_ = nullptr;
+    void* stepCbCtx_ = nullptr;
     VideoPacketFn videoCb_ = nullptr;
     void* videoCbCtx_ = nullptr;
     bool virtualDisplayActive_ = false;

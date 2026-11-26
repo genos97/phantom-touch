@@ -26,6 +26,7 @@ enum DrawerActionId {
     DA_INSP_ACT_PREV,
     DA_INSP_ACT_NEXT,
     DA_INSP_SCOPE,
+    DA_INSP_TOGGLE_MODE,
     DA_INSP_RSTVIEW,
     DA_INSP_REJOY,
     DA_INSP_DELETE,
@@ -49,6 +50,15 @@ enum DrawerActionId {
     DA_REBIND_HOLD_UNLOCK,
     DA_CLEAR_HOLD_UNLOCK,
     DA_RESET_SENS,
+    DA_TOGGLE_ADVANCED,
+    DA_REBIND_RESET_TOUCH,
+    DA_REBIND_JOY_UP,
+    DA_REBIND_JOY_DOWN,
+    DA_REBIND_JOY_LEFT,
+    DA_REBIND_JOY_RIGHT,
+    DA_REBIND_JOY_SPRINT,
+    DA_REBIND_JOY_WALK,
+    DA_CLEAR_JOY_WALK,
 
     // Profiles tab
     DA_FOCUS_NEW_NAME,
@@ -85,11 +95,13 @@ enum DrawerActionId {
     DA_DISCONNECT,
     DA_RUN_LATENCY_PROBE,
     DA_FOCUS_WIRELESS,
-    DA_CONNECT_WIRELESS
+    DA_CONNECT_WIRELESS,
+    DA_OPEN_ONBOARDING
 };
 
 struct DrawerActionResult {
     bool profileModified = false;
+    bool tuningOnlyModified = false;
     bool settingsModified = false;
     bool requestSave = false;
     bool requestCloseDrawer = false;
@@ -110,6 +122,7 @@ struct DrawerActionResult {
     bool requestCalibrateAspect = false;
     bool requestRunLatencyProbe = false;
     bool vsyncToggled = false;
+    bool requestOpenOnboarding = false;
     std::string toastMessage;
 };
 
@@ -140,19 +153,21 @@ public:
         activeEncoder_ = activeEncoder;
         deviceEncoders_ = encoders;
     }
+    void setPendingStreamChanges(bool pending) { pendingStreamChanges_ = pending; }
 
     bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_; }
-    bool isWaitingSpecialRebind() const { return rebindingToggleAim_ || rebindingHoldUnlock_; }
-    bool isRebindingToggleAim() const { return rebindingToggleAim_; }
-    bool isRebindingHoldUnlock() const { return rebindingHoldUnlock_; }
+    bool isWaitingSpecialRebind() const { return specialRebind_ != SRB_NONE; }
+    bool isRebindingToggleAim() const { return specialRebind_ == SRB_TOGGLE_AIM; }
+    bool isRebindingHoldUnlock() const { return specialRebind_ == SRB_HOLD_UNLOCK; }
+    std::string specialRebindLabel() const;
     bool isDraggingSlider() const { return activeSliderId_ != 0; }
+    bool isAdvancedExpanded() const { return advancedExpanded_; }
 
     void clearFocus() {
         editingNewProfileName_ = false;
         editingNodeLabel_ = false;
         editingWireless_ = false;
-        rebindingToggleAim_ = false;
-        rebindingHoldUnlock_ = false;
+        specialRebind_ = SRB_NONE;
     }
 
     void paint(Gdiplus::Graphics& g, const RECT& bounds,
@@ -238,11 +253,25 @@ private:
     std::vector<ProfileEntry> profileEntries_;
     std::string newProfileName_ = "my_custom";
 
+    enum SpecialRebindTarget {
+        SRB_NONE = 0,
+        SRB_TOGGLE_AIM,
+        SRB_HOLD_UNLOCK,
+        SRB_RESET_TOUCH,
+        SRB_JOY_UP,
+        SRB_JOY_DOWN,
+        SRB_JOY_LEFT,
+        SRB_JOY_RIGHT,
+        SRB_JOY_SPRINT,
+        SRB_JOY_WALK
+    };
+
     bool editingNewProfileName_ = false;
     bool editingNodeLabel_ = false;
     bool editingWireless_ = false;
-    bool rebindingToggleAim_ = false;
-    bool rebindingHoldUnlock_ = false;
+    bool advancedExpanded_ = false;
+    bool pendingStreamChanges_ = false;
+    SpecialRebindTarget specialRebind_ = SRB_NONE;
 
     TelemetrySummary vidTelemetry_;
     ProbeResult probeResult_;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bridge/ConnectionState.hpp"
 #include "bridge/ScrcpyBridge.hpp"
 #include "config/AppSettings.hpp"
 #include "config/Profile.hpp"
@@ -7,6 +8,7 @@
 #include "engine/InputHookThread.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/HudOverlay.hpp"
+#include "ui/OnboardingView.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
@@ -37,6 +39,7 @@ public:
         autoProbeOnConnect_ = probeOnConnect;
         autoProbeSamples_ = probeSamples;
         autoFullscreen_ = startFullscreen;
+        if (autoProbeOnConnect_) showOnboarding_ = false;
     }
 
     bool create(HINSTANCE hInst);
@@ -64,6 +67,8 @@ private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static DWORD WINAPI startupToolsThreadProc(LPVOID param);
     static DWORD WINAPI refreshDevicesThreadProc(LPVOID param);
+    static DWORD WINAPI deviceMonitorThreadProc(LPVOID param);
+    static DWORD WINAPI repairToolsThreadProc(LPVOID param);
     static DWORD WINAPI connectThreadProc(LPVOID param);
     static DWORD WINAPI disconnectThreadProc(LPVOID param);
     static DWORD WINAPI legacyFallbackThreadProc(LPVOID param);
@@ -75,6 +80,7 @@ private:
     static DWORD WINAPI settingsSaveWorkerProc(LPVOID param);
     static DWORD WINAPI screenshotThreadProc(LPVOID param);
     static DWORD WINAPI probeThreadProc(LPVOID param);
+    static void onConnectStep(void* ctx, int step);
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
     static void onVideoPacket(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
@@ -106,13 +112,17 @@ private:
 
     void startAsyncConnect(const std::string& serial);
     void startAsyncWirelessConnect(const std::string& ipPort);
+    void startAsyncRepairTools();
     void startAsyncDropTransfer(const std::vector<std::string>& files);
     void startQrWirelessPairing();
     void stopQrWirelessPairing();
     void startRoundTripProbe(int numTrials = 60);
     void refreshAdbDevices();
-    void disconnectDevice(bool returnToHub);
+    void disconnectDevice(bool returnToHub, bool userInitiated = true);
     void takeScreenshot();
+    void applyOnboardingProfileChoice(OnboardingProfileChoice choice);
+    void finishOnboarding();
+    void buildHubViewState(HubViewState& out) const;
 
     void handleForegroundAppChanged(const std::string& pkg);
     bool switchProfilePath(const std::string& targetPath, bool showAutoToast);
@@ -210,8 +220,10 @@ private:
     AsyncContext* asyncCtx_ = nullptr;
     QrPairJob* activeQrJob_ = nullptr;
     HANDLE probeEvent_ = NULL;
+    HANDLE deviceMonitorWakeEvent_ = NULL;
     volatile LONG connecting_ = 0;
     volatile LONG refreshingDevices_ = 0;
+    volatile LONG repairingTools_ = 0;
     volatile LONG stopAuxThreads_ = 0;
     volatile LONG dropping_ = 0;
     volatile LONG probing_ = 0;
@@ -236,6 +248,8 @@ private:
 
     std::string activeAppPackage_;
     std::string pendingForegroundPkg_;
+    bool pendingSecureFlag_ = false;
+    bool secureAppDetected_ = false;
     std::string lastGameProfilePath_;
     std::string manualOverridePkg_;
     std::map<std::string, std::string> sessionAppProfiles_; // E5: session app -> profile memory
@@ -256,6 +270,7 @@ private:
     SideRail sideRail_;
     DrawerPanel drawerPanel_;
     ViewportHost viewportHost_;
+    OnboardingView onboardingView_;
     HudOverlay hudOverlay_;
 
     RECT topBarRc_;
@@ -356,6 +371,23 @@ private:
     std::string shellToastMsg_;
     DWORD shellToastExpireTick_ = 0;
     bool shellToastWasVisible_ = false;
+
+    // F1 / F3 / X2 / F16 Connection Manager, Onboarding & Pending-Stream State
+    bool showOnboarding_ = false;
+    std::string lastConnectedSerial_;
+    bool lastConnectedWireless_ = false;
+    bool userDisconnected_ = false;
+    bool reconnecting_ = false;
+    bool reconnectCancelled_ = false;
+    int reconnectAttempt_ = 0;
+    DWORD reconnectNextTick_ = 0;
+    int lastCountdownShown_ = -1;
+    volatile LONG connectStep_ = 0;
+    std::string lastConnectError_;
+    bool hasPendingDeviceChange_ = false;
+    DWORD deviceChangeDebounceTick_ = 0;
+    AppSettings appliedStreamSettings_;
+    bool hasAppliedStreamSettings_ = false;
 
     // Double-buffered shell GDI surface
     HDC cacheDC_ = NULL;

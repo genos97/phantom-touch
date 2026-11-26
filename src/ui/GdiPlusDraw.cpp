@@ -16,6 +16,7 @@ struct GdiFontCache {
     CRITICAL_SECTION lock;
     bool lockInit = false;
     bool active = false;
+    int warmedDpi = 0;
     Gdiplus::FontFamily* fam = nullptr;
     Gdiplus::StringFormat* fmtLeft = nullptr;
     Gdiplus::StringFormat* fmtCenter = nullptr;
@@ -79,8 +80,10 @@ struct GdiFontCache {
             fmtRight->SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
 
             active = true;
+        }
+        if (warmedDpi != g_activeDpi) {
             const float scale = (g_activeDpi > 0) ? (static_cast<float>(g_activeDpi) / 96.0f) : 1.0f;
-            static const float kSizes[] = { 8.5f, 10.0f, 10.5f, 11.0f, 11.5f, 12.0f, 12.5f, 13.0f, 15.0f, 18.0f };
+            static const float kSizes[] = { 8.5f, 9.5f, 10.0f, 10.5f, 11.0f, 11.5f, 12.0f, 12.5f, 13.0f, 14.0f, 15.0f, 17.5f, 18.0f };
             for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); ++i) {
                 const float scaled = kSizes[i] * scale;
                 getOrCreateFontLocked(scaled, false);
@@ -88,7 +91,7 @@ struct GdiFontCache {
             }
 
             // Use a BI_RGB 32-bit DIBSection + HDC so GDI+ actually initializes ClearType
-            // glyph caches (PixelFormat32bppPARGB silently disables ClearType until first Paint).
+            // glyph caches at the active DPI before the first WM_PAINT.
             HDC memDC = CreateCompatibleDC(NULL);
             if (memDC) {
                 BITMAPINFO bmi = {};
@@ -116,7 +119,7 @@ struct GdiFontCache {
                         g.FillPath(&fillBr, &path);
 
                         Gdiplus::SolidBrush br(Gdiplus::Color(255, 255, 255, 255));
-                        static const float kWarmTextSizes[] = { 11.5f, 13.0f };
+                        static const float kWarmTextSizes[] = { 10.5f, 11.5f, 12.5f, 17.5f };
                         for (size_t i = 0; i < sizeof(kWarmTextSizes) / sizeof(kWarmTextSizes[0]); ++i) {
                             const float sz = kWarmTextSizes[i] * scale;
                             Gdiplus::Font* reg = getOrCreateFontLocked(sz, false);
@@ -130,6 +133,7 @@ struct GdiFontCache {
                 }
                 DeleteDC(memDC);
             }
+            warmedDpi = g_activeDpi;
         }
         LeaveCriticalSection(&lock);
     }
@@ -138,6 +142,7 @@ struct GdiFontCache {
         if (!lockInit) return;
         EnterCriticalSection(&lock);
         active = false;
+        warmedDpi = 0;
         for (std::map<uint32_t, Gdiplus::Font*>::iterator it = fonts.begin(); it != fonts.end(); ++it) {
             delete it->second;
         }
@@ -289,11 +294,19 @@ void GdiPlusDraw::roundedCard(Gdiplus::Graphics& g, const RECT& rc, float r,
 
 void GdiPlusDraw::fillRect(Gdiplus::Graphics& g, const RECT& rc, uint32_t fillArgb) {
     Gdiplus::SolidBrush br(argb(fillArgb));
+    bool opaque = ((fillArgb >> 24) == 0xFFu);
+    Gdiplus::CompositingMode prev = g.GetCompositingMode();
+    if (opaque && prev != Gdiplus::CompositingModeSourceCopy) {
+        g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+    }
     g.FillRectangle(&br,
                     static_cast<INT>(rc.left),
                     static_cast<INT>(rc.top),
                     static_cast<INT>(rc.right - rc.left),
                     static_cast<INT>(rc.bottom - rc.top));
+    if (opaque && prev != Gdiplus::CompositingModeSourceCopy) {
+        g.SetCompositingMode(prev);
+    }
 }
 
 void GdiPlusDraw::hLine(Gdiplus::Graphics& g, int x1, int x2, int y, uint32_t argbColor) {

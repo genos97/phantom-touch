@@ -16,6 +16,18 @@
 #ifndef HTMAXBUTTON
 #define HTMAXBUTTON 9
 #endif
+#ifndef WM_DEVICECHANGE
+#define WM_DEVICECHANGE 0x0219
+#endif
+#ifndef DBT_DEVICEARRIVAL
+#define DBT_DEVICEARRIVAL 0x8000
+#endif
+#ifndef DBT_DEVICEREMOVECOMPLETE
+#define DBT_DEVICEREMOVECOMPLETE 0x8004
+#endif
+#ifndef DBT_DEVNODES_CHANGED
+#define DBT_DEVNODES_CHANGED 0x0007
+#endif
 
 namespace {
 
@@ -67,6 +79,7 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
       demoMode_(startDemo) {
     InitializeCriticalSection(&auxLock_);
     probeEvent_ = CreateEventW(NULL, FALSE, FALSE, NULL);
+    deviceMonitorWakeEvent_ = CreateEventW(NULL, FALSE, FALSE, NULL);
     viewportHost_.setProbeFrameEvent(probeEvent_);
     ZeroMemory(&topBarRc_, sizeof(topBarRc_));
     ZeroMemory(&railRc_, sizeof(railRc_));
@@ -112,16 +125,20 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
         }
     }
     lastAppliedScreenOff_ = settings_.turnScreenOff;
+    appliedStreamSettings_ = settings_;
+    showOnboarding_ = (!settings_.onboardingDone && !demoMode_ && !noMirror_);
     InterlockedExchange(&autoSwitchAtomic_, settings_.autoSwitchProfiles ? 1 : 0);
     InterlockedExchange(&gameProfileAtomic_, profile_.keymapEnabled ? 1 : 0);
     engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
+    bridge_->setConnectStepCallback(ShellWindow::onConnectStep, this);
 }
 
 ShellWindow::~ShellWindow() {
     InterlockedExchange(&stopAuxThreads_, 1);
     InterlockedExchange(&stopProbe_, 1);
+    if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
     stopQrWirelessPairing();
     if (asyncCtx_) {
         EnterCriticalSection(&asyncCtx_->lock);
@@ -130,6 +147,7 @@ ShellWindow::~ShellWindow() {
         LeaveCriticalSection(&asyncCtx_->lock);
     }
     bridge_->setClipboardCallback(nullptr, nullptr);
+    bridge_->setConnectStepCallback(nullptr, nullptr);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
     viewportHost_.setProbeFrameEvent(NULL);
     viewportHost_.setProbeSampleRect(false, 0.5f, 0.5f);
@@ -143,6 +161,10 @@ ShellWindow::~ShellWindow() {
     if (probeEvent_) {
         CloseHandle(probeEvent_);
         probeEvent_ = NULL;
+    }
+    if (deviceMonitorWakeEvent_) {
+        CloseHandle(deviceMonitorWakeEvent_);
+        deviceMonitorWakeEvent_ = NULL;
     }
     if (cacheDC_) {
         if (cacheOldBmp_) SelectObject(cacheDC_, cacheOldBmp_);
@@ -204,6 +226,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
 
     metrics_.dpi = GdiPlusDraw::queryWindowDpi(hwnd_);
     GdiPlusDraw::setActiveDpi(metrics_.dpi);
+    GdiPlusDraw::warmCache();
 
     EnterCriticalSection(&asyncCtx_->lock);
     asyncCtx_->hwnd = hwnd_;
@@ -226,22 +249,27 @@ bool ShellWindow::create(HINSTANCE hInst) {
     asyncCtx_->addRef();
     HANDLE hWatcher = CreateThread(NULL, 0, appWatcherThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
     if (hWatcher) CloseHandle(hWatcher);
+    asyncCtx_->addRef();
+    HANDLE hDevMon = CreateThread(NULL, 0, deviceMonitorThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hDevMon) CloseHandle(hDevMon);
+    else asyncCtx_->release();
+
+    if (demoMode_) {
+        drawerOpen_ = true;
+        drawerPanel_.setActiveTab(0);
+        setEditMode(true);
+        layoutChildren();
+        showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
+    } else {
+        hubStatusMsg_ = "Locating scrcpy / ADB tools...";
+        layoutChildren();
+        // N36: run scrcpy --version and initial ADB device discovery off the UI thread!
+        asyncCtx_->addRef();
+        HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+        if (hTools) CloseHandle(hTools);
+    }
 
     if (autoFullscreen_) {
-        if (demoMode_) {
-            drawerOpen_ = true;
-            drawerPanel_.setActiveTab(0);
-            setEditMode(true);
-            layoutChildren();
-            showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
-        } else {
-            hubStatusMsg_ = "Locating scrcpy / ADB tools...";
-            layoutChildren();
-            // N36: run scrcpy --version and initial ADB device discovery off the UI thread!
-            asyncCtx_->addRef();
-            HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
-            if (hTools) CloseHandle(hTools);
-        }
         toggleFullscreen();
     } else {
         if (settings_.maximized) {
@@ -250,21 +278,6 @@ bool ShellWindow::create(HINSTANCE hInst) {
             ShowWindow(hwnd_, SW_SHOW);
         }
         UpdateWindow(hwnd_);
-
-        if (demoMode_) {
-            drawerOpen_ = true;
-            drawerPanel_.setActiveTab(0);
-            setEditMode(true);
-            layoutChildren();
-            showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
-        } else {
-            hubStatusMsg_ = "Locating scrcpy / ADB tools...";
-            layoutChildren();
-            // N36: run scrcpy --version and initial ADB device discovery off the UI thread!
-            asyncCtx_->addRef();
-            HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
-            if (hTools) CloseHandle(hTools);
-        }
     }
     syncInputHookSnapshot();
     return true;
@@ -292,6 +305,7 @@ void ShellWindow::syncInputHookSnapshot() {
     s.editMode = editMode_;
     s.nativeVideoActive = viewportHost_.isNativeVideoActive();
     s.uiCapturingText = editingHubWireless_ ||
+                        (showOnboarding_ && onboardingView_.isEditingWifi()) ||
                         (drawerOpen_ && (drawerPanel_.isTypingText() || drawerPanel_.isWaitingSpecialRebind())) ||
                         (hudOverlay_.rebindTarget() != HUD_REBIND_NONE);
     s.waitingSpecialRebind = (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind());
@@ -474,7 +488,15 @@ void ShellWindow::syncHudAndVideo() {
         viewportHost_.updateVideoLayout(1920, 1080);
     }
 
-    bool showHud = !minimized && (connected || demoMode_);
+    if (viewportHost_.hwnd() && IsWindow(viewportHost_.hwnd())) {
+        if (showOnboarding_) {
+            if (IsWindowVisible(viewportHost_.hwnd())) ShowWindow(viewportHost_.hwnd(), SW_HIDE);
+        } else if (viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded()) {
+            if (!IsWindowVisible(viewportHost_.hwnd())) ShowWindow(viewportHost_.hwnd(), SW_SHOWNA);
+        }
+    }
+
+    bool showHud = !minimized && !showOnboarding_ && (connected || demoMode_);
     RECT vidScr = viewportHost_.activeVideoScreenRect();
     hudOverlay_.syncBounds(vidScr, showHud);
     if (aimMode_ && showHud) {
@@ -577,6 +599,211 @@ DWORD WINAPI ShellWindow::refreshDevicesThreadProc(LPVOID param) {
     }
     delete job;
     return 0;
+}
+
+DWORD WINAPI ShellWindow::deviceMonitorThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
+    std::vector<AdbDeviceInfo> lastDevs;
+    bool haveSnapshot = false;
+
+    while (!self->stopAuxThreads_ && job->ctx->alive) {
+        DWORD waitRes = WAIT_TIMEOUT;
+        if (self->deviceMonitorWakeEvent_) {
+            waitRes = WaitForSingleObject(self->deviceMonitorWakeEvent_, 2000);
+        } else {
+            Sleep(2000);
+        }
+        if (self->stopAuxThreads_ || !job->ctx->alive) break;
+
+        if (!self->toolsReady_ || self->bridge_->isConnected() || self->connecting_ ||
+            self->demoMode_ || self->repairingTools_) {
+            continue;
+        }
+        if (InterlockedCompareExchange(&self->refreshingDevices_, 1, 0) != 0) {
+            continue;
+        }
+
+        std::vector<AdbDeviceInfo> devs;
+        bool ok = self->bridge_->listDevices(self->tools_, devs);
+        bool changed = !haveSnapshot || (devs.size() != lastDevs.size());
+        if (!changed) {
+            for (size_t i = 0; i < devs.size(); ++i) {
+                if (devs[i].serial != lastDevs[i].serial ||
+                    devs[i].state != lastDevs[i].state ||
+                    devs[i].model != lastDevs[i].model) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed || waitRes == WAIT_OBJECT_0 || self->reconnecting_) {
+            lastDevs = devs;
+            haveSnapshot = true;
+            EnterCriticalSection(&self->auxLock_);
+            self->pendingAdbDevices_ = devs;
+            self->pendingDevicesRefreshOk_ = ok;
+            LeaveCriticalSection(&self->auxLock_);
+            job->ctx->postMsg(MSG_DEVICES_REFRESHED, 0, 0);
+        }
+        InterlockedExchange(&self->refreshingDevices_, 0);
+    }
+
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+DWORD WINAPI ShellWindow::repairToolsThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (job && job->ctx) {
+        ShellWindow* self = job->shell;
+        std::string scriptPath = self->exeDir_ + "\\setup_scrcpy.ps1";
+        if (GetFileAttributesA(scriptPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::string cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + scriptPath + "\"";
+            std::wstring wcmd(cmd.begin(), cmd.end());
+            std::vector<wchar_t> buf(wcmd.begin(), wcmd.end());
+            buf.push_back(L'\0');
+            STARTUPINFOW si;
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION pi;
+            ZeroMemory(&pi, sizeof(pi));
+            if (CreateProcessW(NULL, buf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 120000);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+        }
+
+        ToolPaths tools;
+        std::string err;
+        bool ok = self->bridge_->locateTools(tools, err);
+        std::vector<AdbDeviceInfo> devs;
+        if (ok) {
+            self->bridge_->listDevices(tools, devs);
+        }
+        EnterCriticalSection(&self->auxLock_);
+        self->pendingTools_ = tools;
+        self->pendingToolsErr_ = err;
+        self->pendingToolsOk_ = ok;
+        self->pendingAdbDevices_ = devs;
+        LeaveCriticalSection(&self->auxLock_);
+        InterlockedExchange(&self->repairingTools_, 0);
+        job->ctx->postMsg(MSG_REPAIR_TOOLS_DONE, 0, 0);
+        job->ctx->release();
+    }
+    delete job;
+    return 0;
+}
+
+void ShellWindow::onConnectStep(void* ctx, int step) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self) return;
+    InterlockedExchange(&self->connectStep_, step);
+    if (self->asyncCtx_) {
+        self->asyncCtx_->postMsg(MSG_CONNECT_STEP, static_cast<WPARAM>(step), 0);
+    }
+}
+
+void ShellWindow::startAsyncRepairTools() {
+    if (InterlockedCompareExchange(&repairingTools_, 1, 0) != 0) return;
+    hubStatusMsg_ = "Running phone tools setup (setup_scrcpy.ps1)...";
+    asyncCtx_->addRef();
+    HANDLE hRep = CreateThread(NULL, 0, repairToolsThreadProc,
+                               new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hRep) CloseHandle(hRep);
+    else {
+        InterlockedExchange(&repairingTools_, 0);
+        asyncCtx_->release();
+    }
+    invalidateShell();
+}
+
+void ShellWindow::applyOnboardingProfileChoice(OnboardingProfileChoice choice) {
+    if (choice == OB_PROF_CONTROLLER) {
+        settings_.gamepadEnabled = true;
+        engine_->setGamepadEnabled(true);
+        scheduleSettingsSave();
+        std::string deskPath = ensureDesktopProfileExists();
+        switchProfilePath(deskPath, false);
+        showToast("Starter set: Controller + Desktop Typing", 2200);
+    } else if (choice == OB_PROF_GAMING) {
+        std::string starterPath = profilesDir_ + "\\freefire.cfg";
+        if (GetFileAttributesA(starterPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            Profile p = ProfileDefaults::createFreeFire();
+            p.name = "Game Keymap Starter";
+            ProfileStore::save(starterPath, p);
+        }
+        switchProfilePath(starterPath, false);
+        showToast("Starter set: Game Keymap (" + profile_.name + ")", 2200);
+    } else {
+        std::string deskPath = ensureDesktopProfileExists();
+        switchProfilePath(deskPath, false);
+        showToast("Starter set: Desktop (Typing)", 2200);
+    }
+}
+
+void ShellWindow::finishOnboarding() {
+    showOnboarding_ = false;
+    onboardingView_.clearFocus();
+    settings_.onboardingDone = true;
+    saveSettingsNow();
+    layoutChildren();
+    syncInputHookSnapshot();
+    invalidateShell();
+}
+
+void ShellWindow::buildHubViewState(HubViewState& out) const {
+    out = HubViewState();
+    int readyCnt = 0;
+    int unauthCnt = 0;
+    for (size_t i = 0; i < adbDevices_.size(); ++i) {
+        if (adbDevices_[i].state == "device") ++readyCnt;
+        else if (adbDevices_[i].state == "unauthorized") ++unauthCnt;
+    }
+
+    ConnStateInput ci;
+    ci.toolsReady = toolsReady_;
+    ci.streaming = bridge_->isConnected();
+    ci.connecting = (connecting_ != 0);
+    ci.reconnecting = reconnecting_;
+    ci.reconnectCancelled = reconnectCancelled_;
+    ci.reconnectAttempt = reconnectAttempt_;
+    ci.maxReconnectAttempts = 5;
+    ci.hasError = !lastConnectError_.empty();
+    ci.readyDeviceCount = readyCnt;
+    ci.unauthorizedDeviceCount = unauthCnt;
+
+    out.connState = ConnectionStateMachine::evaluate(ci);
+    int cs = static_cast<int>(connectStep_);
+    if (cs < 0) cs = 0;
+    if (cs > 2) cs = 2;
+    out.connectStep = static_cast<ConnectProgressStep>(cs);
+
+    DWORD nowTick = GetTickCount();
+    int remMs = (nowTick < reconnectNextTick_) ? static_cast<int>(reconnectNextTick_ - nowTick) : 0;
+    out.reconnectCountdownSec = (remMs + 999) / 1000;
+    if (out.reconnectCountdownSec < 1 && out.connState == CONN_RECONNECTING) out.reconnectCountdownSec = 1;
+    out.reconnectAttempt = reconnectAttempt_;
+    out.maxReconnectAttempts = 5;
+    out.statusMsg = !lastConnectError_.empty() ? lastConnectError_ : hubStatusMsg_;
+    out.errorDetails = lastConnectError_;
+    out.secureAppBlocked = secureAppDetected_;
+    out.devices = &adbDevices_;
+    out.wirelessAddr = settings_.lastWirelessAddr;
+    out.editingWirelessAddr = editingHubWireless_;
+    out.showingQrPair = showingQrPair_;
+    out.qrMatrix = &qrMatrix_;
+    EnterCriticalSection(&auxLock_);
+    out.qrStatus = qrPairStatus_;
+    LeaveCriticalSection(&auxLock_);
 }
 
 void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
@@ -901,6 +1128,9 @@ void ShellWindow::startAsyncConnect(const std::string& serial) {
     demoMode_ = false;
     sawEmbeddedMirror_ = false;
     nativeVideoSession_ = false;
+    userDisconnected_ = false;
+    lastConnectError_.clear();
+    InterlockedExchange(&connectStep_, 0);
     pendingSerial_ = serial;
 
     hubStatusMsg_ = settings_.virtualDisplayMode
@@ -1056,7 +1286,7 @@ void ShellWindow::stopQrWirelessPairing() {
     showingQrPair_ = false;
 }
 
-void ShellWindow::disconnectDevice(bool returnToHub) {
+void ShellWindow::disconnectDevice(bool returnToHub, bool userInitiated) {
     InterlockedExchange(&stopProbe_, 1);
     hudOverlay_.cancelRebind();
     drawerPanel_.clearFocus();
@@ -1069,10 +1299,18 @@ void ShellWindow::disconnectDevice(bool returnToHub) {
     sawEmbeddedMirror_ = false;
     nativeVideoSession_ = false;
     d3dHudDragging_ = false;
+    secureAppDetected_ = false;
+    userDisconnected_ = userInitiated;
+    if (userInitiated) {
+        reconnecting_ = false;
+        reconnectCancelled_ = false;
+        reconnectAttempt_ = 0;
+        lastConnectError_.clear();
+    }
     if (returnToHub) {
         demoMode_ = false;
         setEditMode(false);
-        hubStatusMsg_ = "Disconnecting...";
+        hubStatusMsg_ = userInitiated ? "Disconnected." : "Connection interrupted.";
     }
     layoutChildren();
     syncInputHookSnapshot();
@@ -1415,22 +1653,28 @@ DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
     }
     ShellWindow* self = job->shell;
     std::string lastPkg;
+    bool lastSecure = false;
     int pollCycle = 0;
     while (!self->stopAuxThreads_ && job->ctx->alive) {
         bool connected = self->bridge_->isConnected();
-        bool autoSw = (self->autoSwitchAtomic_ != 0);
         bool inAim = (self->aimModeAtomic_ != 0);
-        if (connected && autoSw && !inAim) {
-            std::string pkg = self->bridge_->queryForegroundPackage();
-            if (!pkg.empty() && pkg != lastPkg && !self->stopAuxThreads_ && job->ctx->alive) {
-                lastPkg = pkg;
+        if (connected && !inAim) {
+            std::string pkg;
+            bool sec = false;
+            self->bridge_->queryForegroundInfo(pkg, sec);
+            bool changed = (!pkg.empty() && pkg != lastPkg) || (sec != lastSecure);
+            if (changed && !self->stopAuxThreads_ && job->ctx->alive) {
+                if (!pkg.empty()) lastPkg = pkg;
+                lastSecure = sec;
                 EnterCriticalSection(&self->auxLock_);
                 self->pendingForegroundPkg_ = pkg;
+                self->pendingSecureFlag_ = sec;
                 LeaveCriticalSection(&self->auxLock_);
                 job->ctx->postMsg(MSG_FOREGROUND_APP, 0, 0);
             }
         } else if (!connected) {
             lastPkg.clear();
+            lastSecure = false;
         }
         // LATENCY 2.5: refresh battery temp & thermal status every ~10s off the UI thread
         if (connected && !inAim && (++pollCycle % 3) == 0 && !self->stopAuxThreads_ && job->ctx->alive) {
@@ -1932,9 +2176,7 @@ void ShellWindow::triggerQuickReset() {
 // --- IHudOverlayHost callbacks ---
 
 std::string ShellWindow::hudSpecialRebindLabel() const {
-    if (drawerPanel_.isRebindingToggleAim()) return "AIM LOCK / UNLOCK";
-    if (drawerPanel_.isRebindingHoldUnlock()) return "HOLD-TO-UNLOCK CURSOR";
-    return "KEY";
+    return drawerPanel_.specialRebindLabel();
 }
 
 void ShellWindow::hudOnSelectionChanged(int newSelectedIdx) {
@@ -1984,7 +2226,9 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     if (res.cancelRebind) {
         hudOverlay_.cancelRebind();
     }
-    if (res.profileModified) {
+    if (res.tuningOnlyModified && !res.profileModified) {
+        applyTuningToEngine();
+    } else if (res.profileModified) {
         applyProfileToEngine(!drawerPanel_.isDraggingSlider());
     }
     if (res.settingsModified) {
@@ -2084,6 +2328,12 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
     if (res.requestConnectWireless) {
         startAsyncWirelessConnect(res.wirelessAddr);
     }
+    if (res.requestOpenOnboarding) {
+        setDrawerState(false, drawerPanel_.activeTab());
+        showOnboarding_ = true;
+        onboardingView_.setStep(toolsReady_ ? OB_STEP_PREPARE : OB_STEP_TOOLS);
+        syncHudAndVideo();
+    }
 
     // N32: ONLY KEYS tab (0) enters Edit Mode; SENS/PROFILES/DEVICE stay playable!
     bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && (bridge_->isConnected() || demoMode_));
@@ -2103,6 +2353,17 @@ void ShellWindow::handleTopBarAction(TopBarAction act) {
             else setDrawerState(true, 2);
             break;
         case TB_TOGGLE_AIM: setAimMode(!aimMode_); break;
+        case TB_OPEN_HELP:
+            if (showOnboarding_) {
+                finishOnboarding();
+            } else {
+                if (drawerOpen_) setDrawerState(false, drawerPanel_.activeTab());
+                showOnboarding_ = true;
+                onboardingView_.setStep(toolsReady_ ? (bridge_->isConnected() ? OB_STEP_PROFILE : OB_STEP_PREPARE) : OB_STEP_TOOLS);
+                syncHudAndVideo();
+                invalidateShell();
+            }
+            break;
         case TB_TOGGLE_PIN: toggleAlwaysOnTop(); break;
         case TB_MINIMIZE:   ShowWindow(hwnd_, SW_MINIMIZE); break;
         case TB_MAXIMIZE:
@@ -2354,6 +2615,23 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             showToast("Injected 300ms video stall test", 1400);
             return 0;
 
+        case WM_DEVICECHANGE: {
+            if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE ||
+                wParam == DBT_DEVNODES_CHANGED) {
+                deviceChangeDebounceTick_ = GetTickCount() + 350;
+                hasPendingDeviceChange_ = true;
+            }
+            return TRUE;
+        }
+
+        case MSG_CONNECT_STEP: {
+            if (!bridge_->isConnected() && !fullscreen_) {
+                InvalidateRect(hwnd, &viewportRc_, FALSE);
+            }
+            return 0;
+        }
+
+        case MSG_REPAIR_TOOLS_DONE:
         case MSG_TOOLS_READY: {
             EnterCriticalSection(&auxLock_);
             toolsReady_ = pendingToolsOk_;
@@ -2372,11 +2650,24 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
                 } else {
                     hubStatusMsg_.clear();
-                    for (size_t i = 0; i < adbDevices_.size(); ++i) {
-                        if (adbDevices_[i].state == "device") {
-                            startAsyncConnect(adbDevices_[i].serial);
-                            break;
-                        }
+                }
+                if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
+            }
+
+            if (showOnboarding_) {
+                bool hasAuth = false;
+                bool hasUnauth = false;
+                for (size_t i = 0; i < adbDevices_.size(); ++i) {
+                    if (adbDevices_[i].state == "device") hasAuth = true;
+                    else if (adbDevices_[i].state == "unauthorized") hasUnauth = true;
+                }
+                onboardingView_.setStep(OnboardingView::computeRecommendedStep(
+                    onboardingView_.step(), toolsReady_, bridge_->isConnected(), hasAuth, hasUnauth));
+            } else if (toolsReady_ && msg == MSG_TOOLS_READY && !adbDevices_.empty()) {
+                for (size_t i = 0; i < adbDevices_.size(); ++i) {
+                    if (adbDevices_[i].state == "device") {
+                        startAsyncConnect(adbDevices_[i].serial);
+                        break;
                     }
                 }
             }
@@ -2387,8 +2678,26 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             EnterCriticalSection(&auxLock_);
             adbDevices_ = pendingAdbDevices_;
             LeaveCriticalSection(&auxLock_);
+            if (showOnboarding_) {
+                bool hasAuth = false;
+                bool hasUnauth = false;
+                for (size_t i = 0; i < adbDevices_.size(); ++i) {
+                    if (adbDevices_[i].state == "device") hasAuth = true;
+                    else if (adbDevices_[i].state == "unauthorized") hasUnauth = true;
+                }
+                onboardingView_.setStep(OnboardingView::computeRecommendedStep(
+                    onboardingView_.step(), toolsReady_, bridge_->isConnected(), hasAuth, hasUnauth));
+            }
             if (!bridge_->isConnected() && !connecting_) {
-                if (adbDevices_.empty()) {
+                if (reconnecting_ && !reconnectCancelled_ && !lastConnectedWireless_ && !lastConnectedSerial_.empty()) {
+                    for (size_t i = 0; i < adbDevices_.size(); ++i) {
+                        if (adbDevices_[i].serial == lastConnectedSerial_ && adbDevices_[i].state == "device") {
+                            lastConnectError_.clear();
+                            startAsyncConnect(lastConnectedSerial_);
+                            break;
+                        }
+                    }
+                } else if (adbDevices_.empty()) {
                     hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
                 } else {
                     hubStatusMsg_.clear();
@@ -2446,6 +2755,32 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         case MSG_CONNECT_DONE: {
             hubStatusMsg_ = asyncResultOk_ ? "" : asyncResultMsg_;
+            if (asyncResultOk_) {
+                lastConnectError_.clear();
+                lastConnectedSerial_ = bridge_->activeSerial();
+                lastConnectedWireless_ = (lastConnectedSerial_.find(':') != std::string::npos);
+                reconnecting_ = false;
+                reconnectCancelled_ = false;
+                reconnectAttempt_ = 0;
+                userDisconnected_ = false;
+                secureAppDetected_ = false;
+                appliedStreamSettings_ = settings_;
+                hasAppliedStreamSettings_ = true;
+                if (showOnboarding_ && onboardingView_.step() <= OB_STEP_CONNECT) {
+                    onboardingView_.setStep(OB_STEP_PROFILE);
+                }
+            } else {
+                lastConnectError_ = asyncResultMsg_;
+                if (reconnecting_ && !reconnectCancelled_) {
+                    ++reconnectAttempt_;
+                    if (reconnectAttempt_ > 5) {
+                        reconnecting_ = false;
+                        hubStatusMsg_ = "Connection lost after 5 retries.";
+                    } else {
+                        reconnectNextTick_ = GetTickCount() + static_cast<DWORD>(ConnectionStateMachine::backoffMs(reconnectAttempt_ - 1));
+                    }
+                }
+            }
             std::string discSer, discEnc;
             EnterCriticalSection(&auxLock_);
             discSer = pendingDiscoveredSerial_;
@@ -2556,10 +2891,23 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         case MSG_FOREGROUND_APP: {
             std::string pkg;
+            bool sec = false;
             EnterCriticalSection(&auxLock_);
             pkg = pendingForegroundPkg_;
+            sec = pendingSecureFlag_;
             LeaveCriticalSection(&auxLock_);
-            handleForegroundAppChanged(pkg);
+            bool secRising = (sec && !secureAppDetected_);
+            secureAppDetected_ = sec;
+            if (secRising) {
+                showToast("This app blocks screen capture.", 4500);
+            }
+            if (!pkg.empty() && settings_.autoSwitchProfiles) {
+                handleForegroundAppChanged(pkg);
+            }
+            if (secRising || !pkg.empty()) {
+                lastTopBarSig_.valid = false;
+                InvalidateRect(hwnd, &topBarRc_, FALSE);
+            }
             return 0;
         }
         case MSG_DROP_TOAST: {
@@ -2627,16 +2975,68 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 }
                 hadForeground_ = fg;
 
-                // Detect if embedded phone mirror disconnected externally (e.g. cable unplugged)
+                // F3: debounced WM_DEVICECHANGE wake
+                DWORD nowTick = GetTickCount();
+                if (hasPendingDeviceChange_ && static_cast<LONG>(nowTick - deviceChangeDebounceTick_) >= 0) {
+                    hasPendingDeviceChange_ = false;
+                    if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
+                }
+
+                // F3 / X2: Detect unexpected drop -> enter exponential backoff auto-reconnect
                 if (sawEmbeddedMirror_ && !bridge_->isConnected() && !connecting_) {
-                    disconnectDevice(true);
-                    hubStatusMsg_ = "Phone disconnected. Reconnect USB cable and click Refresh.";
+                    bool unexpected = (!userDisconnected_ && !lastConnectedSerial_.empty());
+                    disconnectDevice(true, !unexpected);
+                    if (unexpected) {
+                        reconnecting_ = true;
+                        reconnectCancelled_ = false;
+                        reconnectAttempt_ = 1;
+                        reconnectNextTick_ = nowTick + static_cast<DWORD>(ConnectionStateMachine::backoffMs(0));
+                        lastCountdownShown_ = -1;
+                        hubStatusMsg_ = "Connection interrupted. Auto-reconnecting...";
+                        if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
+                    } else {
+                        hubStatusMsg_ = "Phone disconnected. Reconnect USB cable or pick a device.";
+                    }
+                }
+
+                // F3: Countdown refresh & backoff retry tick
+                if (reconnecting_ && !reconnectCancelled_ && !connecting_ && !bridge_->isConnected()) {
+                    int remSec = (nowTick < reconnectNextTick_)
+                        ? static_cast<int>((reconnectNextTick_ - nowTick + 999) / 1000) : 0;
+                    if (remSec != lastCountdownShown_) {
+                        lastCountdownShown_ = remSec;
+                        InvalidateRect(hwnd, &viewportRc_, FALSE);
+                    }
+                    if (static_cast<LONG>(nowTick - reconnectNextTick_) >= 0) {
+                        if (reconnectAttempt_ > 5) {
+                            reconnecting_ = false;
+                            hubStatusMsg_ = "Connection lost after 5 reconnect attempts.";
+                            invalidateShell();
+                        } else if (lastConnectedWireless_) {
+                            ++reconnectAttempt_;
+                            reconnectNextTick_ = nowTick + static_cast<DWORD>(ConnectionStateMachine::backoffMs(reconnectAttempt_ - 1));
+                            startAsyncWirelessConnect(lastConnectedSerial_);
+                        } else {
+                            bool foundReady = false;
+                            for (size_t di = 0; di < adbDevices_.size(); ++di) {
+                                if (adbDevices_[di].serial == lastConnectedSerial_ && adbDevices_[di].state == "device") {
+                                    foundReady = true;
+                                    break;
+                                }
+                            }
+                            if (foundReady) {
+                                startAsyncConnect(lastConnectedSerial_);
+                            } else {
+                                ++reconnectAttempt_;
+                                reconnectNextTick_ = nowTick + static_cast<DWORD>(ConnectionStateMachine::backoffMs(reconnectAttempt_ - 1));
+                                if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
+                            }
+                        }
+                    }
                 }
 
                 syncHudAndVideo();
                 hudOverlay_.checkToastExpired();
-
-                DWORD nowTick = GetTickCount();
                 if (shellToastWasVisible_ && static_cast<LONG>(nowTick - shellToastExpireTick_) >= 0) {
                     shellToastWasVisible_ = false;
                     shellToastMsg_.clear();
@@ -2800,6 +3200,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (sideRail_.hoverItemAt(mx, my, curId, curRc)) curRegion = 2;
             } else if (!fullscreen_ && drawerOpen_ && ptIn(drawerRc_, mx, my)) {
                 if (drawerPanel_.hoverItemAt(mx, my, curId, curRc)) curRegion = 3;
+            } else if (showOnboarding_ && ptIn(viewportRc_, mx, my)) {
+                if (onboardingView_.hoverItemAt(mx, my, curId, curRc)) curRegion = 5;
             } else if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
                 if (viewportHost_.hoverHubAt(mx, my, curId, curRc)) curRegion = 4;
             }
@@ -2935,7 +3337,12 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             if (GetCapture() == hwnd) ReleaseCapture();
             if (drawerOpen_ && drawerPanel_.onMouseUp()) {
-                applyProfileToEngine(true);
+                if (drawerPanel_.activeTab() == 1) {
+                    applyTuningToEngine();
+                    saveCurrentProfile(true);
+                } else {
+                    applyProfileToEngine(true);
+                }
             }
             return 0;
         }
@@ -3000,6 +3407,11 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 invalidateShell();
                 return 0;
             }
+            if (!showOnboarding_ && !bridge_->isConnected() && !demoMode_ &&
+                viewportHost_.onHubMouseWheel(pt.x, pt.y, delta)) {
+                InvalidateRect(hwnd, &viewportRc_, FALSE);
+                return 0;
+            }
             if (!editMode_ && !aimMode_ && bridge_->isConnected()) {
                 float nx = 0.0f, ny = 0.0f;
                 if (mapShellClientToVideoNorm(pt.x, pt.y, nx, ny, true)) {
@@ -3019,6 +3431,18 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
             int vk = static_cast<int>(wParam);
+            if (showOnboarding_ && onboardingView_.isEditingWifi()) {
+                OnboardingClickResult obRes;
+                if (onboardingView_.onKeyDown(vk, settings_.lastWirelessAddr, obRes)) {
+                    scheduleSettingsSave();
+                    if (obRes.action == OB_ACT_CONNECT_WIFI) {
+                        startAsyncWirelessConnect(settings_.lastWirelessAddr);
+                    }
+                    syncInputHookSnapshot();
+                    invalidateShell();
+                    return 0;
+                }
+            }
             if (editingHubWireless_) {
                 if (vk == VK_RETURN) {
                     editingHubWireless_ = false;
@@ -3056,6 +3480,13 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         case WM_CHAR: {
             wchar_t ch = static_cast<wchar_t>(wParam);
+            if (showOnboarding_ && onboardingView_.isEditingWifi() && ch <= 126) {
+                if (onboardingView_.onChar(static_cast<char>(ch), settings_.lastWirelessAddr)) {
+                    scheduleSettingsSave();
+                    invalidateShell();
+                    return 0;
+                }
+            }
             if (editingHubWireless_ && ch >= 32 && ch <= 126) {
                 if (settings_.lastWirelessAddr.size() < 28) {
                     settings_.lastWirelessAddr.push_back(static_cast<char>(ch));
@@ -3124,6 +3555,7 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_CLOSE:
             InterlockedExchange(&stopAuxThreads_, 1);
             InterlockedExchange(&stopProbe_, 1);
+            if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
             flushOnExit();
             DestroyWindow(hwnd);
             return 0;
@@ -3131,6 +3563,7 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_DESTROY:
             InterlockedExchange(&stopAuxThreads_, 1);
             InterlockedExchange(&stopProbe_, 1);
+            if (deviceMonitorWakeEvent_) SetEvent(deviceMonitorWakeEvent_);
             if (asyncCtx_) {
                 EnterCriticalSection(&asyncCtx_->lock);
                 InterlockedExchange(&asyncCtx_->alive, 0);
@@ -3202,24 +3635,95 @@ void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
             return;
         }
     }
-    // 6. Device Hub inside ViewportHost (when disconnected)
+    // 6. Onboarding Wizard OR Device Hub inside ViewportHost
+    if (showOnboarding_ && !demoMode_ && ptIn(viewportRc_, mx, my)) {
+        OnboardingClickResult ob;
+        if (onboardingView_.onMouseDown(mx, my, ob)) {
+            if (ob.action == OB_ACT_SKIP || ob.action == OB_ACT_FINISH) {
+                finishOnboarding();
+                return;
+            }
+            if (ob.action == OB_ACT_REPAIR_TOOLS) {
+                startAsyncRepairTools();
+            } else if (ob.action == OB_ACT_RECHECK_TOOLS) {
+                if (toolsReady_) refreshAdbDevices();
+                else startAsyncRepairTools();
+            } else if (ob.action == OB_ACT_CONNECT_DEVICE && ob.index >= 0 &&
+                       ob.index < static_cast<int>(adbDevices_.size())) {
+                startAsyncConnect(adbDevices_[ob.index].serial);
+            } else if (ob.action == OB_ACT_CONNECT_WIFI) {
+                startAsyncWirelessConnect(settings_.lastWirelessAddr);
+            } else if (ob.action == OB_ACT_TOGGLE_QR) {
+                if (showingQrPair_) { stopQrWirelessPairing(); refreshAdbDevices(); }
+                else startQrWirelessPairing();
+            } else if (ob.action == OB_ACT_APPLY_PROFILE_CHOICE) {
+                applyOnboardingProfileChoice(ob.profileChoice);
+            }
+            syncInputHookSnapshot();
+            invalidateShell();
+            return;
+        }
+    }
     if (!bridge_->isConnected() && !demoMode_ && ptIn(viewportRc_, mx, my)) {
         HubClickResult hr = viewportHost_.hitTestHub(mx, my);
         if (hr.action == HUB_REFRESH_DEVICES) {
-            refreshAdbDevices();
+            if (!toolsReady_) {
+                startAsyncRepairTools();
+            } else {
+                lastConnectError_.clear();
+                refreshAdbDevices();
+            }
         } else if (hr.action == HUB_CONNECT_DEVICE && hr.index >= 0 &&
                    hr.index < static_cast<int>(adbDevices_.size())) {
+            reconnecting_ = false;
+            reconnectCancelled_ = false;
             startAsyncConnect(adbDevices_[hr.index].serial);
         } else if (hr.action == HUB_FOCUS_WIFI_ADDR) {
             editingHubWireless_ = true;
             invalidateShell();
         } else if (hr.action == HUB_CONNECT_WIFI) {
+            reconnecting_ = false;
+            reconnectCancelled_ = false;
             startAsyncWirelessConnect(settings_.lastWirelessAddr);
         } else if (hr.action == HUB_TOGGLE_QR_PAIR) {
             if (showingQrPair_) { stopQrWirelessPairing(); refreshAdbDevices(); }
             else startQrWirelessPairing();
+        } else if (hr.action == HUB_REPAIR_TOOLS) {
+            startAsyncRepairTools();
+        } else if (hr.action == HUB_OPEN_ONBOARDING) {
+            showOnboarding_ = true;
+            onboardingView_.setStep(toolsReady_ ? OB_STEP_PREPARE : OB_STEP_TOOLS);
+            invalidateShell();
+        } else if (hr.action == HUB_CANCEL_RECONNECT) {
+            reconnecting_ = false;
+            reconnectCancelled_ = true;
+            lastConnectError_.clear();
+            hubStatusMsg_ = "Auto-reconnect cancelled.";
+            invalidateShell();
+        } else if (hr.action == HUB_RETRY_RECONNECT) {
+            lastConnectError_.clear();
+            if (!lastConnectedSerial_.empty()) {
+                reconnecting_ = true;
+                reconnectCancelled_ = false;
+                reconnectAttempt_ = 1;
+                if (lastConnectedWireless_) startAsyncWirelessConnect(lastConnectedSerial_);
+                else                        startAsyncConnect(lastConnectedSerial_);
+            } else {
+                refreshAdbDevices();
+            }
+        } else if (hr.action == HUB_COPY_ERROR) {
+            std::string det = lastConnectError_;
+            std::vector<std::string> rlogs = bridge_->getRecentLogs();
+            for (size_t li = 0; li < rlogs.size(); ++li) {
+                det += "\r\n" + rlogs[li];
+            }
+            if (!det.empty()) {
+                writeWindowsClipboardUtf8(det);
+                showToast("Copied error details to clipboard", 1800);
+            }
         } else if (hr.action == HUB_START_OFFLINE_STUDIO) {
             stopQrWirelessPairing();
+            reconnecting_ = false;
             demoMode_ = true;
             setDrawerState(true, 0);
             showToast("Offline Keymap Studio active! Changes auto-save to " + profile_.name, 3000);
@@ -3286,6 +3790,10 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
     double msHub = 0.0, msTop = 0.0, msDraw = 0.0, msRail = 0.0;
     TelemetrySummary vidTel = telemetry_.getSummary();
     {
+        // Fast native GDI clear before GDI+ vector overlay (sub-millisecond even at 2560x1440!)
+        SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
+        FillRect(cacheDC_, &paintRc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+
         Gdiplus::Graphics g(cacheDC_);
         g.SetClip(Gdiplus::Rect(paintRc.left, paintRc.top,
                                 paintRc.right - paintRc.left, paintRc.bottom - paintRc.top));
@@ -3293,31 +3801,39 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
         bool connected = bridge_->isConnected();
-        bool childCoversViewport = viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded();
+        bool childCoversViewport = !showOnboarding_ && (viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded());
         std::string devLabel;
         bool needDevLabel = (!fullscreen_ && (hitsDirty(topBarRc_) || (drawerOpen_ && hitsDirty(drawerRc_))));
         if (needDevLabel) {
             devLabel = bridge_->deviceName();
             if (connected) {
                 char dbuf[112];
-                std::snprintf(dbuf, sizeof(dbuf), "%s%s · %ux%u",
+                std::snprintf(dbuf, sizeof(dbuf), "%s%s%s · %ux%u",
                               devLabel.empty() ? "Android" : devLabel.c_str(),
                               bridge_->isVirtualDisplayActive() ? " [2ND]" : "",
+                              secureAppDetected_ ? " [SECURE APP]" : "",
                               lastPhoneW_, lastPhoneH_);
                 devLabel = dbuf;
             }
         }
 
-        // 1. Center Viewport backdrop / Device Hub (skip completely when D3D11 child HWND owns viewportRc_!)
+        // 1. Center Viewport backdrop / Onboarding Wizard / Device Hub (skip when child HWND owns viewportRc_!)
         if (!childCoversViewport && hitsDirty(viewportRc_)) {
             const int64_t ts = LatencyTelemetry::nowQpc();
             std::string qrSt;
             EnterCriticalSection(&auxLock_);
             qrSt = qrPairStatus_;
             LeaveCriticalSection(&auxLock_);
-            viewportHost_.paint(g, viewportRc_, connected, demoMode_, (connecting_ != 0),
-                                hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
-                                editingHubWireless_, showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
+            if (showOnboarding_ && !demoMode_) {
+                onboardingView_.paint(g, viewportRc_, toolsReady_, connected, (connecting_ != 0),
+                                      (repairingTools_ != 0), lastConnectError_.empty() ? hubStatusMsg_ : lastConnectError_,
+                                      hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
+                                      showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
+            } else {
+                HubViewState hub;
+                buildHubViewState(hub);
+                viewportHost_.paint(g, viewportRc_, connected, demoMode_, hub, hoverX_, hoverY_);
+            }
             msHub = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
         }
 
@@ -3329,6 +3845,17 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
                               profile_, tel, settings_.alwaysOnTop,
                               (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_, vidTel);
+                if (connected && secureAppDetected_) {
+                    RECT rSecBar = { topBarRc_.left + metrics_.dp(170), topBarRc_.bottom - metrics_.dp(16),
+                                     topBarRc_.right - metrics_.dp(180), topBarRc_.bottom - metrics_.dp(1) };
+                    if (rSecBar.right > rSecBar.left + metrics_.dp(120)) {
+                        GdiPlusDraw::roundedCard(g, rSecBar, GdiPlusDraw::dpf(4.0f), Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 1.0f);
+                        GdiPlusDraw::textCenter(g, "This app blocks screen capture.",
+                                                static_cast<float>(rSecBar.left + rSecBar.right) * 0.5f,
+                                                static_cast<float>(rSecBar.top + rSecBar.bottom) * 0.5f,
+                                                9.5f, true, Theme::ACCENT_AMBER);
+                    }
+                }
                 msTop = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
             }
 
@@ -3347,6 +3874,9 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 LeaveCriticalSection(&auxLock_);
                 drawerPanel_.setLatencyDiagnostics(vidTel, pr, viewportHost_.presentationModeLabel());
                 drawerPanel_.setThermalAndEncoderInfo(bridge_->activeSerial(), ti, actEnc, encList);
+                drawerPanel_.setPendingStreamChanges(
+                    connected && hasAppliedStreamSettings_ &&
+                    AppSettings::hasPendingStreamChanges(settings_, appliedStreamSettings_, bridge_->activeSerial()));
                 std::vector<std::string> logs = bridge_->getRecentLogs();
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),

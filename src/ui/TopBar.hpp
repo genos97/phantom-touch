@@ -12,6 +12,7 @@ enum TopBarAction {
     TB_NONE = 0,
     TB_OPEN_PROFILES,
     TB_TOGGLE_AIM,
+    TB_OPEN_HELP,
     TB_TOGGLE_PIN,
     TB_MINIMIZE,
     TB_MAXIMIZE,
@@ -45,6 +46,7 @@ private:
     RECT bounds_ = { 0, 0, 0, 0 };
     RECT rDev_ = { 0, 0, 0, 0 };
     RECT rProf_ = { 0, 0, 0, 0 };
+    RECT rHelp_ = { 0, 0, 0, 0 };
     RECT rPin_ = { 0, 0, 0, 0 };
     RECT rMin_ = { 0, 0, 0, 0 };
     RECT maxBtnRc_ = { 0, 0, 0, 0 };

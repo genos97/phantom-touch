@@ -29,6 +29,7 @@ if defined MINGW64_BIN (
     src\bridge\SpsParser.cpp ^
     src\bridge\TouchFingerPool.cpp ^
     src\bridge\QrCodeGen.cpp ^
+    src\bridge\ConnectionState.cpp ^
     src\bridge\ScrcpyBridge.cpp ^
     src\video\H264Decoder.cpp ^
     src\video\D3D11Renderer.cpp ^
@@ -48,6 +49,8 @@ if defined MINGW64_BIN (
     src\ui\HudRenderer.cpp ^
     src\ui\TopBar.cpp ^
     src\ui\SideRail.cpp ^
+    src\ui\ViewportHost.cpp ^
+    src\ui\OnboardingView.cpp ^
     src\ui\DrawerPanel.cpp ^
     -o tests\test_core.exe ^
     -static ^

@@ -38,6 +38,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\bridge\SpsParser.cpp ^
     src\bridge\TouchFingerPool.cpp ^
     src\bridge\QrCodeGen.cpp ^
+    src\bridge\ConnectionState.cpp ^
     src\bridge\ScrcpyBridge.cpp ^
     src\video\H264Decoder.cpp ^
     src\video\D3D11Renderer.cpp ^
@@ -58,6 +59,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\ui\TopBar.cpp ^
     src\ui\SideRail.cpp ^
     src\ui\ViewportHost.cpp ^
+    src\ui\OnboardingView.cpp ^
     src\ui\DrawerPanel.cpp ^
     src\ui\HudOverlay.cpp ^
     src\ui\ShellWindow.cpp ^

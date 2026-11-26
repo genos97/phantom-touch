@@ -858,6 +858,16 @@ std::string ScrcpyBridge::activeSerial() const {
     return copy;
 }
 
+bool ScrcpyBridge::reconnect(const ToolPaths& tools, const BridgeStreamConfig& cfg,
+                             bool useNativeVideo, int controlMaxSize,
+                             std::string& outError, const std::string& deviceSerial) {
+    disconnect();
+    if (useNativeVideo) {
+        return connectSession(tools, cfg, outError, deviceSerial);
+    }
+    return connectControl(tools, controlMaxSize, outError, deviceSerial, cfg.stayAwake);
+}
+
 bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
                                   const std::string& deviceSerial, bool stayAwake) {
     BridgeStreamConfig cfg;
@@ -917,6 +927,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     std::string adb = adbPrefix();
 
     // 2. Push scrcpy-server binary to a unique path so cleanup=true never races with scrcpy.exe!
+    if (stepCb_) stepCb_(stepCbCtx_, 0);
     std::string pushOut;
     DWORD exitCode = 0;
     if (!runCommandCapture(adb + " push \"" + tools.scrcpyServer +
@@ -1033,8 +1044,13 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     std::vector<wchar_t> mutableSrv(wSrvCmd.begin(), wSrvCmd.end());
     mutableSrv.push_back(L'\0');
 
-    if (wSrvCmd.empty() || !CreateProcessW(NULL, mutableSrv.data(), NULL, NULL, FALSE,
-                                           CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (wSrvCmd.empty()) {
+        outError = "Failed to build scrcpy-server command.";
+        return false;
+    }
+    if (stepCb_) stepCb_(stepCbCtx_, 1);
+    if (!CreateProcessW(NULL, mutableSrv.data(), NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         outError = "Failed to start scrcpy-server process.";
         return false;
     }
@@ -1042,6 +1058,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     CloseHandle(pi.hThread);
 
     // 5. Connect Video socket #1 and wait for the 1-byte dummy handshake
+    if (stepCb_) stepCb_(stepCbCtx_, 2);
     sockaddr_in addr;
     ZeroMemory(&addr, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -1375,6 +1392,13 @@ void ScrcpyBridge::setClipboardCallback(DeviceClipboardFn fn, void* ctx) {
     LeaveCriticalSection(&metaLock_);
 }
 
+void ScrcpyBridge::setConnectStepCallback(ConnectStepFn fn, void* ctx) {
+    EnterCriticalSection(&metaLock_);
+    stepCb_ = fn;
+    stepCbCtx_ = ctx;
+    LeaveCriticalSection(&metaLock_);
+}
+
 void ScrcpyBridge::setVideoPacketCallback(VideoPacketFn fn, void* ctx) {
     EnterCriticalSection(&metaLock_);
     videoCb_ = fn;
@@ -1463,20 +1487,36 @@ std::string ScrcpyBridge::parseForegroundPackage(const std::string& raw) {
     return fallback;
 }
 
-std::string ScrcpyBridge::queryForegroundPackage() {
-    if (!connected_ || adbExe_.empty()) return "";
+bool ScrcpyBridge::parseWindowSecureFlag(const std::string& dumpsysRaw) {
+    if (dumpsysRaw.empty()) return false;
+    return (dumpsysRaw.find("FLAG_SECURE") != std::string::npos ||
+            dumpsysRaw.find("isSecure=true") != std::string::npos);
+}
+
+bool ScrcpyBridge::queryForegroundInfo(std::string& outPackage, bool& outSecure) {
+    outPackage.clear();
+    outSecure = false;
+    if (!connected_ || adbExe_.empty()) return false;
     std::string raw;
     DWORD ec = 0;
     std::string adb = adbPrefix();
-    if (runCommandCapture(adb + " shell \"dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp'\"", raw, ec, 5000)) {
-        std::string pkg = parseForegroundPackage(raw);
-        if (!pkg.empty()) return pkg;
+    if (runCommandCapture(adb + " shell \"dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp|FLAG_SECURE'\"", raw, ec, 5000)) {
+        outSecure = parseWindowSecureFlag(raw);
+        outPackage = parseForegroundPackage(raw);
+        if (!outPackage.empty()) return true;
     }
     if (runCommandCapture(adb + " shell \"dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'\"", raw, ec, 5000)) {
-        std::string pkg = parseForegroundPackage(raw);
-        if (!pkg.empty()) return pkg;
+        outPackage = parseForegroundPackage(raw);
+        if (!outPackage.empty()) return true;
     }
-    return "";
+    return false;
+}
+
+std::string ScrcpyBridge::queryForegroundPackage() {
+    std::string pkg;
+    bool sec = false;
+    queryForegroundInfo(pkg, sec);
+    return pkg;
 }
 
 bool ScrcpyBridge::installApk(const std::string& localApkPath, std::string& outMsg) {

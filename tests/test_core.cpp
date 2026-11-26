@@ -1,3 +1,4 @@
+#include "bridge/ConnectionState.hpp"
 #include "bridge/QrCodeGen.hpp"
 #include "bridge/SpsParser.hpp"
 #include "bridge/TouchFingerPool.hpp"
@@ -15,9 +16,11 @@
 #include "engine/ThreadScheduling.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "ui/OnboardingView.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
+#include "ui/ViewportHost.hpp"
 #include "video/D3D11Renderer.hpp"
 #include "video/H264Decoder.hpp"
 #include "video/LatencyTelemetry.hpp"
@@ -1261,6 +1264,165 @@ static void testSprint2aUiFoundation() {
     std::printf("[Test] Sprint 2A (C1/C2/U1/U2/U3/S2/S4/N29/N32) OK!\n");
 }
 
+static void testSprint2bConnectionOnboardingAndSettings() {
+    // 1. F3 exponential backoff & X2/F3 connection state machine
+    assert(ConnectionStateMachine::backoffMs(0) == 1000);
+    assert(ConnectionStateMachine::backoffMs(1) == 2000);
+    assert(ConnectionStateMachine::backoffMs(2) == 4000);
+    assert(ConnectionStateMachine::backoffMs(3) == 8000);
+    assert(ConnectionStateMachine::backoffMs(4) == 10000);
+    assert(ConnectionStateMachine::backoffMs(5) == 10000);
+
+    ConnStateInput ci;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_NO_TOOLS);
+    ci.toolsReady = true;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_NO_DEVICE);
+    ci.unauthorizedDeviceCount = 1;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_UNAUTHORIZED);
+    ci.readyDeviceCount = 1;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_READY);
+    ci.reconnecting = true;
+    ci.reconnectAttempt = 2;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_RECONNECTING);
+    ci.reconnectAttempt = 6;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_LOST);
+    ci.connecting = true;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_CONNECTING);
+    ci.streaming = true;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_STREAMING);
+    ci = ConnStateInput();
+    ci.toolsReady = true;
+    ci.hasError = true;
+    assert(ConnectionStateMachine::evaluate(ci) == CONN_ERROR);
+
+    // 2. X2 FLAG_SECURE detection parser
+    assert(!ScrcpyBridge::parseWindowSecureFlag("mCurrentFocus=Window{123 u0 com.dts.freefiremax}"));
+    assert(ScrcpyBridge::parseWindowSecureFlag("mCurrentFocus=Window{456 u0 com.bank.app} flags=FLAG_SECURE"));
+    assert(ScrcpyBridge::parseWindowSecureFlag("WindowState{abc isSecure=true}"));
+
+    // 3. F1 OnboardingView state machine & AppSettings::onboardingDone + hasPendingStreamChanges
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_TOOLS, false, false, false, false) == OB_STEP_TOOLS);
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_TOOLS, true, false, false, false) == OB_STEP_PREPARE);
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_TOOLS, true, false, true, false) == OB_STEP_CONNECT);
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_TOOLS, true, false, false, true) == OB_STEP_CONNECT);
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_CONNECT, true, true, true, false) == OB_STEP_PROFILE);
+    assert(OnboardingView::computeRecommendedStep(OB_STEP_TOUR, true, true, true, false) == OB_STEP_TOUR);
+
+    AppSettings baseSet, liveSet;
+    assert(!baseSet.onboardingDone);
+    liveSet.vsyncEnabled = true;
+    liveSet.turnScreenOff = true;
+    liveSet.gamepadEnabled = false;
+    liveSet.onboardingDone = true;
+    assert(!AppSettings::hasPendingStreamChanges(liveSet, baseSet, "SER1"));
+    liveSet.mirrorBitrateMbps = 24;
+    assert(AppSettings::hasPendingStreamChanges(liveSet, baseSet, "SER1"));
+    liveSet.mirrorBitrateMbps = baseSet.mirrorBitrateMbps;
+    liveSet.setEncoderForDevice("SER1", "c2.exynos.h264.encoder");
+    assert(AppSettings::hasPendingStreamChanges(liveSet, baseSet, "SER1"));
+
+    std::string tmpCfg = "profiles\\_test_s2b_settings.cfg";
+    assert(AppSettingsStore::save(tmpCfg, liveSet));
+    AppSettings reloaded;
+    assert(AppSettingsStore::load(tmpCfg, reloaded));
+    assert(reloaded.onboardingDone == true);
+    DeleteFileA(tmpCfg.c_str());
+
+    // 4. F16 DrawerPanel Advanced section + tuningOnlyModified + Device pending bar
+    HDC scDC = GetDC(NULL);
+    HDC mDC = CreateCompatibleDC(scDC);
+    HBITMAP bmp = CreateCompatibleBitmap(scDC, 1200, 1600);
+    HGDIOBJ old = SelectObject(mDC, bmp);
+    GdiPlusDraw::setActiveDpi(96);
+
+    DrawerPanel dpnl;
+    dpnl.setProfilesDir("profiles", "profiles\\freefire.cfg");
+    dpnl.setActiveTab(1); // SENS
+    Profile prof = ProfileDefaults::createFreeFire();
+    AppSettings set;
+    std::vector<std::string> logs;
+    RECT dRc = { 0, 0, 356, 1500 };
+    {
+        Gdiplus::Graphics g(mDC);
+        dpnl.paint(g, dRc, prof, set, "profiles\\freefire.cfg", -1, false, true, "SM-G990E", "", logs, -1, -1);
+    }
+    RECT rAdvBtn = { 0, 0, 0, 0 };
+    assert(dpnl.rectForAction(DA_TOGGLE_ADVANCED, -1, rAdvBtn));
+    int sel = -1;
+    DrawerActionResult res;
+    assert(dpnl.onMouseDown((rAdvBtn.left + rAdvBtn.right) / 2, (rAdvBtn.top + rAdvBtn.bottom) / 2, prof, set, sel, res));
+    assert(dpnl.isAdvancedExpanded());
+    {
+        Gdiplus::Graphics g(mDC);
+        dpnl.paint(g, dRc, prof, set, "profiles\\freefire.cfg", -1, false, true, "SM-G990E", "", logs, -1, -1);
+    }
+    RECT rResetKey = { 0, 0, 0, 0 };
+    assert(dpnl.rectForAction(DA_REBIND_RESET_TOUCH, -1, rResetKey));
+    res = DrawerActionResult();
+    assert(dpnl.onMouseDown((rResetKey.left + rResetKey.right) / 2, (rResetKey.top + rResetKey.bottom) / 2, prof, set, sel, res));
+    assert(dpnl.isWaitingSpecialRebind());
+    res = DrawerActionResult();
+    assert(dpnl.onKeyDown(VK_F6, prof, set, sel, res));
+    assert(prof.resetTouchVk == VK_F6 && res.profileModified);
+
+    RECT rFireDual = { 0, 0, 0, 0 };
+    assert(dpnl.rectForAction(DA_FIRE_DUAL, -1, rFireDual));
+    res = DrawerActionResult();
+    assert(dpnl.onMouseDown((rFireDual.left + rFireDual.right) / 2, (rFireDual.top + rFireDual.bottom) / 2, prof, set, sel, res));
+    assert(res.tuningOnlyModified && !res.profileModified);
+
+    // 5. F3 ViewportHost scrollable Hub renders all 6 devices (no 3-device limit)
+    std::vector<AdbDeviceInfo> sixDevs;
+    for (int i = 0; i < 6; ++i) {
+        AdbDeviceInfo d;
+        char sbuf[32], mbuf[32];
+        std::snprintf(sbuf, sizeof(sbuf), "DEV-%d", i);
+        std::snprintf(mbuf, sizeof(mbuf), "Phone_%d", i);
+        d.serial = sbuf;
+        d.model = mbuf;
+        d.state = "device";
+        sixDevs.push_back(d);
+    }
+    ViewportHost vh;
+    HubViewState hvs;
+    hvs.connState = CONN_READY;
+    hvs.devices = &sixDevs;
+    RECT vpRc = { 0, 0, 860, 660 };
+    {
+        Gdiplus::Graphics g(mDC);
+        vh.paint(g, vpRc, false, false, hvs, -1, -1);
+    }
+    assert(vh.onHubMouseWheel(430, 300, -120 * 3));
+    {
+        Gdiplus::Graphics g(mDC);
+        vh.paint(g, vpRc, false, false, hvs, -1, -1);
+    }
+    RECT rDev5 = { 0, 0, 0, 0 };
+    assert(vh.rectForHubAction(HUB_CONNECT_DEVICE, 5, rDev5));
+    HubClickResult hcr = vh.hitTestHub((rDev5.left + rDev5.right) / 2, (rDev5.top + rDev5.bottom) / 2);
+    assert(hcr.action == HUB_CONNECT_DEVICE && hcr.index == 5);
+
+    // 6. F1 OnboardingView paint + click verification
+    OnboardingView ob;
+    ob.setStep(OB_STEP_CONNECT);
+    QrMatrix qrm;
+    {
+        Gdiplus::Graphics g(mDC);
+        ob.paint(g, vpRc, true, false, false, false, "", "", sixDevs, "192.168.1.50:5555", false, &qrm, "", -1, -1);
+    }
+    OnboardingClickResult obRes;
+    RECT rSkip = { 0, 0, 0, 0 };
+    assert(ob.rectForStepButton(1, rSkip)); // BTN_SKIP
+    assert(ob.onMouseDown((rSkip.left + rSkip.right) / 2, (rSkip.top + rSkip.bottom) / 2, obRes));
+    assert(obRes.action == OB_ACT_SKIP);
+
+    SelectObject(mDC, old);
+    DeleteObject(bmp);
+    DeleteDC(mDC);
+    ReleaseDC(NULL, scDC);
+    std::printf("[Test] Sprint 2B (X2/F1/F2/F3/F16) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1277,6 +1439,7 @@ int main() {
     testSprint1LatencyAndAsync();
     testSprint1bPhase2PresetsAndTelemetry();
     testSprint2aUiFoundation();
-    std::printf("ALL SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    testSprint2bConnectionOnboardingAndSettings();
+    std::printf("ALL SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

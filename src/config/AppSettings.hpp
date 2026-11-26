@@ -39,6 +39,7 @@ struct AppSettings {
     bool virtualDisplayMode = false; // Stage 3: "Second Phone" virtual screen (new_display)
     std::string virtualDisplaySpec = "1920x1080/320"; // WxH/DPI or "auto"
     bool gamepadEnabled = true;     // Stage 3: XInput gamepad-to-touch controller
+    bool onboardingDone = false;    // F1: First-run onboarding wizard completed
     std::string lastWirelessAddr = "192.168.1.100:5555";
     std::string lastGameProfile;    // Remembers preferred game profile across Desktop auto-switch & restarts
 
@@ -48,6 +49,8 @@ struct AppSettings {
     static const char* streamPresetName(StreamPresetId id);
     std::string encoderForDevice(const std::string& serial) const;
     void setEncoderForDevice(const std::string& serial, const std::string& encoderName);
+    static bool hasPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
+                                        const std::string& serial);
 };
 
 class AppSettingsStore {

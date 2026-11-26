@@ -40,7 +40,9 @@ enum ShellAppMsg {
     MSG_DISCONNECT_DONE    = WM_APP + 28,
     MSG_SCREENSHOT_DONE    = WM_APP + 29,
     MSG_PROBE_UPDATE       = WM_APP + 30,
-    MSG_THERMAL_UPDATE     = WM_APP + 31
+    MSG_THERMAL_UPDATE     = WM_APP + 31,
+    MSG_CONNECT_STEP       = WM_APP + 32,
+    MSG_REPAIR_TOOLS_DONE  = WM_APP + 33
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread

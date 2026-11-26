@@ -20,6 +20,14 @@ enum DrawerSliderId {
     DSL_HUD_OPACITY,
     DSL_IDLE_RESET,
     DSL_TAP_JITTER,
+    DSL_ACCEL_POWER,
+    DSL_ACCEL_REF,
+    DSL_ACCEL_CAP,
+    DSL_TDOWN_DELAY,
+    DSL_TUP_DELAY,
+    DSL_SCROLL_STEP,
+    DSL_WALK_RADIUS,
+    DSL_FIRE_BOX_W,
     DSL_NODE_DUR
 };
 
@@ -77,6 +85,21 @@ void DrawerPanel::setActiveTab(int tab) {
     activeTab_ = tab;
     clearFocus();
     if (tab == 2) refreshProfileList();
+}
+
+std::string DrawerPanel::specialRebindLabel() const {
+    switch (specialRebind_) {
+        case SRB_TOGGLE_AIM:  return "AIM LOCK / UNLOCK";
+        case SRB_HOLD_UNLOCK: return "HOLD-TO-UNLOCK CURSOR";
+        case SRB_RESET_TOUCH: return "RESET ALL TOUCHES";
+        case SRB_JOY_UP:      return "JOYSTICK UP";
+        case SRB_JOY_DOWN:    return "JOYSTICK DOWN";
+        case SRB_JOY_LEFT:    return "JOYSTICK LEFT";
+        case SRB_JOY_RIGHT:   return "JOYSTICK RIGHT";
+        case SRB_JOY_SPRINT:  return "JOYSTICK SPRINT";
+        case SRB_JOY_WALK:    return "JOYSTICK WALK";
+        default:              return "KEY";
+    }
 }
 
 bool DrawerPanel::containsPoint(int x, int y) const {
@@ -365,19 +388,23 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         drawSliderRow(g, ix, cy, iw, "Tap/Swipe Dur", static_cast<float>(node.durationMs), 15.0f, 300.0f, dbuf, Theme::ACCENT_AMBER, DSL_NODE_DUR, hoverX, hoverY);
         cy += 30;
 
-        // Per-node add-on chips: Scope Sens | Reset View | Fix Joy
-        int tw = (iw - 8) / 3;
+        // Per-node add-on chips: ADS Sens | Toggle | Rst View | Fix Joy
+        int tw = (iw - 12) / 4;
         RECT rScp = { ix, cy, ix + tw, cy + 24 };
-        RECT rRst = { ix + tw + 4, cy, ix + 2 * tw + 4, cy + 24 };
-        RECT rJoy = { ix + 2 * tw + 8, cy, ix + iw, cy + 24 };
+        RECT rTog = { ix + tw + 4, cy, ix + 2 * tw + 4, cy + 24 };
+        RECT rRst = { ix + 2 * tw + 8, cy, ix + 3 * tw + 8, cy + 24 };
+        RECT rJoy = { ix + 3 * tw + 12, cy, ix + iw, cy + 24 };
         GdiPlusDraw::roundedCard(g, rScp, 5.0f, node.switchScopeSens ? Theme::ACCENT_PURPLE_BG : Theme::BG_INPUT, node.switchScopeSens ? Theme::ACCENT_PURPLE : Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::roundedCard(g, rTog, 5.0f, node.toggleMode ? Theme::ACCENT_CYAN_BG : Theme::BG_INPUT, node.toggleMode ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
         GdiPlusDraw::roundedCard(g, rRst, 5.0f, node.resetView ? Theme::ACCENT_AMBER_BG : Theme::BG_INPUT, node.resetView ? Theme::ACCENT_AMBER : Theme::BORDER_SUBTLE, 1.0f);
         GdiPlusDraw::roundedCard(g, rJoy, 5.0f, node.reactivateJoy ? Theme::ACCENT_GREEN_BG : Theme::BG_INPUT, node.reactivateJoy ? Theme::ACCENT_GREEN : Theme::BORDER_SUBTLE, 1.0f);
-        GdiPlusDraw::textCenter(g, "ADS Sens", static_cast<float>(rScp.left + rScp.right) * 0.5f, static_cast<float>(cy + 12), 10.0f, true, node.switchScopeSens ? Theme::ACCENT_PURPLE : Theme::TEXT_MUTED);
-        GdiPlusDraw::textCenter(g, "Rst View", static_cast<float>(rRst.left + rRst.right) * 0.5f, static_cast<float>(cy + 12), 10.0f, true, node.resetView ? Theme::ACCENT_AMBER : Theme::TEXT_MUTED);
-        GdiPlusDraw::textCenter(g, "Fix Joy",  static_cast<float>(rJoy.left + rJoy.right) * 0.5f, static_cast<float>(cy + 12), 10.0f, true, node.reactivateJoy ? Theme::ACCENT_GREEN : Theme::TEXT_MUTED);
+        GdiPlusDraw::textCenter(g, "ADS Sens", static_cast<float>(rScp.left + rScp.right) * 0.5f, static_cast<float>(cy + 12), 9.5f, true, node.switchScopeSens ? Theme::ACCENT_PURPLE : Theme::TEXT_MUTED);
+        GdiPlusDraw::textCenter(g, "Toggle",   static_cast<float>(rTog.left + rTog.right) * 0.5f, static_cast<float>(cy + 12), 9.5f, true, node.toggleMode ? Theme::ACCENT_CYAN : Theme::TEXT_MUTED);
+        GdiPlusDraw::textCenter(g, "Rst View", static_cast<float>(rRst.left + rRst.right) * 0.5f, static_cast<float>(cy + 12), 9.5f, true, node.resetView ? Theme::ACCENT_AMBER : Theme::TEXT_MUTED);
+        GdiPlusDraw::textCenter(g, "Fix Joy",  static_cast<float>(rJoy.left + rJoy.right) * 0.5f, static_cast<float>(cy + 12), 9.5f, true, node.reactivateJoy ? Theme::ACCENT_GREEN : Theme::TEXT_MUTED);
         if (rScp.bottom > bodyClip_.top && rScp.top < bodyClip_.bottom) {
             hotspots_.push_back(Hotspot{ rScp, DA_INSP_SCOPE, 0 });
+            hotspots_.push_back(Hotspot{ rTog, DA_INSP_TOGGLE_MODE, 0 });
             hotspots_.push_back(Hotspot{ rRst, DA_INSP_RSTVIEW, 0 });
             hotspots_.push_back(Hotspot{ rJoy, DA_INSP_REJOY, 0 });
         }
@@ -544,9 +571,10 @@ int DrawerPanel::paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
     y += 20;
 
     RECT rAimK = { x, y, x + w - 68, y + 28 };
-    GdiPlusDraw::roundedCard(g, rAimK, 6.0f, rebindingToggleAim_ ? Theme::ACCENT_AMBER_BG : Theme::BG_CARD,
-                             rebindingToggleAim_ ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.1f);
-    std::string aimLbl = rebindingToggleAim_ ? "Press Key / Mouse..." : ("Lock/Unlock: " + KeyCodes::toName(p.toggleAimVk));
+    bool rbAim = (specialRebind_ == SRB_TOGGLE_AIM);
+    GdiPlusDraw::roundedCard(g, rAimK, 6.0f, rbAim ? Theme::ACCENT_AMBER_BG : Theme::BG_CARD,
+                             rbAim ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.1f);
+    std::string aimLbl = rbAim ? "Press Key / Mouse..." : ("Lock/Unlock: " + KeyCodes::toName(p.toggleAimVk));
     GdiPlusDraw::textCenter(g, aimLbl, static_cast<float>(rAimK.left + rAimK.right) * 0.5f, static_cast<float>(y + 14), 11.5f, true, Theme::TEXT_PRIMARY);
     RECT rMmb = { x + w - 62, y, x + w, y + 28 };
     bool isMmb = (p.toggleAimVk == VK_MBUTTON);
@@ -559,9 +587,10 @@ int DrawerPanel::paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
     y += 34;
 
     RECT rHoldK = { x, y, x + w - 68, y + 28 };
-    GdiPlusDraw::roundedCard(g, rHoldK, 6.0f, rebindingHoldUnlock_ ? Theme::ACCENT_AMBER_BG : Theme::BG_CARD,
-                             rebindingHoldUnlock_ ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.1f);
-    std::string holdLbl = rebindingHoldUnlock_ ? "Press Key / Mouse..." : ("Hold-Unlock: " + KeyCodes::toName(p.holdUnlockVk));
+    bool rbHold = (specialRebind_ == SRB_HOLD_UNLOCK);
+    GdiPlusDraw::roundedCard(g, rHoldK, 6.0f, rbHold ? Theme::ACCENT_AMBER_BG : Theme::BG_CARD,
+                             rbHold ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.1f);
+    std::string holdLbl = rbHold ? "Press Key / Mouse..." : ("Hold-Unlock: " + KeyCodes::toName(p.holdUnlockVk));
     GdiPlusDraw::textCenter(g, holdLbl, static_cast<float>(rHoldK.left + rHoldK.right) * 0.5f, static_cast<float>(y + 14), 11.5f, true, Theme::TEXT_PRIMARY);
     RECT rClrH = { x + w - 62, y, x + w, y + 28 };
     GdiPlusDraw::roundedCard(g, rClrH, 6.0f, Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
@@ -576,7 +605,73 @@ int DrawerPanel::paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
     GdiPlusDraw::roundedCard(g, rRstS, 7.0f, ptIn(rRstS, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 1.0f);
     GdiPlusDraw::textCenter(g, "RESET SENSITIVITY DEFAULTS", static_cast<float>(x + w / 2), static_cast<float>(y + 14), 11.0f, true, Theme::ACCENT_AMBER);
     if (rRstS.bottom > bodyClip_.top && rRstS.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rRstS, DA_RESET_SENS, 0 });
-    return y + 36;
+    y += 36;
+
+    // F16: Collapsible Advanced Tuning & Keys section
+    RECT rAdvHdr = { x, y, x + w, y + 30 };
+    bool hovAdv = ptIn(rAdvHdr, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rAdvHdr, 7.0f, hovAdv ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+                             advancedExpanded_ ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.1f);
+    GdiPlusDraw::textLeft(g, advancedExpanded_ ? "v ADVANCED TUNING & KEYS" : "> ADVANCED TUNING & KEYS",
+                          static_cast<float>(x + 12), static_cast<float>(y + 15), 11.0f, true,
+                          advancedExpanded_ ? Theme::ACCENT_CYAN : Theme::TEXT_PRIMARY, static_cast<float>(w - 24));
+    if (rAdvHdr.bottom > bodyClip_.top && rAdvHdr.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rAdvHdr, DA_TOGGLE_ADVANCED, 0 });
+    }
+    y += 36;
+
+    if (advancedExpanded_) {
+        std::snprintf(buf, sizeof(buf), "%.2f", p.accelPower);
+        drawSliderRow(g, x, y, w, "Accel Power", p.accelPower, 1.00f, 2.50f, buf, Theme::ACCENT_PURPLE, DSL_ACCEL_POWER, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%.0f", p.accelRefSpeed);
+        drawSliderRow(g, x, y, w, "Accel Ref Spd", p.accelRefSpeed, 2.0f, 80.0f, buf, Theme::ACCENT_PURPLE, DSL_ACCEL_REF, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%.2fx", p.accelCap);
+        drawSliderRow(g, x, y, w, "Accel Cap", p.accelCap, 1.00f, 4.00f, buf, Theme::ACCENT_PURPLE, DSL_ACCEL_CAP, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%dms", p.touchDownDelayMs);
+        drawSliderRow(g, x, y, w, "Touch Down Dly", static_cast<float>(p.touchDownDelayMs), 0.0f, 50.0f, buf, Theme::ACCENT_AMBER, DSL_TDOWN_DELAY, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%dms", p.touchUpDelayMs);
+        drawSliderRow(g, x, y, w, "Touch Up Dly", static_cast<float>(p.touchUpDelayMs), 0.0f, 50.0f, buf, Theme::ACCENT_AMBER, DSL_TUP_DELAY, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%dpx", p.cursorScrollStepPx);
+        drawSliderRow(g, x, y, w, "Scroll Step", static_cast<float>(p.cursorScrollStepPx), 20.0f, 250.0f, buf, Theme::ACCENT_CYAN, DSL_SCROLL_STEP, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%.3f", p.joyWalkRadius);
+        drawSliderRow(g, x, y, w, "Walk Radius", p.joyWalkRadius, 0.015f, 0.120f, buf, Theme::ACCENT_GREEN, DSL_WALK_RADIUS, hoverX, hoverY); y += step;
+        std::snprintf(buf, sizeof(buf), "%.2f", p.fireBoxHalfW);
+        drawSliderRow(g, x, y, w, "Fire Box Width", p.fireBoxHalfW, 0.08f, 0.70f, buf, Theme::ACCENT_RED, DSL_FIRE_BOX_W, hoverX, hoverY); y += step + 6;
+
+        GdiPlusDraw::textLeft(g, "MOVEMENT & RESET KEYS", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+        y += 20;
+
+        auto drawKeyBtn = [&](RECT r, const char* prefix, int vkVal, SpecialRebindTarget rbTgt, int actId) {
+            bool rb = (specialRebind_ == rbTgt);
+            bool hovK = ptIn(r, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, r, 6.0f, rb ? Theme::ACCENT_AMBER_BG : (hovK ? Theme::BG_CARD_HOVER : Theme::BG_CARD),
+                                     rb ? Theme::ACCENT_AMBER : Theme::BORDER_STRONG, 1.0f);
+            std::string txt = rb ? "Press Key..." : (std::string(prefix) + ": " + KeyCodes::toName(vkVal));
+            GdiPlusDraw::textCenter(g, txt, static_cast<float>(r.left + r.right) * 0.5f,
+                                    static_cast<float>(r.top + r.bottom) * 0.5f, 10.5f, true, Theme::TEXT_PRIMARY);
+            if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) {
+                hotspots_.push_back(Hotspot{ r, actId, 0 });
+            }
+        };
+
+        int khw = (w - 6) / 2;
+        drawKeyBtn(RECT{ x, y, x + khw, y + 26 }, "Up", p.vkUp, SRB_JOY_UP, DA_REBIND_JOY_UP);
+        drawKeyBtn(RECT{ x + khw + 6, y, x + w, y + 26 }, "Down", p.vkDown, SRB_JOY_DOWN, DA_REBIND_JOY_DOWN);
+        y += 30;
+        drawKeyBtn(RECT{ x, y, x + khw, y + 26 }, "Left", p.vkLeft, SRB_JOY_LEFT, DA_REBIND_JOY_LEFT);
+        drawKeyBtn(RECT{ x + khw + 6, y, x + w, y + 26 }, "Right", p.vkRight, SRB_JOY_RIGHT, DA_REBIND_JOY_RIGHT);
+        y += 30;
+        drawKeyBtn(RECT{ x, y, x + khw, y + 26 }, "Sprint", p.vkSprint, SRB_JOY_SPRINT, DA_REBIND_JOY_SPRINT);
+        drawKeyBtn(RECT{ x + khw + 6, y, x + w - 46, y + 26 }, "Walk", p.vkWalk, SRB_JOY_WALK, DA_REBIND_JOY_WALK);
+        RECT rClrW = { x + w - 42, y, x + w, y + 26 };
+        GdiPlusDraw::roundedCard(g, rClrW, 6.0f, Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
+        GdiPlusDraw::textCenter(g, "CLR", static_cast<float>(rClrW.left + rClrW.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::ACCENT_RED);
+        if (rClrW.bottom > bodyClip_.top && rClrW.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rClrW, DA_CLEAR_JOY_WALK, 0 });
+        y += 30;
+        drawKeyBtn(RECT{ x, y, x + w, y + 26 }, "Quick Reset Key", p.resetTouchVk, SRB_RESET_TOUCH, DA_REBIND_RESET_TOUCH);
+        y += 34;
+    }
+    return y;
 }
 
 int DrawerPanel::paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
@@ -700,6 +795,22 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     GdiPlusDraw::textLeft(g, connected ? deviceLabel : "Open Device Hub or plug in USB", static_cast<float>(x + 12), static_cast<float>(y + 34), 12.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 24));
     GdiPlusDraw::textLeft(g, "Stream: " + s.buildScrcpyArgs(), static_cast<float>(x + 12), static_cast<float>(y + 52), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 24));
     y += 76;
+
+    // F16: Pending stream-settings banner (only shown when reconnect-requiring settings differ)
+    if (connected && pendingStreamChanges_) {
+        RECT rPend = { x, y, x + w, y + 38 };
+        GdiPlusDraw::roundedCard(g, rPend, 8.0f, Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 1.2f);
+        GdiPlusDraw::textLeft(g, "Stream settings changed", static_cast<float>(x + 10), static_cast<float>(y + 19), 11.0f, true, Theme::ACCENT_AMBER, static_cast<float>(w - 142));
+        RECT rRecNow = { rPend.right - 126, y + 6, rPend.right - 8, y + 32 };
+        bool hovRn = ptIn(rRecNow, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rRecNow, 6.0f, hovRn ? Theme::ACCENT_AMBER : Theme::BG_CARD, Theme::ACCENT_AMBER, 1.1f);
+        GdiPlusDraw::textCenter(g, "Reconnect to apply", static_cast<float>(rRecNow.left + rRecNow.right) * 0.5f,
+                                static_cast<float>(y + 19), 10.0f, true, hovRn ? 0xFF081018u : Theme::TEXT_PRIMARY);
+        if (rRecNow.bottom > bodyClip_.top && rRecNow.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rRecNow, DA_APPLY_RECONNECT, 0 });
+        }
+        y += 46;
+    }
 
     // 2. Stream Presets (LATENCY 2.1-2.4) & Quality Controls
     GdiPlusDraw::textLeft(g, "STREAM PRESET (PHASE 2)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
@@ -907,7 +1018,16 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     if (logs.empty()) {
         GdiPlusDraw::textLeft(g, "Ready. Connect phone or edit keymaps.", static_cast<float>(x + 8), static_cast<float>(ly), 10.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 16));
     }
-    return rLog.bottom + 10;
+    int gy = rLog.bottom + 12;
+    RECT rGuide = { x, gy, x + w, gy + 28 };
+    bool hovG = ptIn(rGuide, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rGuide, 7.0f, hovG ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "OPEN SETUP GUIDE / ONBOARDING", static_cast<float>(x + w / 2),
+                            static_cast<float>(gy + 14), 10.5f, true, Theme::TEXT_SECONDARY);
+    if (rGuide.bottom > bodyClip_.top && rGuide.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rGuide, DA_OPEN_ONBOARDING, 0 });
+    }
+    return rGuide.bottom + 10;
 }
 
 void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
@@ -927,6 +1047,14 @@ void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int se
             case DSL_HUD_OPACITY: p.hudOpacity = std::floor(v * 20.0f + 0.5f) / 20.0f; break;
             case DSL_IDLE_RESET:  p.idleResetMs = static_cast<int>(std::floor(v / 25.0f + 0.5f)) * 25; break;
             case DSL_TAP_JITTER:  p.tapJitterPx = static_cast<int>(std::floor(v + 0.5f)); break;
+            case DSL_ACCEL_POWER: p.accelPower = std::floor(v * 20.0f + 0.5f) / 20.0f; break;
+            case DSL_ACCEL_REF:   p.accelRefSpeed = std::floor(v + 0.5f); break;
+            case DSL_ACCEL_CAP:   p.accelCap = std::floor(v * 20.0f + 0.5f) / 20.0f; break;
+            case DSL_TDOWN_DELAY: p.touchDownDelayMs = static_cast<int>(std::floor(v + 0.5f)); break;
+            case DSL_TUP_DELAY:   p.touchUpDelayMs = static_cast<int>(std::floor(v + 0.5f)); break;
+            case DSL_SCROLL_STEP: p.cursorScrollStepPx = static_cast<int>(std::floor(v / 5.0f + 0.5f)) * 5; break;
+            case DSL_WALK_RADIUS: p.joyWalkRadius = std::floor(v * 200.0f + 0.5f) / 200.0f; break;
+            case DSL_FIRE_BOX_W:  p.fireBoxHalfW = std::floor(v * 50.0f + 0.5f) / 50.0f; break;
             case DSL_NODE_DUR:
                 if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(p.buttons.size())) {
                     p.buttons[selectedBtnIndex].durationMs = static_cast<int>(std::floor(v / 5.0f + 0.5f)) * 5;
@@ -953,7 +1081,8 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
             float w = static_cast<float>(activeSliderTrack_.right - activeSliderTrack_.left);
             float t = (w > 1.0f) ? (static_cast<float>(x - activeSliderTrack_.left) / w) : 0.0f;
             applySliderValue(activeSliderId_, t, profile, selectedBtnIndex);
-            out.profileModified = true;
+            if (activeSliderId_ == DSL_NODE_DUR) out.profileModified = true;
+            else                               out.tuningOnlyModified = true;
             clearFocus();
             return true;
         }
@@ -1018,6 +1147,13 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                     out.profileModified = true;
                 }
                 return true;
+            case DA_INSP_TOGGLE_MODE:
+                if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
+                    profile.buttons[selectedBtnIndex].toggleMode = !profile.buttons[selectedBtnIndex].toggleMode;
+                    out.profileModified = true;
+                    out.toastMessage = profile.buttons[selectedBtnIndex].toggleMode ? "Switch/Action Mode: TOGGLE" : "Switch/Action Mode: HOLD";
+                }
+                return true;
             case DA_INSP_RSTVIEW:
                 if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(profile.buttons.size())) {
                     profile.buttons[selectedBtnIndex].resetView = !profile.buttons[selectedBtnIndex].resetView;
@@ -1032,23 +1168,38 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 return true;
             case DA_INSP_DELETE: out.requestDeleteSelectedNode = true; return true;
 
-            case DA_FIRE_CLAW: profile.fireMode = FIRE_MODE_CLAW_LEFT; out.profileModified = true; out.toastMessage = "Fire Mode: CLAW-LEFT"; return true;
-            case DA_FIRE_DRAG: profile.fireMode = FIRE_MODE_DRAG_RIGHT; out.profileModified = true; out.toastMessage = "Fire Mode: DRAG-FIRE"; return true;
-            case DA_FIRE_DUAL: profile.fireMode = FIRE_MODE_DUAL_DRAG; out.profileModified = true; out.toastMessage = "Fire Mode: DUAL-DRAG"; return true;
-            case DA_BOUNDS_UNBOUNDED: profile.unboundedAim = true; out.profileModified = true; out.toastMessage = "Aim Bounds: UNBOUNDED (Free Fire)"; return true;
-            case DA_BOUNDS_BOXED:     profile.unboundedAim = false; out.profileModified = true; out.toastMessage = "Aim Bounds: BOXED (15ms Edge Reset)"; return true;
-            case DA_POLL_125: profile.pollHz = 125; out.profileModified = true; out.toastMessage = "Polling: 125 Hz"; return true;
-            case DA_POLL_250: profile.pollHz = 250; out.profileModified = true; out.toastMessage = "Polling: 250 Hz"; return true;
-            case DA_POLL_500: profile.pollHz = 500; out.profileModified = true; out.toastMessage = "Polling: 500 Hz"; return true;
-            case DA_POLL_MAX: profile.pollHz = 0;   out.profileModified = true; out.toastMessage = "Polling: MAX (1000 Hz)"; return true;
-            case DA_JOY_GLIDE: profile.joySteppedGlide = true; out.profileModified = true; out.toastMessage = "Joystick: FF 4-Step Glide"; return true;
-            case DA_JOY_FAST:  profile.joySteppedGlide = false; out.profileModified = true; out.toastMessage = "Joystick: Fast 3-Step (24ms)"; return true;
-            case DA_TOGGLE_INVERT_Y: profile.invertY = !profile.invertY; out.profileModified = true; return true;
-            case DA_TOGGLE_REMEMBER_CURSOR: profile.rememberCursorPos = !profile.rememberCursorPos; out.profileModified = true; return true;
-            case DA_REBIND_TOGGLE_AIM: rebindingToggleAim_ = true; out.toastMessage = "Press ANY key or Mouse button (MMB, LShift, ~) for Aim Lock..."; return true;
+            case DA_FIRE_CLAW: profile.fireMode = FIRE_MODE_CLAW_LEFT; out.tuningOnlyModified = true; out.toastMessage = "Fire Mode: CLAW-LEFT"; return true;
+            case DA_FIRE_DRAG: profile.fireMode = FIRE_MODE_DRAG_RIGHT; out.tuningOnlyModified = true; out.toastMessage = "Fire Mode: DRAG-FIRE"; return true;
+            case DA_FIRE_DUAL: profile.fireMode = FIRE_MODE_DUAL_DRAG; out.tuningOnlyModified = true; out.toastMessage = "Fire Mode: DUAL-DRAG"; return true;
+            case DA_BOUNDS_UNBOUNDED: profile.unboundedAim = true; out.tuningOnlyModified = true; out.toastMessage = "Aim Bounds: UNBOUNDED (Free Fire)"; return true;
+            case DA_BOUNDS_BOXED:     profile.unboundedAim = false; out.tuningOnlyModified = true; out.toastMessage = "Aim Bounds: BOXED (15ms Edge Reset)"; return true;
+            case DA_POLL_125: profile.pollHz = 125; out.tuningOnlyModified = true; out.toastMessage = "Polling: 125 Hz"; return true;
+            case DA_POLL_250: profile.pollHz = 250; out.tuningOnlyModified = true; out.toastMessage = "Polling: 250 Hz"; return true;
+            case DA_POLL_500: profile.pollHz = 500; out.tuningOnlyModified = true; out.toastMessage = "Polling: 500 Hz"; return true;
+            case DA_POLL_MAX: profile.pollHz = 0;   out.tuningOnlyModified = true; out.toastMessage = "Polling: MAX (1000 Hz)"; return true;
+            case DA_JOY_GLIDE: profile.joySteppedGlide = true; out.tuningOnlyModified = true; out.toastMessage = "Joystick: FF 4-Step Glide"; return true;
+            case DA_JOY_FAST:  profile.joySteppedGlide = false; out.tuningOnlyModified = true; out.toastMessage = "Joystick: Fast 3-Step (24ms)"; return true;
+            case DA_TOGGLE_INVERT_Y: profile.invertY = !profile.invertY; out.tuningOnlyModified = true; return true;
+            case DA_TOGGLE_REMEMBER_CURSOR: profile.rememberCursorPos = !profile.rememberCursorPos; out.tuningOnlyModified = true; return true;
+            case DA_REBIND_TOGGLE_AIM: specialRebind_ = SRB_TOGGLE_AIM; out.toastMessage = "Press ANY key or Mouse button (MMB, LShift, ~) for Aim Lock..."; return true;
             case DA_SET_TOGGLE_MMB: profile.toggleAimVk = VK_MBUTTON; out.profileModified = true; out.toastMessage = "Aim Lock Toggle set to MMB"; return true;
-            case DA_REBIND_HOLD_UNLOCK: rebindingHoldUnlock_ = true; out.toastMessage = "Press ANY key or Mouse button for Hold-to-Unlock..."; return true;
+            case DA_REBIND_HOLD_UNLOCK: specialRebind_ = SRB_HOLD_UNLOCK; out.toastMessage = "Press ANY key or Mouse button for Hold-to-Unlock..."; return true;
             case DA_CLEAR_HOLD_UNLOCK: profile.holdUnlockVk = 0; out.profileModified = true; out.toastMessage = "Hold-to-Unlock cleared"; return true;
+            case DA_TOGGLE_ADVANCED:
+                advancedExpanded_ = !advancedExpanded_;
+                return true;
+            case DA_REBIND_RESET_TOUCH: specialRebind_ = SRB_RESET_TOUCH; out.toastMessage = "Press key for Quick Touch Reset..."; return true;
+            case DA_REBIND_JOY_UP:      specialRebind_ = SRB_JOY_UP;      out.toastMessage = "Press key for Joystick Up..."; return true;
+            case DA_REBIND_JOY_DOWN:    specialRebind_ = SRB_JOY_DOWN;    out.toastMessage = "Press key for Joystick Down..."; return true;
+            case DA_REBIND_JOY_LEFT:    specialRebind_ = SRB_JOY_LEFT;    out.toastMessage = "Press key for Joystick Left..."; return true;
+            case DA_REBIND_JOY_RIGHT:   specialRebind_ = SRB_JOY_RIGHT;   out.toastMessage = "Press key for Joystick Right..."; return true;
+            case DA_REBIND_JOY_SPRINT:  specialRebind_ = SRB_JOY_SPRINT;  out.toastMessage = "Press key for Joystick Sprint..."; return true;
+            case DA_REBIND_JOY_WALK:    specialRebind_ = SRB_JOY_WALK;    out.toastMessage = "Press key for Joystick Walk..."; return true;
+            case DA_CLEAR_JOY_WALK:
+                profile.vkWalk = 0;
+                out.profileModified = true;
+                out.toastMessage = "Joystick Walk key cleared";
+                return true;
             case DA_RESET_SENS: {
                 Profile def = ProfileDefaults::createFreeFire();
                 profile.sensX = def.sensX; profile.sensY = def.sensY;
@@ -1057,7 +1208,7 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 profile.ffCounterAccel = def.ffCounterAccel;
                 profile.smoothing = def.smoothing;
                 profile.hudOpacity = def.hudOpacity;
-                out.profileModified = true;
+                out.tuningOnlyModified = true;
                 out.toastMessage = "Sensitivities reset to default Free Fire values";
                 return true;
             }
@@ -1222,6 +1373,9 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 out.requestConnectWireless = true;
                 out.wirelessAddr = settings.lastWirelessAddr;
                 return true;
+            case DA_OPEN_ONBOARDING:
+                out.requestOpenOnboarding = true;
+                return true;
             default:
                 break;
         }
@@ -1235,7 +1389,8 @@ bool DrawerPanel::onMouseMove(int x, int y, Profile& profile, int selectedBtnInd
         float w = static_cast<float>(activeSliderTrack_.right - activeSliderTrack_.left);
         float t = (w > 1.0f) ? (static_cast<float>(x - activeSliderTrack_.left) / w) : 0.0f;
         applySliderValue(activeSliderId_, t, profile, selectedBtnIndex);
-        out.profileModified = true;
+        if (activeSliderId_ == DSL_NODE_DUR) out.profileModified = true;
+        else                               out.tuningOnlyModified = true;
         return true;
     }
     return false;
@@ -1259,24 +1414,26 @@ bool DrawerPanel::onMouseWheel(int x, int y, int delta) {
 
 bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
                             int selectedBtnIndex, DrawerActionResult& out) {
-    if (rebindingToggleAim_) {
+    if (specialRebind_ != SRB_NONE) {
         if (vk != VK_ESCAPE) {
             vk = KeyCodes::normalizeModifier(vk);
-            profile.toggleAimVk = vk;
+            std::string lbl = specialRebindLabel();
+            switch (specialRebind_) {
+                case SRB_TOGGLE_AIM:  profile.toggleAimVk = vk; break;
+                case SRB_HOLD_UNLOCK: profile.holdUnlockVk = vk; break;
+                case SRB_RESET_TOUCH: profile.resetTouchVk = vk; break;
+                case SRB_JOY_UP:      profile.vkUp = vk; break;
+                case SRB_JOY_DOWN:    profile.vkDown = vk; break;
+                case SRB_JOY_LEFT:    profile.vkLeft = vk; break;
+                case SRB_JOY_RIGHT:   profile.vkRight = vk; break;
+                case SRB_JOY_SPRINT:  profile.vkSprint = vk; break;
+                case SRB_JOY_WALK:    profile.vkWalk = vk; break;
+                default: break;
+            }
             out.profileModified = true;
-            out.toastMessage = "Aim Lock Toggle bound to " + KeyCodes::toName(vk);
+            out.toastMessage = lbl + " bound to " + KeyCodes::toName(vk);
         }
-        rebindingToggleAim_ = false;
-        return true;
-    }
-    if (rebindingHoldUnlock_) {
-        if (vk != VK_ESCAPE) {
-            vk = KeyCodes::normalizeModifier(vk);
-            profile.holdUnlockVk = vk;
-            out.profileModified = true;
-            out.toastMessage = "Hold-to-Unlock bound to " + KeyCodes::toName(vk);
-        }
-        rebindingHoldUnlock_ = false;
+        specialRebind_ = SRB_NONE;
         return true;
     }
     if (editingNewProfileName_) {
@@ -1313,29 +1470,25 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
 }
 
 bool DrawerPanel::onMouseBind(int mouseVk, Profile& profile, DrawerActionResult& out) {
-    if (rebindingToggleAim_) {
-        if (mouseVk == VK_LBUTTON) {
-            out.toastMessage = "Use Keyboard, MMB, RMB, X1, X2, or Wheel for Aim Lock";
-            return true;
-        }
+    if (specialRebind_ == SRB_NONE) return false;
+    if (mouseVk == VK_LBUTTON) {
+        out.toastMessage = "Use Keyboard, MMB, RMB, X1, X2, or Wheel for " + specialRebindLabel();
+        return true;
+    }
+    if (specialRebind_ != SRB_TOGGLE_AIM && specialRebind_ != SRB_HOLD_UNLOCK) {
+        out.toastMessage = "Please press a keyboard key for " + specialRebindLabel();
+        return true;
+    }
+    if (specialRebind_ == SRB_TOGGLE_AIM) {
         profile.toggleAimVk = mouseVk;
-        rebindingToggleAim_ = false;
-        out.profileModified = true;
         out.toastMessage = "Aim Lock Toggle bound to " + KeyCodes::toName(mouseVk);
-        return true;
-    }
-    if (rebindingHoldUnlock_) {
-        if (mouseVk == VK_LBUTTON) {
-            out.toastMessage = "Use Keyboard, MMB, RMB, X1, X2, or Wheel for Hold-Unlock";
-            return true;
-        }
+    } else {
         profile.holdUnlockVk = mouseVk;
-        rebindingHoldUnlock_ = false;
-        out.profileModified = true;
         out.toastMessage = "Hold-to-Unlock bound to " + KeyCodes::toName(mouseVk);
-        return true;
     }
-    return false;
+    specialRebind_ = SRB_NONE;
+    out.profileModified = true;
+    return true;
 }
 
 bool DrawerPanel::onChar(char ch, Profile& profile, AppSettings& settings,

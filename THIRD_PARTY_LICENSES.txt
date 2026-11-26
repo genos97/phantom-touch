@@ -1,0 +1,17 @@
+Phantom Touch — Third-Party Software Notices
+============================================
+
+This distribution bundles unmodified runtime binaries from the following upstream
+projects inside .\scrcpy\:
+
+1. Genymobile/scrcpy (v5.0.1) — https://github.com/Genymobile/scrcpy
+   - Components: scrcpy.exe, scrcpy-server, SDL3.dll, FFmpeg (avcodec, avformat,
+     avutil, swresample), libusb-1.0.dll
+   - License: Apache License, Version 2.0 (see .\scrcpy\LICENSE.txt for the full text
+     and upstream third-party library notices included by Genymobile).
+
+2. Android Debug Bridge (adb) — Android SDK Platform-Tools
+   - Components: adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll
+   - License: Apache License 2.0 / Android Software Development Kit License Agreement
+     (https://developer.android.com/studio/terms).
+   - Included unmodified from the official Genymobile scrcpy-win64-v5.0.1 package.

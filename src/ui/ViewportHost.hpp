@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bridge/ConnectionState.hpp"
 #include "bridge/QrCodeGen.hpp"
 #include "bridge/ScrcpyBridge.hpp"
 #include "ui/GdiPlusDraw.hpp"
@@ -15,12 +16,34 @@ enum HubActionType {
     HUB_FOCUS_WIFI_ADDR,
     HUB_CONNECT_WIFI,
     HUB_TOGGLE_QR_PAIR,
-    HUB_START_OFFLINE_STUDIO
+    HUB_START_OFFLINE_STUDIO,
+    HUB_REPAIR_TOOLS,
+    HUB_OPEN_ONBOARDING,
+    HUB_CANCEL_RECONNECT,
+    HUB_RETRY_RECONNECT,
+    HUB_COPY_ERROR
 };
 
 struct HubClickResult {
     HubActionType action = HUB_NONE;
     int index = -1;
+};
+
+struct HubViewState {
+    ConnState connState = CONN_NO_DEVICE;
+    ConnectProgressStep connectStep = CONN_STEP_PUSH_SERVER;
+    int reconnectCountdownSec = 0;
+    int reconnectAttempt = 0;
+    int maxReconnectAttempts = 5;
+    std::string statusMsg;
+    std::string errorDetails;
+    bool secureAppBlocked = false;
+    const std::vector<AdbDeviceInfo>* devices = nullptr;
+    std::string wirelessAddr;
+    bool editingWirelessAddr = false;
+    bool showingQrPair = false;
+    const QrMatrix* qrMatrix = nullptr;
+    std::string qrStatus;
 };
 
 // Manages the center viewport of the Emulator Shell:
@@ -92,17 +115,16 @@ public:
     RECT activeVideoScreenRect() const;
     ViewportRect activeVideoClientRect() const { return videoRect_; }
 
-    // Renders either dark letterbox backdrop (connected) or interactive Device Hub (disconnected)
+    // Renders either dark letterbox backdrop (connected) or interactive X2/F3 Device Hub (disconnected)
     void paint(Gdiplus::Graphics& g, const RECT& clientRc,
-               bool connected, bool demoMode, bool connecting,
-               const std::string& statusMsg,
-               const std::vector<AdbDeviceInfo>& devices,
-               const std::string& wirelessAddr, bool editingWirelessAddr,
-               bool showingQrPair, const QrMatrix* qrMatrix, const std::string& qrStatus,
+               bool connected, bool demoMode,
+               const HubViewState& hub,
                int hoverX, int hoverY);
 
     HubClickResult hitTestHub(int x, int y) const;
+    bool onHubMouseWheel(int x, int y, int delta);
     bool hoverHubAt(int x, int y, int& outId, RECT& outRc) const;
+    bool rectForHubAction(HubActionType act, int extra, RECT& outRc) const;
 
 private:
     static LRESULT CALLBACK hostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -126,6 +148,9 @@ private:
     uint32_t lastPhoneW_ = 1920;
     uint32_t lastPhoneH_ = 1080;
     std::vector<HubHotspot> hotspots_;
+    RECT hubDeviceListRc_ = { 0, 0, 0, 0 };
+    int hubDeviceScrollY_ = 0;
+    int hubDeviceMaxScrollY_ = 0;
     Gdiplus::Bitmap* cachedQrBmp_ = nullptr;
     int cachedQrSize_ = 0;
     int cachedQrCellPx_ = 0;

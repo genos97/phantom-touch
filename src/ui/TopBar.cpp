@@ -53,20 +53,22 @@ void TopBar::layout(const RECT& bounds,
     buttons_.push_back(Btn{ rProf_, TB_OPEN_PROFILES });
     curX = rProf_.right + dp(8);
 
-    // Right Window Chrome Controls (Close, Max, Min, Pin)
+    // Right Window Chrome Controls (Close, Max, Min, Pin, Help)
     const int winBtnW = dp(42);
     rClose_   = { x1 - winBtnW, y0, x1, y1 - 1 };
     maxBtnRc_ = { rClose_.left - winBtnW, y0, rClose_.left, y1 - 1 };
     rMin_     = { maxBtnRc_.left - winBtnW, y0, maxBtnRc_.left, y1 - 1 };
     rPin_     = { rMin_.left - dp(34), y0 + dp(6), rMin_.left - dp(4), y1 - dp(6) };
+    rHelp_    = { rPin_.left - dp(30), y0 + dp(6), rPin_.left - dp(4), y1 - dp(6) };
 
+    buttons_.push_back(Btn{ rHelp_, TB_OPEN_HELP });
     buttons_.push_back(Btn{ rPin_, TB_TOGGLE_PIN });
     buttons_.push_back(Btn{ rMin_, TB_MINIMIZE });
     buttons_.push_back(Btn{ maxBtnRc_, TB_MAXIMIZE });
     buttons_.push_back(Btn{ rClose_, TB_CLOSE });
 
     // Live Telemetry Pill + Video Pipeline Latency Pill (0.1)
-    int availRight = rPin_.left - dp(12);
+    int availRight = rHelp_.left - dp(12);
     if (connected && videoTel.presentedCount > 0 && (availRight - curX) >= dp(400)) {
         char latBuf[80];
         std::snprintf(latBuf, sizeof(latBuf), "p50 %.1f / p95 %.1fms | %llu/%llu/%llu",
@@ -157,12 +159,18 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
     if (ptIn(rClose_, hoverX, hoverY))   GdiPlusDraw::fillRect(g, rClose_, Theme::ACCENT_RED);
     if (ptIn(maxBtnRc_, hoverX, hoverY)) GdiPlusDraw::fillRect(g, maxBtnRc_, Theme::BG_CARD_HOVER);
     if (ptIn(rMin_, hoverX, hoverY))     GdiPlusDraw::fillRect(g, rMin_, Theme::BG_CARD_HOVER);
+    bool hovHelp = ptIn(rHelp_, hoverX, hoverY);
+    if (hovHelp) {
+        GdiPlusDraw::roundedCard(g, rHelp_, GdiPlusDraw::dpf(6.0f), Theme::BG_CARD_HOVER, Theme::ACCENT_CYAN, 1.0f);
+    }
     bool hovPin = ptIn(rPin_, hoverX, hoverY);
     if (alwaysOnTop || hovPin) {
         GdiPlusDraw::roundedCard(g, rPin_, GdiPlusDraw::dpf(6.0f), alwaysOnTop ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD_HOVER,
                                  alwaysOnTop ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
     }
 
+    GdiPlusDraw::textCenter(g, "?", static_cast<float>(rHelp_.left + rHelp_.right) * 0.5f, cy,
+                            12.5f, true, hovHelp ? Theme::ACCENT_CYAN : Theme::TEXT_MUTED);
     GdiPlusDraw::drawIcon(g, ICON_PIN,      static_cast<float>(rPin_.left + rPin_.right) * 0.5f,       cy, GdiPlusDraw::dpf(12.0f), alwaysOnTop ? Theme::ACCENT_CYAN : Theme::TEXT_MUTED);
     GdiPlusDraw::drawIcon(g, ICON_MINIMIZE, static_cast<float>(rMin_.left + rMin_.right) * 0.5f,       cy, GdiPlusDraw::dpf(11.0f), Theme::TEXT_SECONDARY);
     GdiPlusDraw::drawIcon(g, ICON_MAXIMIZE, static_cast<float>(maxBtnRc_.left + maxBtnRc_.right) * 0.5f, cy, GdiPlusDraw::dpf(maximized ? 10.0f : 11.0f), Theme::TEXT_SECONDARY);
