@@ -31,6 +31,8 @@ struct AdbDeviceInfo {
     bool wireless = false;
 };
 
+typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
+
 class ScrcpyBridge {
 public:
     ScrcpyBridge();
@@ -41,6 +43,7 @@ public:
     bool connectWireless(const ToolPaths& tools, const std::string& ipPort, std::string& outMsg);
 
     static std::vector<AdbDeviceInfo> parseAdbDevicesOutput(const std::string& raw);
+    static std::string parseForegroundPackage(const std::string& dumpsysRaw);
 
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,
@@ -59,12 +62,22 @@ public:
     std::string deviceName() const;
     void getScreenSize(uint32_t& outW, uint32_t& outH) const;
 
-    // Sends a 32-byte SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT packet
+    // Multi-touch, keyboard, text, clipboard, and display control over scrcpy control socket
     bool sendTouchPixels(TouchAction action, uint64_t pointerId, int32_t px, int32_t py, bool clampToScreen = true);
     bool sendTouchNorm(TouchAction action, uint64_t pointerId, float nx, float ny);
-    bool sendKeycode(uint8_t action, uint32_t androidKeycode);
+    bool sendKeycode(uint8_t action, uint32_t androidKeycode, uint32_t metastate = 0);
+    bool sendText(const std::string& utf8Text);
+    bool sendSetClipboard(const std::string& utf8Text, bool paste);
+    bool sendGetClipboard(uint8_t copyKey); // 0=NONE, 1=COPY, 2=CUT
     void sendAndroidNav(uint32_t androidKeycode);
     bool setDisplayPower(bool on);
+
+    void setClipboardCallback(DeviceClipboardFn fn, void* ctx);
+
+    // Foreground app inspection & Drag-and-Drop file/APK helpers
+    std::string queryForegroundPackage();
+    bool installApk(const std::string& localApkPath, std::string& outMsg);
+    bool pushFileToDownloads(const std::string& localFilePath, std::string& outMsg);
 
     // Captures a native device PNG screenshot via adb exec-out screencap -p
     bool captureScreenshot(const std::string& savePath, std::string& outError);
@@ -111,4 +124,8 @@ private:
     uint32_t screenW_ = 1920;
     uint32_t screenH_ = 1080;
     std::vector<std::string> logs_;
+
+    uint64_t clipSeq_ = 1;
+    DeviceClipboardFn clipCb_ = nullptr;
+    void* clipCbCtx_ = nullptr;
 };

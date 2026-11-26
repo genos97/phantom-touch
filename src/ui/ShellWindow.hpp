@@ -55,6 +55,9 @@ private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static DWORD WINAPI connectThreadProc(LPVOID param);
     static DWORD WINAPI wirelessThreadProc(LPVOID param);
+    static DWORD WINAPI appWatcherThreadProc(LPVOID param);
+    static DWORD WINAPI dropWorkerThreadProc(LPVOID param);
+    static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
 
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -70,9 +73,18 @@ private:
 
     void startAsyncConnect(const std::string& serial);
     void startAsyncWirelessConnect(const std::string& ipPort);
+    void startAsyncDropTransfer(const std::vector<std::string>& files);
     void refreshAdbDevices();
     void disconnectDevice(bool returnToHub);
     void takeScreenshot();
+
+    void handleForegroundAppChanged(const std::string& pkg);
+    bool switchProfilePath(const std::string& targetPath, bool showAutoToast);
+    std::string ensureDesktopProfileExists();
+    bool handleDesktopKeyEvent(int vk, bool down);
+    bool handleDesktopChar(wchar_t ch);
+    std::string readWindowsClipboardUtf8() const;
+    void writeWindowsClipboardUtf8(const std::string& utf8Text);
 
     void setAimMode(bool enabled);
     void setDrawerState(bool open, int tab);
@@ -115,13 +127,27 @@ private:
     std::string hubStatusMsg_;
     bool editingHubWireless_ = false;
 
-    // Async connection state
+    // Async connection, foreground-app watcher, clipboard sync & drag-drop state
+    mutable CRITICAL_SECTION auxLock_;
     HANDLE connectThread_ = NULL;
+    HANDLE appWatcherThread_ = NULL;
+    HANDLE dropThread_ = NULL;
     volatile LONG connecting_ = 0;
+    volatile LONG stopAuxThreads_ = 0;
+    volatile LONG dropping_ = 0;
     std::string pendingSerial_;
     std::string pendingWirelessIp_;
     std::string asyncResultMsg_;
     bool asyncResultOk_ = false;
+
+    std::string activeAppPackage_;
+    std::string pendingForegroundPkg_;
+    std::string lastGameProfilePath_;
+    std::string pendingDeviceClip_;
+    std::string lastSyncedClip_;
+    std::vector<std::string> pendingDropFiles_;
+    std::string pendingDropToast_;
+    bool rightClickBackSwallowUp_ = false;
 
     Profile profile_;
     bool profileDirty_ = false;

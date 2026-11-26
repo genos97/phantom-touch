@@ -86,6 +86,7 @@ InputEngine::~InputEngine() {
 }
 
 void InputEngine::rebuildKeyRouteCacheLocked() {
+    routeKeymapEnabled_ = profile_.keymapEnabled;
     routeVkUp_     = profile_.vkUp;
     routeVkDown_   = profile_.vkDown;
     routeVkLeft_   = profile_.vkLeft;
@@ -263,12 +264,34 @@ void InputEngine::onDirectCursorScroll(float normX, float normY, int wheelNotche
         return;
     }
     EnterCriticalSection(&inputLock_);
-    if (!pendingScroll_.empty()) {
+    if (!pendingScroll_.empty() && !pendingScroll_.back().isPinch) {
         pendingScroll_.back().normX = normX;
         pendingScroll_.back().normY = normY;
         pendingScroll_.back().notches += wheelNotches;
     } else {
-        QueuedCursorScroll q = { normX, normY, wheelNotches };
+        QueuedCursorScroll q = { normX, normY, wheelNotches, false };
+        pendingScroll_.push_back(q);
+    }
+    LeaveCriticalSection(&inputLock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+void InputEngine::onDirectCursorPinch(float normX, float normY, int wheelNotches) {
+    if (aimMode_ || wheelNotches == 0) return;
+    double nowMs = getTimeMs();
+    if (thread_ == NULL) {
+        EnterCriticalSection(&lock_);
+        processDirectCursorPinchLocked(normX, normY, wheelNotches, nowMs);
+        LeaveCriticalSection(&lock_);
+        return;
+    }
+    EnterCriticalSection(&inputLock_);
+    if (!pendingScroll_.empty() && pendingScroll_.back().isPinch) {
+        pendingScroll_.back().normX = normX;
+        pendingScroll_.back().normY = normY;
+        pendingScroll_.back().notches += wheelNotches;
+    } else {
+        QueuedCursorScroll q = { normX, normY, wheelNotches, true };
         pendingScroll_.push_back(q);
     }
     LeaveCriticalSection(&inputLock_);
@@ -358,8 +381,69 @@ void InputEngine::releaseCursorScrollLocked() {
     }
 }
 
+void InputEngine::processDirectCursorPinchLocked(float normX, float normY, int wheelNotches, double nowMs) {
+    if (wheelNotches == 0) return;
+    releaseCursorScrollLocked();
+
+    uint32_t w = 1920, h = 1080;
+    bridge_->getScreenSize(w, h);
+    double dw = static_cast<double>(w > 0 ? w : 1920);
+    double dh = static_cast<double>(h > 0 ? h : 1080);
+
+    double cx = clampd(static_cast<double>(normX) * dw, 48.0, dw - 49.0);
+    double cy = clampd(static_cast<double>(normY) * dh, 48.0, dh - 49.0);
+    double maxR = (dw < dh ? dw : dh) * 0.36;
+    if (maxR < 80.0) maxR = 80.0;
+    const double minR = 24.0;
+    const double stepPx = 30.0;
+
+    if (cursorPinchDown_) {
+        double nextR = pinchRadius_ + static_cast<double>(wheelNotches) * stepPx;
+        if (nextR < minR || nextR > maxR || std::fabs(cx - pinchCenterX_) > dw * 0.15) {
+            releaseCursorPinchLocked();
+        }
+    }
+
+    if (!cursorPinchDown_) {
+        pinchCenterX_ = cx;
+        pinchCenterY_ = cy;
+        pinchRadius_ = (wheelNotches > 0) ? (maxR * 0.28) : (maxR * 0.72);
+        if (pinchRadius_ < minR + 10.0) pinchRadius_ = minR + 10.0;
+        double d = pinchRadius_ * 0.7071;
+        int32_t ax = static_cast<int32_t>(std::floor(clampd(pinchCenterX_ - d, 4.0, dw - 5.0) + 0.5));
+        int32_t ay = static_cast<int32_t>(std::floor(clampd(pinchCenterY_ - d, 4.0, dh - 5.0) + 0.5));
+        int32_t bx = static_cast<int32_t>(std::floor(clampd(pinchCenterX_ + d, 4.0, dw - 5.0) + 0.5));
+        int32_t by = static_cast<int32_t>(std::floor(clampd(pinchCenterY_ + d, 4.0, dh - 5.0) + 0.5));
+        fingerPool_.emit(TOUCH_DOWN, PointerId::PINCH_A, ax, ay, true);
+        fingerPool_.emit(TOUCH_DOWN, PointerId::PINCH_B, bx, by, true);
+        cursorPinchDown_ = true;
+        packetsThisSec_ += 2;
+    }
+
+    pinchRadius_ = clampd(pinchRadius_ + static_cast<double>(wheelNotches) * stepPx, minR, maxR);
+    double d = pinchRadius_ * 0.7071;
+    int32_t ax = static_cast<int32_t>(std::floor(clampd(pinchCenterX_ - d, 4.0, dw - 5.0) + 0.5));
+    int32_t ay = static_cast<int32_t>(std::floor(clampd(pinchCenterY_ - d, 4.0, dh - 5.0) + 0.5));
+    int32_t bx = static_cast<int32_t>(std::floor(clampd(pinchCenterX_ + d, 4.0, dw - 5.0) + 0.5));
+    int32_t by = static_cast<int32_t>(std::floor(clampd(pinchCenterY_ + d, 4.0, dh - 5.0) + 0.5));
+    if (fingerPool_.emit(TOUCH_MOVE, PointerId::PINCH_A, ax, ay, true)) ++packetsThisSec_;
+    if (fingerPool_.emit(TOUCH_MOVE, PointerId::PINCH_B, bx, by, true)) ++packetsThisSec_;
+    pinchReleaseAtMs_ = nowMs + 140.0;
+}
+
+void InputEngine::releaseCursorPinchLocked() {
+    if (cursorPinchDown_) {
+        fingerPool_.releaseLogical(PointerId::PINCH_A);
+        fingerPool_.releaseLogical(PointerId::PINCH_B);
+        cursorPinchDown_ = false;
+        pinchReleaseAtMs_ = 0.0;
+        packetsThisSec_ += 2;
+    }
+}
+
 bool InputEngine::classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim) {
     outRequestToggleAim = false;
+    if (!routeKeymapEnabled_) return false;
     bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
     bool mouseBtn = KeyCodes::isMouseKey(vk);
 
@@ -416,6 +500,10 @@ bool InputEngine::classifyKeyInputLocked(int vk, bool down, bool isAim, bool& ou
 
 bool InputEngine::isKeyMapped(int vk, bool aimModeActive) const {
     EnterCriticalSection(&inputLock_);
+    if (!routeKeymapEnabled_) {
+        LeaveCriticalSection(&inputLock_);
+        return false;
+    }
     bool mouseBtn = KeyCodes::isMouseKey(vk);
     if (!aimModeActive && mouseBtn) {
         for (size_t i = 0; i < routeButtons_.size(); ++i) {
@@ -474,6 +562,7 @@ bool InputEngine::onKeyEvent(int vk, bool down, bool& outRequestToggleAim) {
 }
 
 void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs) {
+    if (!profile_.keymapEnabled) return;
     bool isAim = (aimMode_ != 0);
     bool isWheel = (vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN);
     bool mouseBtn = KeyCodes::isMouseKey(vk);
@@ -662,6 +751,7 @@ void InputEngine::releaseMouseTouchesLocked() {
         directCursorDown_ = false;
     }
     releaseCursorScrollLocked();
+    releaseCursorPinchLocked();
 }
 
 void InputEngine::releaseAllLocked() {
@@ -727,8 +817,13 @@ void InputEngine::processTick(double nowMs) {
     }
     for (size_t i = 0; i < localScroll.size(); ++i) {
         if (!aimMode_) {
-            processDirectCursorScrollLocked(localScroll[i].normX, localScroll[i].normY,
-                                            localScroll[i].notches, nowMs);
+            if (localScroll[i].isPinch) {
+                processDirectCursorPinchLocked(localScroll[i].normX, localScroll[i].normY,
+                                               localScroll[i].notches, nowMs);
+            } else {
+                processDirectCursorScrollLocked(localScroll[i].normX, localScroll[i].normY,
+                                                localScroll[i].notches, nowMs);
+            }
         }
     }
 
@@ -737,6 +832,9 @@ void InputEngine::processTick(double nowMs) {
 
     if (cursorScrollDown_ && (aimMode_ || nowMs >= cursorScrollReleaseAtMs_)) {
         releaseCursorScrollLocked();
+    }
+    if (cursorPinchDown_ && (aimMode_ || nowMs >= pinchReleaseAtMs_)) {
+        releaseCursorPinchLocked();
     }
 
     if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {

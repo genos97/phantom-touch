@@ -495,7 +495,7 @@ bool ScrcpyBridge::connectControl(const ToolPaths& tools, int controlMaxSize, st
                          " send_device_meta=true"
                          " send_codec_meta=true"
                          " send_frame_meta=true"
-                         " clipboard_autosync=false"
+                         " clipboard_autosync=true"
                          " power_on=true"
                          " stay_awake=" + std::string(stayAwake ? "true" : "false") +
                          " cleanup=false";
@@ -760,7 +760,7 @@ bool ScrcpyBridge::sendTouchNorm(TouchAction action, uint64_t pointerId, float n
     return sendTouchPixels(action, pointerId, px, py);
 }
 
-bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode) {
+bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode, uint32_t metastate) {
     if (!connected_) return false;
     // SC_CONTROL_MSG_TYPE_INJECT_KEYCODE (14 bytes):
     // [0] type=0, [1] action, [2..5] keycode, [6..9] repeat, [10..13] metastate
@@ -769,12 +769,176 @@ bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode) {
     msg[1] = action;
     writeU32BE(msg + 2, androidKeycode);
     writeU32BE(msg + 6, 0);
-    writeU32BE(msg + 10, 0);
+    writeU32BE(msg + 10, metastate);
 
     EnterCriticalSection(&sendLock_);
     bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
     LeaveCriticalSection(&sendLock_);
     return ok;
+}
+
+bool ScrcpyBridge::sendText(const std::string& utf8Text) {
+    if (!connected_ || utf8Text.empty()) return false;
+    // SC_CONTROL_MSG_TYPE_INJECT_TEXT (type=1): [1:1][len:4 BE][utf8 bytes] (max 300B per scrcpy packet)
+    const size_t kChunk = 250;
+    size_t off = 0;
+    while (off < utf8Text.size()) {
+        size_t n = utf8Text.size() - off;
+        if (n > kChunk) n = kChunk;
+        std::vector<uint8_t> msg(5 + n);
+        msg[0] = 1;
+        writeU32BE(msg.data() + 1, static_cast<uint32_t>(n));
+        std::memcpy(msg.data() + 5, utf8Text.data() + off, n);
+
+        EnterCriticalSection(&sendLock_);
+        bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
+        LeaveCriticalSection(&sendLock_);
+        if (!ok) return false;
+        off += n;
+    }
+    return true;
+}
+
+bool ScrcpyBridge::sendSetClipboard(const std::string& utf8Text, bool paste) {
+    if (!connected_) return false;
+    // SC_CONTROL_MSG_TYPE_SET_CLIPBOARD (type=9): [9:1][seq:8 BE][paste:1][len:4 BE][utf8 bytes]
+    size_t len = utf8Text.size();
+    if (len > 262100) len = 262100;
+    std::vector<uint8_t> msg(14 + len);
+    msg[0] = 9;
+    EnterCriticalSection(&sendLock_);
+    uint64_t seq = ++clipSeq_;
+    writeU64BE(msg.data() + 1, seq);
+    msg[9] = paste ? 1u : 0u;
+    writeU32BE(msg.data() + 10, static_cast<uint32_t>(len));
+    if (len > 0) std::memcpy(msg.data() + 14, utf8Text.data(), len);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
+}
+
+bool ScrcpyBridge::sendGetClipboard(uint8_t copyKey) {
+    if (!connected_) return false;
+    // SC_CONTROL_MSG_TYPE_GET_CLIPBOARD (type=8): [8:1][copy_key:1] (0=NONE, 1=COPY, 2=CUT)
+    uint8_t msg[2];
+    msg[0] = 8;
+    msg[1] = copyKey;
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
+    LeaveCriticalSection(&sendLock_);
+    return ok;
+}
+
+void ScrcpyBridge::setClipboardCallback(DeviceClipboardFn fn, void* ctx) {
+    EnterCriticalSection(&metaLock_);
+    clipCb_ = fn;
+    clipCbCtx_ = ctx;
+    LeaveCriticalSection(&metaLock_);
+}
+
+std::string ScrcpyBridge::parseForegroundPackage(const std::string& raw) {
+    // Parses Android 8-16 dumpsys window / dumpsys activity lines such as:
+    //   mCurrentFocus=Window{abc u0 com.dts.freefiremax/com.dts.freefireth.FFMainActivity}
+    //   mFocusedApp=ActivityRecord{abc u0 com.whatsapp/.HomeActivity t42}
+    //   topResumedActivity=ActivityRecord{abc u0 com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity t19}
+    std::istringstream iss(raw);
+    std::string line;
+    std::string fallback;
+
+    auto extractPkgFromLine = [](const std::string& ln) -> std::string {
+        size_t slash = ln.find('/');
+        while (slash != std::string::npos) {
+            size_t start = slash;
+            while (start > 0) {
+                char c = ln[start - 1];
+                bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '_';
+                if (!ok) break;
+                --start;
+            }
+            if (slash > start) {
+                std::string pkg = ln.substr(start, slash - start);
+                // Valid Android package names contain at least one dot and aren't transient system overlays
+                if (pkg.find('.') != std::string::npos &&
+                    pkg != "com.android.systemui" &&
+                    pkg.find("inputmethod") == std::string::npos) {
+                    return pkg;
+                }
+            }
+            slash = ln.find('/', slash + 1);
+        }
+        return "";
+    };
+
+    while (std::getline(iss, line)) {
+        if (line.find("NotificationShade") != std::string::npos ||
+            line.find("InputMethod") != std::string::npos ||
+            line.find("StatusBar") != std::string::npos) {
+            continue;
+        }
+        bool isPrimary = (line.find("mCurrentFocus") != std::string::npos ||
+                          line.find("topResumedActivity") != std::string::npos);
+        bool isSecondary = (line.find("mFocusedApp") != std::string::npos ||
+                            line.find("mResumedActivity") != std::string::npos);
+        if (!isPrimary && !isSecondary) continue;
+
+        std::string pkg = extractPkgFromLine(line);
+        if (!pkg.empty()) {
+            if (isPrimary) return pkg;
+            if (fallback.empty()) fallback = pkg;
+        }
+    }
+    return fallback;
+}
+
+std::string ScrcpyBridge::queryForegroundPackage() {
+    if (!connected_ || adbExe_.empty()) return "";
+    std::string raw;
+    DWORD ec = 0;
+    std::string adb = adbPrefix();
+    if (runCommandCapture(adb + " shell \"dumpsys window displays | grep -E 'mCurrentFocus|mFocusedApp'\"", raw, ec)) {
+        std::string pkg = parseForegroundPackage(raw);
+        if (!pkg.empty()) return pkg;
+    }
+    if (runCommandCapture(adb + " shell \"dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'\"", raw, ec)) {
+        std::string pkg = parseForegroundPackage(raw);
+        if (!pkg.empty()) return pkg;
+    }
+    return "";
+}
+
+bool ScrcpyBridge::installApk(const std::string& localApkPath, std::string& outMsg) {
+    outMsg.clear();
+    if (adbExe_.empty()) { outMsg = "ADB not ready"; return false; }
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture(adbPrefix() + " install -r \"" + localApkPath + "\"", raw, ec)) {
+        outMsg = "Failed to execute adb install";
+        return false;
+    }
+    while (!raw.empty() && (raw.back() == '\r' || raw.back() == '\n')) raw.pop_back();
+    bool ok = (ec == 0 && raw.find("Success") != std::string::npos);
+    outMsg = ok ? "APK installed successfully" : (raw.empty() ? "APK install failed" : raw);
+    appendLog("[APK] " + outMsg);
+    return ok;
+}
+
+bool ScrcpyBridge::pushFileToDownloads(const std::string& localFilePath, std::string& outMsg) {
+    outMsg.clear();
+    if (adbExe_.empty()) { outMsg = "ADB not ready"; return false; }
+    size_t slash = localFilePath.find_last_of("\\/");
+    std::string fname = (slash == std::string::npos) ? localFilePath : localFilePath.substr(slash + 1);
+    std::string remote = "/sdcard/Download/" + fname;
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture(adbPrefix() + " push \"" + localFilePath + "\" \"" + remote + "\"", raw, ec) || ec != 0) {
+        outMsg = "Push failed for " + fname;
+        appendLog("[Push] " + outMsg);
+        return false;
+    }
+    outMsg = "Sent " + fname + " -> /sdcard/Download/";
+    appendLog("[Push] " + outMsg);
+    return true;
 }
 
 void ScrcpyBridge::sendAndroidNav(uint32_t androidKeycode) {
@@ -884,9 +1048,43 @@ void ScrcpyBridge::runVideoReader() {
 }
 
 void ScrcpyBridge::runControlReader() {
-    uint8_t buf[512];
+    // Parse framed scrcpy DeviceMessages (clipboard sync from Android -> Windows!)
     while (!stopThreads_) {
-        int n = recv(controlSock_, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        if (n <= 0) break;
+        uint8_t msgType = 0;
+        if (!recvAll(controlSock_, &msgType, 1)) break;
+
+        if (msgType == 0 /* DEVICE_MSG_TYPE_CLIPBOARD */) {
+            uint8_t lenBuf[4];
+            if (!recvAll(controlSock_, lenBuf, 4)) break;
+            uint32_t len = readU32BE(lenBuf);
+            if (len > 4u * 1024u * 1024u) break;
+            std::string clipText(len, '\0');
+            if (len > 0 && !recvAll(controlSock_, reinterpret_cast<uint8_t*>(&clipText[0]), static_cast<int>(len))) {
+                break;
+            }
+            DeviceClipboardFn cb = nullptr;
+            void* ctx = nullptr;
+            EnterCriticalSection(&metaLock_);
+            cb = clipCb_;
+            ctx = clipCbCtx_;
+            LeaveCriticalSection(&metaLock_);
+            if (cb && !clipText.empty()) {
+                cb(ctx, clipText);
+            }
+        } else if (msgType == 1 /* DEVICE_MSG_TYPE_ACK_CLIPBOARD */) {
+            uint8_t seqBuf[8];
+            if (!recvAll(controlSock_, seqBuf, 8)) break;
+        } else if (msgType == 2 /* DEVICE_MSG_TYPE_UHID_OUTPUT */) {
+            uint8_t hdr[4];
+            if (!recvAll(controlSock_, hdr, 4)) break;
+            uint16_t sz = static_cast<uint16_t>((static_cast<uint16_t>(hdr[2]) << 8) | hdr[3]);
+            if (sz > 0) {
+                std::vector<uint8_t> skip(sz);
+                if (!recvAll(controlSock_, skip.data(), static_cast<int>(sz))) break;
+            }
+        } else {
+            // Unknown future device message type: stop parsing stream safely
+            break;
+        }
     }
 }

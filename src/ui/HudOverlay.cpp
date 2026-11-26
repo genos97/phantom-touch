@@ -250,11 +250,11 @@ void HudOverlay::renderLayered() {
             // Play Mode: 100% transparent outside the frosted keycaps!
             g.Clear(Gdiplus::Color(0, 0, 0, 0));
 
-            if (p.showHudInPlay || demoMode) {
+            if (p.keymapEnabled && (p.showHudInPlay || demoMode)) {
                 HudRenderer::paintKeymapNodes(g, w, h, p, tel, false, demoMode,
                                               -1, -1, false, false, p.hudOpacity);
             }
-            if (aimMode && !demoMode) {
+            if (p.keymapEnabled && aimMode && !demoMode) {
                 HudRenderer::paintCrosshairDot(g, w, h);
             }
             if (host_->hudIsFullscreen() && !aimMode) {

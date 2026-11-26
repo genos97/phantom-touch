@@ -55,6 +55,9 @@ enum DrawerActionId {
     DA_CREATE_CLONE,
     DA_LOAD_PROFILE,    // extra = idx
     DA_DELETE_PROFILE,  // extra = idx
+    DA_TOGGLE_KEYMAP_MODE,
+    DA_LINK_CURRENT_APP,
+    DA_UNLINK_APP,
 
     // Device & Stream tab
     DA_STREAM_FPS,      // extra = 60/90/120
@@ -63,6 +66,8 @@ enum DrawerActionId {
     DA_TOGGLE_AUDIO,
     DA_TOGGLE_SCREEN_OFF,
     DA_TOGGLE_STAY_AWAKE,
+    DA_TOGGLE_AUTO_SWITCH,
+    DA_TOGGLE_RCLICK_BACK,
     DA_APPLY_RECONNECT,
     DA_DISCONNECT,
     DA_FOCUS_WIRELESS,
@@ -184,6 +189,7 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
                         const std::string& activeProfilePath,
                         int selectedBtnIndex, bool waitingNodeRebind,
                         bool connected, const std::string& deviceLabel,
+                        const std::string& foregroundPkg,
                         const std::vector<std::string>& logs,
                         int hoverX, int hoverY) {
     bounds_ = bounds;
@@ -257,7 +263,7 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
     } else if (activeTab_ == 1) {
         endY = paintTabSens(g, x0, startY, w, profile, hoverX, hoverY);
     } else if (activeTab_ == 2) {
-        endY = paintTabProfiles(g, x0, startY, w, activeProfilePath, hoverX, hoverY);
+        endY = paintTabProfiles(g, x0, startY, w, profile, activeProfilePath, foregroundPkg, hoverX, hoverY);
     } else {
         endY = paintTabDevice(g, x0, startY, w, settings, connected, deviceLabel, logs, hoverX, hoverY);
     }
@@ -608,7 +614,46 @@ int DrawerPanel::paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
 }
 
 int DrawerPanel::paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
-                                  const std::string& activePath, int hoverX, int hoverY) {
+                                  const Profile& p, const std::string& activePath,
+                                  const std::string& foregroundPkg, int hoverX, int hoverY) {
+    // 1. Active Profile App-Link & Input Mode Card
+    RECT rLink = { x, y, x + w, y + 104 };
+    GdiPlusDraw::roundedCard(g, rLink, 9.0f, Theme::BG_CARD, Theme::BORDER_STRONG, 1.1f);
+    int lx = x + 10, lw = w - 20, ly = y + 10;
+    GdiPlusDraw::textLeft(g, "PER-APP AUTO-SWITCH LINK", static_cast<float>(lx), static_cast<float>(ly + 6), 10.0f, true, Theme::ACCENT_CYAN);
+    ly += 18;
+    std::string liveTxt = "Open App: " + (foregroundPkg.empty() ? std::string("(none detected)") : foregroundPkg);
+    GdiPlusDraw::textLeft(g, liveTxt, static_cast<float>(lx), static_cast<float>(ly + 6), 11.0f, false, Theme::TEXT_SECONDARY, static_cast<float>(lw));
+    ly += 16;
+    std::string linkedTxt = "Linked To: " + (p.appPackage.empty() ? std::string("Manual (not linked)") : p.appPackage);
+    GdiPlusDraw::textLeft(g, linkedTxt, static_cast<float>(lx), static_cast<float>(ly + 6), 11.0f, true,
+                          p.appPackage.empty() ? Theme::TEXT_MUTED : Theme::ACCENT_GREEN, static_cast<float>(lw));
+    ly += 20;
+
+    int lhw = (lw - 6) / 2;
+    RECT rBindApp = { lx, ly, lx + lhw + 22, ly + 26 };
+    RECT rUnlink  = { rBindApp.right + 6, ly, lx + lw, ly + 26 };
+    bool canLink = !foregroundPkg.empty();
+    GdiPlusDraw::roundedCard(g, rBindApp, 6.0f,
+                             canLink ? (ptIn(rBindApp, hoverX, hoverY) ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG) : Theme::BG_INPUT,
+                             canLink ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textCenter(g, "LINK CURRENT APP", static_cast<float>(rBindApp.left + rBindApp.right) * 0.5f,
+                            static_cast<float>(ly + 13), 10.5f, true,
+                            canLink ? (ptIn(rBindApp, hoverX, hoverY) ? 0xFF07131Au : Theme::TEXT_PRIMARY) : Theme::TEXT_MUTED);
+    GdiPlusDraw::roundedCard(g, rUnlink, 6.0f, ptIn(rUnlink, hoverX, hoverY) ? Theme::ACCENT_RED_BG : Theme::BG_INPUT,
+                             Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "UNLINK", static_cast<float>(rUnlink.left + rUnlink.right) * 0.5f,
+                            static_cast<float>(ly + 13), 10.5f, true, Theme::TEXT_SECONDARY);
+    if (rBindApp.bottom > bodyClip_.top && rBindApp.top < bodyClip_.bottom) {
+        if (canLink) hotspots_.push_back(Hotspot{ rBindApp, DA_LINK_CURRENT_APP, 0 });
+        hotspots_.push_back(Hotspot{ rUnlink, DA_UNLINK_APP, 0 });
+    }
+    y = rLink.bottom + 8;
+
+    drawToggleRow(g, x, y, w, p.keymapEnabled ? "Mode: Game Keymap (OFF = PC Typing)" : "Mode: Desktop PC Typing (No Keymap)",
+                  p.keymapEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_KEYMAP_MODE, hoverX, hoverY);
+    y += 40;
+
     GdiPlusDraw::textLeft(g, "CREATE NEW CONFIG", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 20;
 
@@ -714,7 +759,9 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
 
     drawToggleRow(g, x, y, w, "Forward Phone Audio (scrcpy 5.0)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 40;
+    drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "Auto-Switch Profile by Open App", s.autoSwitchProfiles, Theme::ACCENT_GREEN, DA_TOGGLE_AUTO_SWITCH, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "Right-Click = Android Back (Cursor)", s.rightClickBack, Theme::ACCENT_CYAN, DA_TOGGLE_RCLICK_BACK, hoverX, hoverY); y += 40;
 
     // Apply & Restart Stream / Disconnect
     int hw = (w - 8) / 2;
@@ -961,12 +1008,34 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 }
                 return true;
 
+            case DA_TOGGLE_KEYMAP_MODE:
+                profile.keymapEnabled = !profile.keymapEnabled;
+                out.profileModified = true;
+                out.toastMessage = profile.keymapEnabled ? "Game Keymap Mode ON" : "Desktop Typing Mode ON (full PC keyboard)";
+                return true;
+            case DA_LINK_CURRENT_APP:
+                out.requestLinkCurrentApp = true;
+                return true;
+            case DA_UNLINK_APP:
+                out.requestUnlinkApp = true;
+                return true;
+
             case DA_STREAM_FPS:     settings.mirrorFps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_BITRATE: settings.mirrorBitrateMbps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_MAXSIZE: settings.mirrorMaxSize = hs.extra; out.settingsModified = true; return true;
             case DA_TOGGLE_AUDIO:      settings.mirrorAudio = !settings.mirrorAudio; out.settingsModified = true; return true;
             case DA_TOGGLE_SCREEN_OFF: settings.turnScreenOff = !settings.turnScreenOff; out.settingsModified = true; return true;
             case DA_TOGGLE_STAY_AWAKE: settings.stayAwake = !settings.stayAwake; out.settingsModified = true; return true;
+            case DA_TOGGLE_AUTO_SWITCH:
+                settings.autoSwitchProfiles = !settings.autoSwitchProfiles;
+                out.settingsModified = true;
+                out.toastMessage = settings.autoSwitchProfiles ? "Per-App Auto-Switch: ON" : "Per-App Auto-Switch: OFF";
+                return true;
+            case DA_TOGGLE_RCLICK_BACK:
+                settings.rightClickBack = !settings.rightClickBack;
+                out.settingsModified = true;
+                out.toastMessage = settings.rightClickBack ? "Cursor Right-Click = Back: ON" : "Cursor Right-Click = Back: OFF";
+                return true;
             case DA_APPLY_RECONNECT:   out.requestReconnectStream = true; return true;
             case DA_DISCONNECT:        out.requestDisconnectDevice = true; return true;
             case DA_FOCUS_WIRELESS:    editingWireless_ = true; return true;

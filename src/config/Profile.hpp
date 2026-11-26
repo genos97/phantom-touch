@@ -43,6 +43,8 @@ struct KeyNode {
 
 struct Profile {
     std::string name = "Free Fire MAX (S21 FE)";
+    std::string appPackage = "com.dts.freefiremax,com.dts.freefireth"; // Optional comma-separated Android package(s) for auto-switch
+    bool keymapEnabled = true;       // false = Desktop Typing Mode (all PC keys type directly into Android!)
     std::string scrcpyArgs = "--max-fps=90 --video-bit-rate=16M";
     int controlMaxSize = 0;          // 0 = native phone resolution
     int pollHz = 250;                // 125 / 250 / 500 Hz coalescing (0 = MAX 1000 Hz)
@@ -114,6 +116,8 @@ class ProfileDefaults {
 public:
     static Profile createFreeFire();
     static Profile createBlank(const std::string& name);
+    static Profile createDesktop(const std::string& name = "Desktop (Typing)");
+    static bool matchesPackage(const std::string& packageList, const std::string& activePkg);
     static std::string actionTypeToName(KeyActionType action);
     static KeyActionType nameToActionType(const std::string& raw);
 };

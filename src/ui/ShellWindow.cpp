@@ -3,6 +3,7 @@
 #include "config/ProfileStore.hpp"
 #include "ui/Theme.hpp"
 
+#include <shellapi.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,10 @@ static const UINT MSG_SENS_X_UP          = WM_APP + 11;
 static const UINT MSG_SENS_Y_DOWN        = WM_APP + 12;
 static const UINT MSG_SENS_Y_UP          = WM_APP + 13;
 static const UINT MSG_WIRELESS_DONE      = WM_APP + 14;
+static const UINT MSG_DEVICE_CLIPBOARD   = WM_APP + 15;
+static const UINT MSG_FOREGROUND_APP     = WM_APP + 16;
+static const UINT MSG_DROP_TOAST         = WM_APP + 17;
+static const UINT MSG_ANDROID_BACK       = WM_APP + 18;
 
 LRESULT CALLBACK shellMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (g_shellInstance) return g_shellInstance->handleLowLevelMouse(nCode, wParam, lParam);
@@ -70,6 +75,7 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
       noMirror_(noMirror),
       hudOverlay_(this),
       demoMode_(startDemo) {
+    InitializeCriticalSection(&auxLock_);
     ZeroMemory(&topBarRc_, sizeof(topBarRc_));
     ZeroMemory(&railRc_, sizeof(railRc_));
     ZeroMemory(&drawerRc_, sizeof(drawerRc_));
@@ -83,14 +89,28 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     mirrorTitle_ = tbuf;
 
     profile_ = engine_->getProfileCopy();
+    if (profile_.keymapEnabled) lastGameProfilePath_ = profilePath_;
     AppSettingsStore::load(settingsPath_, settings_);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+    bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
 }
 
 ShellWindow::~ShellWindow() {
+    InterlockedExchange(&stopAuxThreads_, 1);
+    bridge_->setClipboardCallback(nullptr, nullptr);
     flushOnExit();
     setAimMode(false);
     removeHooks();
+    if (appWatcherThread_) {
+        WaitForSingleObject(appWatcherThread_, 1500);
+        CloseHandle(appWatcherThread_);
+        appWatcherThread_ = NULL;
+    }
+    if (dropThread_) {
+        WaitForSingleObject(dropThread_, 2000);
+        CloseHandle(dropThread_);
+        dropThread_ = NULL;
+    }
     if (connectThread_) {
         WaitForSingleObject(connectThread_, 1500);
         CloseHandle(connectThread_);
@@ -106,6 +126,7 @@ ShellWindow::~ShellWindow() {
         cacheBmp_ = NULL;
         cacheOldBmp_ = NULL;
     }
+    DeleteCriticalSection(&auxLock_);
     if (g_shellInstance == this) g_shellInstance = NULL;
 }
 
@@ -151,12 +172,15 @@ bool ShellWindow::create(HINSTANCE hInst) {
     if (!hwnd_) return false;
 
     GdiPlusDraw::enableDarkDwmFrame(hwnd_);
+    DragAcceptFiles(hwnd_, TRUE);
     viewportHost_.create(hwnd_, hInst_);
     hudOverlay_.create(hwnd_, hInst_);
 
     registerRawInput();
     installHooks();
     SetTimer(hwnd_, TIMER_TICK, 16, NULL);
+    InterlockedExchange(&stopAuxThreads_, 0);
+    appWatcherThread_ = CreateThread(NULL, 0, appWatcherThreadProc, this, 0, NULL);
 
     // Locate official scrcpy + adb tools
     std::string toolErr;
@@ -500,8 +524,315 @@ void ShellWindow::takeScreenshot() {
     }
 }
 
+void ShellWindow::onDeviceClipboard(void* ctx, const std::string& utf8Text) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || utf8Text.empty()) return;
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingDeviceClip_ = utf8Text;
+    LeaveCriticalSection(&self->auxLock_);
+    if (self->hwnd_) {
+        PostMessageA(self->hwnd_, MSG_DEVICE_CLIPBOARD, 0, 0);
+    }
+}
+
+std::string ShellWindow::readWindowsClipboardUtf8() const {
+    if (!OpenClipboard(hwnd_)) return "";
+    std::string out;
+    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+    if (hData) {
+        const wchar_t* wstr = reinterpret_cast<const wchar_t*>(GlobalLock(hData));
+        if (wstr) {
+            int bytes = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+            if (bytes > 1) {
+                out.resize(static_cast<size_t>(bytes - 1));
+                WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &out[0], bytes - 1, NULL, NULL);
+            }
+            GlobalUnlock(hData);
+        }
+    }
+    CloseClipboard();
+    return out;
+}
+
+void ShellWindow::writeWindowsClipboardUtf8(const std::string& utf8Text) {
+    if (utf8Text.empty() || utf8Text == lastSyncedClip_) return;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), static_cast<int>(utf8Text.size()), NULL, 0);
+    if (wlen <= 0) return;
+
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wlen + 1) * sizeof(wchar_t));
+    if (!hMem) return;
+    wchar_t* dst = reinterpret_cast<wchar_t*>(GlobalLock(hMem));
+    if (!dst) { GlobalFree(hMem); return; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), static_cast<int>(utf8Text.size()), dst, wlen);
+    dst[wlen] = L'\0';
+    GlobalUnlock(hMem);
+
+    if (OpenClipboard(hwnd_)) {
+        EmptyClipboard();
+        if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+            GlobalFree(hMem);
+        } else {
+            lastSyncedClip_ = utf8Text;
+        }
+        CloseClipboard();
+    } else {
+        GlobalFree(hMem);
+    }
+}
+
+DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
+    ShellWindow* self = static_cast<ShellWindow*>(param);
+    std::string lastPkg;
+    while (!self->stopAuxThreads_) {
+        if (self->bridge_->isConnected()) {
+            std::string pkg = self->bridge_->queryForegroundPackage();
+            if (!pkg.empty() && pkg != lastPkg) {
+                lastPkg = pkg;
+                EnterCriticalSection(&self->auxLock_);
+                self->pendingForegroundPkg_ = pkg;
+                LeaveCriticalSection(&self->auxLock_);
+                if (self->hwnd_) {
+                    PostMessageA(self->hwnd_, MSG_FOREGROUND_APP, 0, 0);
+                }
+            }
+        } else {
+            lastPkg.clear();
+        }
+        for (int i = 0; i < 16 && !self->stopAuxThreads_; ++i) {
+            Sleep(100);
+        }
+    }
+    return 0;
+}
+
+std::string ShellWindow::ensureDesktopProfileExists() {
+    std::string desktopPath = profilesDir_ + "\\desktop.cfg";
+    if (GetFileAttributesA(desktopPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        Profile desk = ProfileDefaults::createDesktop("Desktop (Typing)");
+        ProfileStore::save(desktopPath, desk);
+    }
+    return desktopPath;
+}
+
+bool ShellWindow::switchProfilePath(const std::string& targetPath, bool showAutoToast) {
+    if (targetPath.empty()) return false;
+    if (lstrcmpiA(profilePath_.c_str(), targetPath.c_str()) == 0) return true;
+
+    if (profileDirty_) saveCurrentProfile(true);
+    Profile loaded;
+    if (!ProfileStore::load(targetPath, loaded)) return false;
+
+    if (profile_.keymapEnabled && !profilePath_.empty()) {
+        lastGameProfilePath_ = profilePath_;
+    }
+
+    profilePath_ = targetPath;
+    profile_ = loaded;
+    profileDirty_ = false;
+    if (profile_.keymapEnabled) {
+        lastGameProfilePath_ = profilePath_;
+    }
+    hudOverlay_.setSelectedBtnIndex(-1);
+    hudOverlay_.cancelRebind();
+    if (!profile_.keymapEnabled && aimMode_) {
+        setAimMode(false);
+    }
+    ProfileStore::saveLastActive(profilesDir_, profilePath_);
+    engine_->setProfile(profile_);
+    hudOverlay_.applyOpacity(editMode_, profile_.hudOpacity);
+    drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+
+    if (showAutoToast) {
+        std::string msg = profile_.keymapEnabled
+            ? ("Auto-switched -> " + profile_.name)
+            : ("Desktop Mode · Typing active (" + activeAppPackage_ + ")");
+        hudOverlay_.showToast(msg, 1800);
+    }
+    hudOverlay_.invalidate();
+    invalidateShell();
+    return true;
+}
+
+void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
+    if (pkg.empty()) return;
+    std::string prevPkg = activeAppPackage_;
+    activeAppPackage_ = pkg;
+
+    if (drawerOpen_ && drawerPanel_.activeTab() == 2) {
+        invalidateShell();
+    }
+    if (!settings_.autoSwitchProfiles || drawerOpen_ || editMode_ || demoMode_) {
+        return;
+    }
+
+    // Already on a profile explicitly linked to this app
+    if (ProfileDefaults::matchesPackage(profile_.appPackage, pkg)) {
+        return;
+    }
+
+    // First detection right after launch: never yank user away from a manually chosen unlinked game profile
+    if (prevPkg.empty() && profile_.keymapEnabled && profile_.appPackage.empty()) {
+        return;
+    }
+
+    // Search for a saved profile linked to pkg (prefer lastGameProfilePath_ first!)
+    std::string matchedPath;
+    if (!lastGameProfilePath_.empty()) {
+        Profile cand;
+        if (ProfileStore::load(lastGameProfilePath_, cand) &&
+            ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
+            matchedPath = lastGameProfilePath_;
+        }
+    }
+    if (matchedPath.empty()) {
+        std::vector<std::string> files = ProfileStore::listProfiles(profilesDir_);
+        for (size_t i = 0; i < files.size(); ++i) {
+            Profile cand;
+            if (ProfileStore::load(files[i], cand) &&
+                ProfileDefaults::matchesPackage(cand.appPackage, pkg)) {
+                matchedPath = files[i];
+                break;
+            }
+        }
+    }
+
+    if (!matchedPath.empty()) {
+        switchProfilePath(matchedPath, true);
+    } else if (profile_.keymapEnabled) {
+        // Non-game / unlinked app (WhatsApp, Chrome, Launcher, Settings...) -> switch cleanly to Desktop Typing Mode!
+        std::string deskPath = ensureDesktopProfileExists();
+        switchProfilePath(deskPath, true);
+    }
+}
+
+DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
+    ShellWindow* self = static_cast<ShellWindow*>(param);
+    std::vector<std::string> files;
+    EnterCriticalSection(&self->auxLock_);
+    files.swap(self->pendingDropFiles_);
+    LeaveCriticalSection(&self->auxLock_);
+
+    auto notifyToast = [&](const std::string& msg) {
+        EnterCriticalSection(&self->auxLock_);
+        self->pendingDropToast_ = msg;
+        LeaveCriticalSection(&self->auxLock_);
+        if (self->hwnd_) PostMessageA(self->hwnd_, MSG_DROP_TOAST, 0, 0);
+    };
+
+    for (size_t i = 0; i < files.size() && !self->stopAuxThreads_; ++i) {
+        const std::string& path = files[i];
+        size_t slash = path.find_last_of("\\/");
+        std::string fname = (slash == std::string::npos) ? path : path.substr(slash + 1);
+        size_t dot = fname.find_last_of('.');
+        bool isApk = (dot != std::string::npos && lstrcmpiA(fname.c_str() + dot, ".apk") == 0);
+
+        std::string resultMsg;
+        if (isApk) {
+            notifyToast("Installing " + fname + "...");
+            self->bridge_->installApk(path, resultMsg);
+            notifyToast(resultMsg);
+        } else {
+            notifyToast("Sending " + fname + " to Downloads...");
+            self->bridge_->pushFileToDownloads(path, resultMsg);
+            notifyToast(resultMsg);
+        }
+    }
+
+    InterlockedExchange(&self->dropping_, 0);
+    return 0;
+}
+
+void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) {
+    if (files.empty() || !bridge_->isConnected()) {
+        hudOverlay_.showToast("Connect a phone first to install APKs or push files", 2200);
+        return;
+    }
+    if (InterlockedCompareExchange(&dropping_, 1, 0) != 0) {
+        hudOverlay_.showToast("Another file transfer is already in progress...", 1800);
+        return;
+    }
+    if (dropThread_) {
+        WaitForSingleObject(dropThread_, 500);
+        CloseHandle(dropThread_);
+        dropThread_ = NULL;
+    }
+    EnterCriticalSection(&auxLock_);
+    pendingDropFiles_ = files;
+    LeaveCriticalSection(&auxLock_);
+    dropThread_ = CreateThread(NULL, 0, dropWorkerThreadProc, this, 0, NULL);
+}
+
+bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
+    if (!bridge_->isConnected() || aimMode_ || editMode_) return false;
+    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    if (ctrl && down) {
+        if (vk == 'V') {
+            std::string clip = readWindowsClipboardUtf8();
+            if (!clip.empty()) {
+                lastSyncedClip_ = clip;
+                bridge_->sendSetClipboard(clip, true);
+                hudOverlay_.showToast("Pasted clipboard to phone", 1000);
+            }
+            return true;
+        }
+        if (vk == 'C') {
+            bridge_->sendGetClipboard(1 /* COPY */);
+            return true;
+        }
+        if (vk == 'X') {
+            bridge_->sendGetClipboard(2 /* CUT */);
+            return true;
+        }
+        if (vk == 'A' || vk == 'Z') {
+            uint32_t akc = KeyCodes::vkToAndroidKeycode(vk);
+            if (akc != 0) {
+                const uint32_t metaCtrl = 0x3000u; // AMETA_CTRL_ON | AMETA_CTRL_LEFT_ON
+                bridge_->sendKeycode(0, akc, metaCtrl);
+                bridge_->sendKeycode(1, akc, metaCtrl);
+                return true;
+            }
+        }
+    }
+
+    // Navigation & editing keys (Enter, Backspace, Delete, Tab, Escape, Arrows, Home, End, PgUp/Dn)
+    bool isNavOrEdit = (vk == VK_RETURN || vk == VK_BACK || vk == VK_DELETE || vk == VK_TAB ||
+                        vk == VK_ESCAPE || vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT ||
+                        vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT);
+    if (isNavOrEdit) {
+        uint32_t akc = KeyCodes::vkToAndroidKeycode(vk);
+        if (akc != 0) {
+            uint32_t meta = 0;
+            if (shift) meta |= 0x41u;   // AMETA_SHIFT_ON | AMETA_SHIFT_LEFT_ON
+            if (ctrl)  meta |= 0x3000u; // AMETA_CTRL_ON  | AMETA_CTRL_LEFT_ON
+            bridge_->sendKeycode(down ? 0u : 1u, akc, meta);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ShellWindow::handleDesktopChar(wchar_t ch) {
+    if (!bridge_->isConnected() || aimMode_ || editMode_) return false;
+    if (ch < 32 || ch == 127) return false; // Control chars handled in WM_KEYDOWN
+    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) return false;
+
+    wchar_t buf[2] = { ch, L'\0' };
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, buf, 1, NULL, 0, NULL, NULL);
+    if (bytes <= 0) return false;
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, 1, &utf8[0], bytes, NULL, NULL);
+    bridge_->sendText(utf8);
+    return true;
+}
+
 void ShellWindow::setAimMode(bool enabled) {
     if (enabled && !bridge_->isConnected() && !demoMode_) return;
+    if (enabled && !profile_.keymapEnabled) {
+        hudOverlay_.showToast("Desktop Typing Mode active · Switch to a Game profile for Aim Lock", 1800);
+        return;
+    }
     if (enabled && editMode_) setEditMode(false);
     if (aimMode_ == enabled) return;
 
@@ -701,22 +1032,22 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         saveCurrentProfile(false);
     }
     if (res.requestSwitchProfile && !res.switchProfilePath.empty()) {
-        if (profileDirty_ && lstrcmpiA(profilePath_.c_str(), res.switchProfilePath.c_str()) != 0) {
-            saveCurrentProfile(true);
-        }
-        Profile loaded;
-        if (ProfileStore::load(res.switchProfilePath, loaded)) {
-            profilePath_ = res.switchProfilePath;
-            profile_ = loaded;
-            profileDirty_ = false;
-            hudOverlay_.setSelectedBtnIndex(-1);
-            hudOverlay_.cancelRebind();
-            ProfileStore::saveLastActive(profilesDir_, profilePath_);
-            engine_->setProfile(profile_);
-            hudOverlay_.applyOpacity(editMode_, profile_.hudOpacity);
-            drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+        if (switchProfilePath(res.switchProfilePath, false)) {
             hudOverlay_.showToast("Loaded config: " + profile_.name, 2000);
         }
+    }
+    if (res.requestLinkCurrentApp && !activeAppPackage_.empty()) {
+        if (!ProfileDefaults::matchesPackage(profile_.appPackage, activeAppPackage_)) {
+            if (!profile_.appPackage.empty()) profile_.appPackage += ",";
+            profile_.appPackage += activeAppPackage_;
+        }
+        applyProfileToEngine(true);
+        hudOverlay_.showToast("Linked '" + profile_.name + "' -> " + activeAppPackage_, 2400);
+    }
+    if (res.requestUnlinkApp) {
+        profile_.appPackage.clear();
+        applyProfileToEngine(true);
+        hudOverlay_.showToast("Unlinked app auto-switch for '" + profile_.name + "'", 2000);
     }
     if (res.requestAddNode) {
         KeyNode n;
@@ -901,12 +1232,24 @@ LRESULT ShellWindow::handleLowLevelMouse(int nCode, WPARAM wParam, LPARAM lParam
             cursorDirectDragging_ = false;
             engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
             return 1;
+        } else if (wParam == WM_RBUTTONDOWN && settings_.rightClickBack && inVideo && isAppForeground()) {
+            rightClickBackSwallowUp_ = true;
+            PostMessageA(hwnd_, MSG_ANDROID_BACK, 0, 0);
+            return 1;
+        } else if (wParam == WM_RBUTTONUP && rightClickBackSwallowUp_) {
+            rightClickBackSwallowUp_ = false;
+            return 1;
         } else if (wParam == WM_MOUSEWHEEL && inVideo && isAppForeground()) {
             short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
             int notches = rawDelta / WHEEL_DELTA;
             if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
             if (notches != 0) {
-                engine_->onDirectCursorScroll(nx, ny, notches);
+                bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                if (ctrlHeld) {
+                    engine_->onDirectCursorPinch(nx, ny, notches);
+                } else {
+                    engine_->onDirectCursorScroll(nx, ny, notches);
+                }
                 return 1;
             }
         }
@@ -933,8 +1276,9 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
     }
 
     if (up && (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1)) {
+        bool wasDown = toggleAimKeyDown_;
         toggleAimKeyDown_ = false;
-        if (!editMode_ && (aimMode_ || isAppForeground())) return 1;
+        if (wasDown && !editMode_ && (aimMode_ || (profile_.keymapEnabled && isAppForeground()))) return 1;
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
     if (up && holdUnlockedAim_ && KeyCodes::matches(vk, profile_.holdUnlockVk)) {
@@ -971,23 +1315,25 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
-    if (KeyCodes::matches(vk, profile_.holdUnlockVk)) {
-        if (down) {
-            if (!isRepeat && aimMode_ && !holdUnlockedAim_) {
-                holdUnlockedAim_ = true;
-                PostMessageA(hwnd_, MSG_UNLOCK_AIM, 0, 0);
+    if (profile_.keymapEnabled || aimMode_) {
+        if (KeyCodes::matches(vk, profile_.holdUnlockVk)) {
+            if (down) {
+                if (!isRepeat && aimMode_ && !holdUnlockedAim_) {
+                    holdUnlockedAim_ = true;
+                    PostMessageA(hwnd_, MSG_UNLOCK_AIM, 0, 0);
+                }
+                if (holdUnlockedAim_) return 1;
             }
-            if (holdUnlockedAim_) return 1;
         }
-    }
 
-    if (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1) {
-        if (down) {
-            if (!isRepeat && !toggleAimKeyDown_) {
-                toggleAimKeyDown_ = true;
-                PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+        if (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1) {
+            if (down) {
+                if (!isRepeat && !toggleAimKeyDown_) {
+                    toggleAimKeyDown_ = true;
+                    PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
+                }
+                return 1;
             }
-            return 1;
         }
     }
 
@@ -996,16 +1342,25 @@ LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lPa
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
+    // In unlocked Cursor Mode, allow Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A / Ctrl+Z clipboard shortcuts directly!
+    if (!aimMode_ && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) {
+        if (vk == 'C' || vk == 'V' || vk == 'X' || vk == 'A' || vk == 'Z') {
+            return CallNextHookEx(keyHook_, nCode, wParam, lParam);
+        }
+    }
+
     if (down) {
         if (vk == VK_F2)  { PostMessageA(hwnd_, MSG_TOGGLE_STUDIO, 0, 0); return 1; }
         if (vk == VK_F3)  { PostMessageA(hwnd_, MSG_CYCLE_FIRE, 0, 0); return 1; }
         if (vk == VK_F4)  { PostMessageA(hwnd_, MSG_TOGGLE_HUD, 0, 0); return 1; }
         if (vk == VK_F11) { PostMessageA(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
         if (vk == profile_.resetTouchVk) { PostMessageA(hwnd_, MSG_RESET_TOUCH, 0, 0); return 1; }
-        if (vk == VK_OEM_4)     { PostMessageA(hwnd_, MSG_SENS_X_DOWN, 0, 0); return 1; }
-        if (vk == VK_OEM_6)     { PostMessageA(hwnd_, MSG_SENS_X_UP, 0, 0); return 1; }
-        if (vk == VK_OEM_MINUS) { PostMessageA(hwnd_, MSG_SENS_Y_DOWN, 0, 0); return 1; }
-        if (vk == VK_OEM_PLUS)  { PostMessageA(hwnd_, MSG_SENS_Y_UP, 0, 0); return 1; }
+        if (profile_.keymapEnabled) {
+            if (vk == VK_OEM_4)     { PostMessageA(hwnd_, MSG_SENS_X_DOWN, 0, 0); return 1; }
+            if (vk == VK_OEM_6)     { PostMessageA(hwnd_, MSG_SENS_X_UP, 0, 0); return 1; }
+            if (vk == VK_OEM_MINUS) { PostMessageA(hwnd_, MSG_SENS_Y_DOWN, 0, 0); return 1; }
+            if (vk == VK_OEM_PLUS)  { PostMessageA(hwnd_, MSG_SENS_Y_UP, 0, 0); return 1; }
+        }
     }
 
     bool reqToggle = false;
@@ -1149,6 +1504,52 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 hudOverlay_.showToast(asyncResultMsg_, 2600);
             }
             invalidateShell();
+            return 0;
+        }
+        case MSG_DEVICE_CLIPBOARD: {
+            std::string clip;
+            EnterCriticalSection(&auxLock_);
+            clip.swap(pendingDeviceClip_);
+            LeaveCriticalSection(&auxLock_);
+            if (!clip.empty()) {
+                writeWindowsClipboardUtf8(clip);
+            }
+            return 0;
+        }
+        case MSG_FOREGROUND_APP: {
+            std::string pkg;
+            EnterCriticalSection(&auxLock_);
+            pkg = pendingForegroundPkg_;
+            LeaveCriticalSection(&auxLock_);
+            handleForegroundAppChanged(pkg);
+            return 0;
+        }
+        case MSG_DROP_TOAST: {
+            std::string msgText;
+            EnterCriticalSection(&auxLock_);
+            msgText = pendingDropToast_;
+            LeaveCriticalSection(&auxLock_);
+            if (!msgText.empty()) {
+                hudOverlay_.showToast(msgText, 2600);
+            }
+            return 0;
+        }
+        case MSG_ANDROID_BACK:
+            bridge_->sendAndroidNav(4 /* KEYCODE_BACK */);
+            return 0;
+
+        case WM_DROPFILES: {
+            HDROP hDrop = reinterpret_cast<HDROP>(wParam);
+            UINT count = DragQueryFileA(hDrop, 0xFFFFFFFFu, NULL, 0);
+            std::vector<std::string> dropped;
+            for (UINT i = 0; i < count; ++i) {
+                char pathBuf[MAX_PATH * 2] = {0};
+                if (DragQueryFileA(hDrop, i, pathBuf, sizeof(pathBuf) - 1) > 0) {
+                    dropped.push_back(std::string(pathBuf));
+                }
+            }
+            DragFinish(hDrop);
+            startAsyncDropTransfer(dropped);
             return 0;
         }
 
@@ -1352,15 +1753,29 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 }
             }
             if (editMode_ && hudOverlay_.handleKeyDown(vk)) return 0;
+            if (!editMode_ && handleDesktopKeyEvent(vk, true)) return 0;
             if (!editMode_ && msg == WM_SYSKEYDOWN) return 0;
             break;
         }
 
+        case WM_KEYUP: {
+            int vk = static_cast<int>(wParam);
+            if (!editMode_ && !editingHubWireless_ && !(drawerOpen_ && drawerPanel_.isTypingText())) {
+                if (handleDesktopKeyEvent(vk, false)) return 0;
+            }
+            break;
+        }
+
         case WM_CHAR: {
-            char ch = static_cast<char>(wParam);
+            wchar_t ch = static_cast<wchar_t>(wParam);
+            if (wParam > 127 && wParam <= 255) {
+                char ab = static_cast<char>(wParam & 0xFFu);
+                wchar_t wb = 0;
+                if (MultiByteToWideChar(CP_ACP, 0, &ab, 1, &wb, 1) == 1) ch = wb;
+            }
             if (editingHubWireless_ && ch >= 32 && ch <= 126) {
                 if (settings_.lastWirelessAddr.size() < 28) {
-                    settings_.lastWirelessAddr.push_back(ch);
+                    settings_.lastWirelessAddr.push_back(static_cast<char>(ch));
                     saveSettings();
                     invalidateShell();
                 }
@@ -1368,11 +1783,12 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             if (drawerOpen_) {
                 DrawerActionResult res;
-                if (drawerPanel_.onChar(ch, profile_, settings_, hudOverlay_.selectedBtnIndex(), res)) {
+                if (ch <= 126 && drawerPanel_.onChar(static_cast<char>(ch), profile_, settings_, hudOverlay_.selectedBtnIndex(), res)) {
                     handleDrawerResult(res);
                     return 0;
                 }
             }
+            if (!editMode_ && handleDesktopChar(ch)) return 0;
             break;
         }
 
@@ -1472,7 +1888,7 @@ void ShellWindow::onPaint(HDC hdc) {
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),
                                    (hudOverlay_.rebindTarget() == HUD_REBIND_BUTTON),
-                                   connected, devLabel, logs, hoverX_, hoverY_);
+                                   connected, devLabel, activeAppPackage_, logs, hoverX_, hoverY_);
             }
 
             // 4. Right Emulator SideRail

@@ -51,6 +51,7 @@ public:
     bool isKeyMapped(int vk, bool aimModeActive) const;
     void onDirectCursorTouch(TouchAction action, float normX, float normY);
     void onDirectCursorScroll(float normX, float normY, int wheelNotches);
+    void onDirectCursorPinch(float normX, float normY, int wheelNotches);
 
     void releaseAllTouches();
     void resetAimView();
@@ -77,6 +78,7 @@ private:
         float normX;
         float normY;
         int notches;
+        bool isPinch;
     };
 
     struct KeyRouteEntry {
@@ -100,6 +102,8 @@ private:
     void processDirectCursorLocked(TouchAction action, float normX, float normY);
     void processDirectCursorScrollLocked(float normX, float normY, int wheelNotches, double nowMs);
     void releaseCursorScrollLocked();
+    void processDirectCursorPinchLocked(float normX, float normY, int wheelNotches, double nowMs);
+    void releaseCursorPinchLocked();
 
     void pressFireLocked(double nowMs);
     void liftFireFingerLocked();
@@ -122,6 +126,7 @@ private:
     std::vector<QueuedCursorTouch> pendingCursor_;
     std::vector<QueuedCursorScroll> pendingScroll_;
     bool hookHeldKeys_[512];
+    bool routeKeymapEnabled_ = true;
     int routeVkUp_ = 'W', routeVkDown_ = 'S', routeVkLeft_ = 'A', routeVkRight_ = 'D';
     int routeVkSprint_ = 0xA0, routeVkWalk_ = 0xA2, routeFireVk_ = 0x01;
     std::vector<KeyRouteEntry> routeButtons_;
@@ -142,6 +147,13 @@ private:
     double cursorScrollCurX_ = 0.0;
     double cursorScrollCurY_ = 0.0;
     double cursorScrollReleaseAtMs_ = 0.0;
+
+    // Unlocked cursor Ctrl+Wheel 2-finger pinch-zoom (auto-releases after 140ms idle)
+    bool cursorPinchDown_ = false;
+    double pinchCenterX_ = 0.0;
+    double pinchCenterY_ = 0.0;
+    double pinchRadius_ = 0.0;
+    double pinchReleaseAtMs_ = 0.0;
 
     // Modular sub-controllers & bounded 0..9 Android virtual finger pool
     TouchFingerPool fingerPool_;

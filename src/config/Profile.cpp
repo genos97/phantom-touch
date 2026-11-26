@@ -148,6 +148,35 @@ Profile ProfileDefaults::createFreeFire() {
 Profile ProfileDefaults::createBlank(const std::string& name) {
     Profile p = createFreeFire();
     p.name = name.empty() ? "Custom Keymap" : name;
+    p.appPackage.clear();
+    p.keymapEnabled = true;
     p.buttons.clear();
     return p;
+}
+
+Profile ProfileDefaults::createDesktop(const std::string& name) {
+    Profile p = createBlank(name.empty() ? "Desktop (Typing)" : name);
+    p.keymapEnabled = false;
+    p.showHudInPlay = false;
+    return p;
+}
+
+bool ProfileDefaults::matchesPackage(const std::string& packageList, const std::string& activePkg) {
+    if (packageList.empty() || activePkg.empty()) return false;
+    size_t pos = 0;
+    while (pos < packageList.size()) {
+        size_t comma = packageList.find(',', pos);
+        std::string tok = (comma == std::string::npos)
+            ? packageList.substr(pos)
+            : packageList.substr(pos, comma - pos);
+        size_t a = 0;
+        while (a < tok.size() && std::isspace(static_cast<unsigned char>(tok[a]))) ++a;
+        size_t b = tok.size();
+        while (b > a && std::isspace(static_cast<unsigned char>(tok[b - 1]))) --b;
+        std::string clean = tok.substr(a, b - a);
+        if (!clean.empty() && clean == activePkg) return true;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
 }

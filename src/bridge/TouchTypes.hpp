@@ -15,6 +15,8 @@ namespace PointerId {
     static const uint64_t AIM_B     = 4;
     static const uint64_t HOLD_VIEW = 5;
     static const uint64_t SCROLL    = 6;
+    static const uint64_t PINCH_A   = 7;
+    static const uint64_t PINCH_B   = 8;
     static const uint64_t CURSOR    = 9;
     static const uint64_t BTN_BASE  = 20;
 }

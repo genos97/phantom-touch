@@ -91,23 +91,37 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
     // 5. Live Telemetry Pill (if space permits between profile pill and pin button)
     int availRight = rPin.left - 12;
     if (availRight - curX >= 220) {
-        const char* modeTxt = tel.holdViewActive ? "FREELOOK"
-                            : (tel.aimMode && tel.scopeActive) ? "AIM + ADS"
-                            : tel.aimMode ? "AIM LOCKED" : "CURSOR MODE";
-        const char* fireTxt = (profile.fireMode == FIRE_MODE_DRAG_RIGHT) ? "DRAG-FIRE"
-                            : (profile.fireMode == FIRE_MODE_CLAW_LEFT)  ? "CLAW-LEFT"
-                                                                         : "DUAL-DRAG";
         char telBuf[96];
-        std::snprintf(telBuf, sizeof(telBuf), "%s  |  %s  |  %u/s", modeTxt, fireTxt, tel.touchRateHz);
+        uint32_t bg = Theme::ACCENT_AMBER_BG;
+        uint32_t bd = Theme::ACCENT_AMBER;
+        uint32_t fg = Theme::ACCENT_AMBER;
+
+        if (!profile.keymapEnabled) {
+            std::snprintf(telBuf, sizeof(telBuf), "TYPING MODE  |  Ctrl+V / Pinch");
+            bg = Theme::ACCENT_CYAN_BG;
+            bd = Theme::ACCENT_CYAN;
+            fg = Theme::ACCENT_CYAN;
+        } else {
+            const char* modeTxt = tel.holdViewActive ? "FREELOOK"
+                                : (tel.aimMode && tel.scopeActive) ? "AIM + ADS"
+                                : tel.aimMode ? "AIM LOCKED" : "CURSOR MODE";
+            const char* fireTxt = (profile.fireMode == FIRE_MODE_DRAG_RIGHT) ? "DRAG-FIRE"
+                                : (profile.fireMode == FIRE_MODE_CLAW_LEFT)  ? "CLAW-LEFT"
+                                                                             : "DUAL-DRAG";
+            std::snprintf(telBuf, sizeof(telBuf), "%s  |  %s  |  %u/s", modeTxt, fireTxt, tel.touchRateHz);
+            if (tel.aimMode) {
+                bg = Theme::ACCENT_GREEN_BG;
+                bd = Theme::ACCENT_GREEN;
+                fg = Theme::ACCENT_GREEN;
+            }
+        }
         int pillW = 216;
         if (availRight - curX < pillW) pillW = availRight - curX;
         RECT rTel = { availRight - pillW, y0 + 7, availRight, y1 - 7 };
         bool hovTel = ptIn(rTel, hoverX, hoverY);
-        uint32_t bg = tel.aimMode ? Theme::ACCENT_GREEN_BG : Theme::ACCENT_AMBER_BG;
-        uint32_t bd = tel.aimMode ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER;
         GdiPlusDraw::roundedCard(g, rTel, 13.0f, hovTel ? Theme::BG_CARD_HOVER : bg, bd, 1.2f);
         GdiPlusDraw::textCenter(g, telBuf, static_cast<float>(rTel.left + rTel.right) * 0.5f, cy,
-                                11.0f, true, tel.aimMode ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER);
+                                11.0f, true, fg);
         buttons_.push_back(Btn{ rTel, TB_TOGGLE_AIM });
     }
 }

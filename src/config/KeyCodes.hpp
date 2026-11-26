@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 // Custom virtual key codes for mouse wheel actions (beyond standard 0x00..0xFF Win32 VK range)
@@ -25,4 +26,7 @@ public:
 
     // Returns true for LMB, RMB, MMB, X1, X2, MWHEELUP, MWHEELDOWN
     static bool isMouseKey(int vk);
+
+    // Converts a Win32 VK into an Android AKEYCODE_* (0 if unmapped) for desktop typing & shortcuts
+    static uint32_t vkToAndroidKeycode(int vk);
 };

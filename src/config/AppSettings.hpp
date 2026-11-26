@@ -19,6 +19,8 @@ struct AppSettings {
     bool mirrorAudio = false; // Forward device audio (scrcpy 5.0 supports native audio)
     bool turnScreenOff = false;
     bool stayAwake = true;
+    bool autoSwitchProfiles = true; // Auto-switch game/desktop profile by foreground Android app
+    bool rightClickBack = true;     // Right-click inside phone in Cursor Mode -> Android Back
     std::string lastWirelessAddr = "192.168.1.100:5555";
 
     std::string buildScrcpyArgs() const;

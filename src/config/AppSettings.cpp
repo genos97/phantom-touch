@@ -79,6 +79,8 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "mirror_audio") s.mirrorAudio = (v == "1");
         else if (k == "turn_screen_off") s.turnScreenOff = (v == "1");
         else if (k == "stay_awake") s.stayAwake = (v == "1");
+        else if (k == "auto_switch_profiles") s.autoSwitchProfiles = (v == "1");
+        else if (k == "right_click_back") s.rightClickBack = (v == "1");
         else if (k == "last_wireless_addr" && !v.empty()) s.lastWirelessAddr = v;
     }
 
@@ -104,6 +106,8 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "mirror_audio = " << (s.mirrorAudio ? 1 : 0) << "\n";
         out << "turn_screen_off = " << (s.turnScreenOff ? 1 : 0) << "\n";
         out << "stay_awake = " << (s.stayAwake ? 1 : 0) << "\n";
+        out << "auto_switch_profiles = " << (s.autoSwitchProfiles ? 1 : 0) << "\n";
+        out << "right_click_back = " << (s.rightClickBack ? 1 : 0) << "\n";
         out << "last_wireless_addr = " << s.lastWirelessAddr << "\n";
         out.flush();
         if (!out.good()) return false;

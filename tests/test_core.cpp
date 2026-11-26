@@ -156,11 +156,11 @@ static void testProfileRoundTrip() {
     RECT drawerRc = { 0, 0, 356, 700 };
     {
         Gdiplus::Graphics g(mDC);
-        createUi.paint(g, drawerRc, editCopy, dummySet, tmpCustom, dummySel, false, false, "", noLogs, -1, -1);
+        createUi.paint(g, drawerRc, editCopy, dummySet, tmpCustom, dummySel, false, false, "", "", noLogs, -1, -1);
     }
     DrawerActionResult mkRes;
-    // "+ BLANK CONFIG" button sits at y = 87 + 10 + 20 + 38 = 155 inside drawerRc
-    assert(createUi.onMouseDown(80, 165, editCopy, dummySet, dummySel, mkRes));
+    // "+ BLANK CONFIG" button sits at y = 307..337 inside drawerRc (after Per-App Link card + Mode toggle)
+    assert(createUi.onMouseDown(80, 322, editCopy, dummySet, dummySel, mkRes));
     assert(mkRes.requestSwitchProfile && mkRes.switchProfilePath == (tmpDir + "\\my_custom_2.cfg"));
     // Verify original my_custom.cfg was NOT overwritten and my_custom_2.cfg has 0 buttons!
     Profile verifyOrig, verifyBlank2;
@@ -251,7 +251,7 @@ static void testEmulatorShellHelpersAndDrawer() {
     RECT rc = { 0, 0, 356, 900 };
     {
         Gdiplus::Graphics g(memDC);
-        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", logs, -1, -1);
+        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", "com.dts.freefiremax", logs, -1, -1);
     }
 
     // Inspector layout inside drawer (body starts at y=87, startY=97):
@@ -272,7 +272,7 @@ static void testEmulatorShellHelpersAndDrawer() {
     drawer.setActiveTab(1);
     {
         Gdiplus::Graphics g(memDC);
-        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", logs, -1, -1);
+        drawer.paint(g, rc, loaded, settings, "profiles\\freefire.cfg", sel, false, true, "SM-G990E", "com.dts.freefiremax", logs, -1, -1);
     }
     // Trigger Lock/Unlock rebind -> reject LMB -> bind VK_SHIFT -> normalized to VK_LSHIFT
     // Find by scrolling or direct hit (height 900 fits entire SENS tab!)
@@ -593,6 +593,105 @@ static void testInputEngineIntegration() {
     std::printf("[Test] InputEngine integration (0..9 pool, cursor scroll-drag, LShift toggle, unlocked KB/WASD) OK!\n");
 }
 
+static void testStage1EmulatorFeatures() {
+    // 1. Foreground Android package parser (Android 10-16 dumpsys window & activity)
+    const std::string dump1 =
+        "  mCurrentFocus=Window{a1b2c3 u0 com.dts.freefiremax/com.dts.freefireth.FFMainActivity}\n";
+    assert(ScrcpyBridge::parseForegroundPackage(dump1) == "com.dts.freefiremax");
+
+    const std::string dumpOverlay =
+        "  mCurrentFocus=Window{111 u0 NotificationShade}\n"
+        "  mFocusedApp=ActivityRecord{222 u0 com.whatsapp/.HomeActivity t42}\n";
+    assert(ScrcpyBridge::parseForegroundPackage(dumpOverlay) == "com.whatsapp");
+
+    const std::string dumpResumed =
+        "  mCurrentFocus=Window{333 u0 com.android.systemui/com.android.systemui.shade}\n"
+        "  topResumedActivity=ActivityRecord{444 u0 com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity t9}\n";
+    assert(ScrcpyBridge::parseForegroundPackage(dumpResumed) == "com.android.chrome");
+
+    const std::string dumpIme =
+        "  mCurrentFocus=Window{555 u0 InputMethod}\n"
+        "  mResumedActivity: ActivityRecord{666 u0 com.spotify.music/.MainActivity t12}\n";
+    assert(ScrcpyBridge::parseForegroundPackage(dumpIme) == "com.spotify.music");
+
+    // 2. Per-app matching + Desktop profile defaults + ProfileStore round-trip
+    assert(ProfileDefaults::matchesPackage("com.dts.freefiremax,com.dts.freefireth", "com.dts.freefiremax"));
+    assert(ProfileDefaults::matchesPackage("com.dts.freefiremax, com.dts.freefireth", "com.dts.freefireth"));
+    assert(!ProfileDefaults::matchesPackage("com.dts.freefiremax", "com.whatsapp"));
+    assert(!ProfileDefaults::matchesPackage("", "com.whatsapp"));
+
+    Profile desk = ProfileDefaults::createDesktop("Desktop Typing");
+    assert(!desk.keymapEnabled && desk.buttons.empty() && desk.appPackage.empty());
+    const std::string tmpDesk = "profiles\\_test_desktop_stage1.cfg";
+    assert(ProfileStore::save(tmpDesk, desk));
+    Profile deskLoaded;
+    assert(ProfileStore::load(tmpDesk, deskLoaded));
+    assert(!deskLoaded.keymapEnabled && deskLoaded.buttons.empty());
+    std::remove(tmpDesk.c_str());
+
+    Profile game = ProfileDefaults::createFreeFire();
+    assert(game.keymapEnabled && ProfileDefaults::matchesPackage(game.appPackage, "com.dts.freefiremax"));
+    game.appPackage = "com.supercell.clashofclans,com.supercell.brawlstars";
+    const std::string tmpGame = "profiles\\_test_app_link_stage1.cfg";
+    assert(ProfileStore::save(tmpGame, game));
+    Profile gameLoaded;
+    assert(ProfileStore::load(tmpGame, gameLoaded));
+    assert(gameLoaded.keymapEnabled && ProfileDefaults::matchesPackage(gameLoaded.appPackage, "com.supercell.brawlstars"));
+    std::remove(tmpGame.c_str());
+
+    // 3. AppSettings Stage 1 flags round-trip
+    AppSettings s;
+    s.autoSwitchProfiles = false;
+    s.rightClickBack = false;
+    const std::string tmpSet = "profiles\\_test_stage1_settings.cfg";
+    assert(AppSettingsStore::save(tmpSet, s));
+    AppSettings sLoad;
+    assert(AppSettingsStore::load(tmpSet, sLoad));
+    assert(!sLoad.autoSwitchProfiles && !sLoad.rightClickBack);
+    std::remove(tmpSet.c_str());
+
+    // 4. KeyCodes Win32 VK -> Android keycode mapping
+    assert(KeyCodes::vkToAndroidKeycode(VK_RETURN) == 66);
+    assert(KeyCodes::vkToAndroidKeycode(VK_BACK) == 67);
+    assert(KeyCodes::vkToAndroidKeycode(VK_ESCAPE) == 111);
+    assert(KeyCodes::vkToAndroidKeycode('A') == 29);
+    assert(KeyCodes::vkToAndroidKeycode('V') == 50);
+    assert(KeyCodes::vkToAndroidKeycode('Z') == 54);
+    assert(KeyCodes::vkToAndroidKeycode(VK_UP) == 19);
+    assert(KeyCodes::vkToAndroidKeycode(VK_LEFT) == 21);
+
+    // 5. InputEngine Desktop Typing Mode passthrough + Ctrl+Wheel 2-finger pinch-zoom
+    ScrcpyBridge bridge;
+    InputEngine engine(&bridge);
+    std::vector<RecordedTouch> log;
+    engine.setTouchSinkForTest(recordTouchCb, &log);
+    engine.setProfile(desk);
+    engine.start();
+
+    bool reqToggle = false;
+    assert(!engine.onKeyEvent('W', true, reqToggle));
+    assert(!engine.onKeyEvent('Q', true, reqToggle));
+    assert(!engine.onKeyEvent(VK_SPACE, true, reqToggle));
+    assert(!engine.isKeyMapped('W', false));
+
+    // Ctrl+Wheel pinch zoom: must plant 2 distinct fingers strictly in 0..9, expand them, and auto-release after 140ms
+    engine.onDirectCursorPinch(0.50f, 0.50f, 1);
+    Sleep(20);
+    engine.onDirectCursorPinch(0.50f, 0.50f, 1);
+    Sleep(180); // > 140ms auto-release
+    engine.stop();
+
+    int downCount = 0, moveCount = 0, upCount = 0;
+    for (size_t i = 0; i < log.size(); ++i) {
+        assert(log[i].ptrId < 10);
+        if (log[i].action == TOUCH_DOWN) ++downCount;
+        else if (log[i].action == TOUCH_MOVE) ++moveCount;
+        else if (log[i].action == TOUCH_UP) ++upCount;
+    }
+    assert(downCount == 2 && moveCount >= 2 && upCount == 2);
+    std::printf("[Test] Stage 1 (Auto-Switch parser, Desktop Typing, Android KeyCodes, Ctrl+Wheel Pinch-Zoom) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -602,6 +701,7 @@ int main() {
     testJoystickAndActionModules();
     testFpsViewController();
     testInputEngineIntegration();
+    testStage1EmulatorFeatures();
     std::printf("ALL PRODUCTION EMULATOR SHELL & ENGINE TESTS PASSED!\n");
     return 0;
 }

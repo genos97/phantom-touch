@@ -184,3 +184,25 @@ bool KeyCodes::isMouseKey(int vk) {
            vk == VK_XBUTTON1 || vk == VK_XBUTTON2 ||
            vk == VK_CUSTOM_MWHEEL_UP || vk == VK_CUSTOM_MWHEEL_DOWN;
 }
+
+uint32_t KeyCodes::vkToAndroidKeycode(int vk) {
+    if (vk >= 'A' && vk <= 'Z') return static_cast<uint32_t>(29 + (vk - 'A')); // AKEYCODE_A..Z
+    if (vk >= '0' && vk <= '9') return static_cast<uint32_t>(7  + (vk - '0')); // AKEYCODE_0..9
+    switch (vk) {
+        case VK_RETURN: return 66;  // AKEYCODE_ENTER
+        case VK_BACK:   return 67;  // AKEYCODE_DEL (Backspace)
+        case VK_DELETE: return 112; // AKEYCODE_FORWARD_DEL
+        case VK_TAB:    return 61;  // AKEYCODE_TAB
+        case VK_SPACE:  return 62;  // AKEYCODE_SPACE
+        case VK_ESCAPE: return 111; // AKEYCODE_ESCAPE
+        case VK_UP:     return 19;  // AKEYCODE_DPAD_UP
+        case VK_DOWN:   return 20;  // AKEYCODE_DPAD_DOWN
+        case VK_LEFT:   return 21;  // AKEYCODE_DPAD_LEFT
+        case VK_RIGHT:  return 22;  // AKEYCODE_DPAD_RIGHT
+        case VK_HOME:   return 122; // AKEYCODE_MOVE_HOME
+        case VK_END:    return 123; // AKEYCODE_MOVE_END
+        case VK_PRIOR:  return 92;  // AKEYCODE_PAGE_UP
+        case VK_NEXT:   return 93;  // AKEYCODE_PAGE_DOWN
+        default:        return 0;
+    }
+}

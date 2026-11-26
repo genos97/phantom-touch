@@ -118,6 +118,7 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
     if (!in.is_open()) return false;
 
     Profile p = ProfileDefaults::createFreeFire();
+    p.appPackage.clear(); // Only auto-link if explicitly configured in the .cfg file
     bool sawAnyButton = false;
 
     std::string line;
@@ -134,6 +135,8 @@ bool ProfileStore::load(const std::string& path, Profile& outProfile) {
         std::string val = trim(line.substr(eq + 1));
 
         if (key == "name") p.name = val;
+        else if (key == "app_package") p.appPackage = val;
+        else if (key == "keymap_enabled") p.keymapEnabled = (val == "1" || toUpper(val) == "TRUE");
         else if (key == "scrcpy_args") p.scrcpyArgs = val;
         else if (key == "control_max_size") p.controlMaxSize = clampi(std::atoi(val.c_str()), 0, 4096);
         else if (key == "poll_hz") p.pollHz = clampi(std::atoi(val.c_str()), 0, 1000);
@@ -271,6 +274,8 @@ bool ProfileStore::save(const std::string& path, const Profile& p) {
     out << "# Press F2 in-app to drag & drop nodes, T to cycle node Action Type, Ctrl+S to save.\n\n";
 
     out << "name = " << p.name << "\n";
+    out << "app_package = " << p.appPackage << "\n";
+    out << "keymap_enabled = " << (p.keymapEnabled ? 1 : 0) << "\n";
     out << "scrcpy_args = " << p.scrcpyArgs << "\n";
     out << "control_max_size = " << p.controlMaxSize << "\n";
     out << "poll_hz = " << p.pollHz << "\n";

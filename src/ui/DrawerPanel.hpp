@@ -25,6 +25,8 @@ struct DrawerActionResult {
     bool requestDisconnectDevice = false;
     bool requestConnectWireless = false;
     std::string wirelessAddr;
+    bool requestLinkCurrentApp = false;
+    bool requestUnlinkApp = false;
     std::string toastMessage;
 };
 
@@ -63,6 +65,7 @@ public:
                const std::string& activeProfilePath,
                int selectedBtnIndex, bool waitingNodeRebind,
                bool connected, const std::string& deviceLabel,
+               const std::string& foregroundPkg,
                const std::vector<std::string>& logs,
                int hoverX, int hoverY);
 
@@ -115,7 +118,8 @@ private:
     int paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
                      const Profile& p, int hoverX, int hoverY);
     int paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
-                         const std::string& activePath, int hoverX, int hoverY);
+                         const Profile& p, const std::string& activePath,
+                         const std::string& foregroundPkg, int hoverX, int hoverY);
     int paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
                        const AppSettings& s, bool connected, const std::string& deviceLabel,
                        const std::vector<std::string>& logs, int hoverX, int hoverY);

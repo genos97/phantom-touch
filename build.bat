@@ -34,7 +34,7 @@ g++ -std=c++11 -O2 -Wall -Wextra -mwindows ^
     src\ui\ShellWindow.cpp ^
     resources\phantom_touch.res ^
     -o PhantomTouch.exe ^
-    -lgdiplus -lole32 -lws2_32 -lwinmm -lgdi32 -luser32 -static-libgcc -static-libstdc++
+    -lgdiplus -lole32 -lshell32 -lws2_32 -lwinmm -lgdi32 -luser32 -static-libgcc -static-libstdc++
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
