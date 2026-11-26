@@ -155,23 +155,27 @@ void AppSettings::setEncoderForDevice(const std::string& serial, const std::stri
     }
 }
 
+int AppSettings::countPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
+                                           const std::string& serial) {
+    int count = 0;
+    if (live.mirrorFps != applied.mirrorFps) ++count;
+    if (live.mirrorBitrateMbps != applied.mirrorBitrateMbps) ++count;
+    if (live.mirrorMaxSize != applied.mirrorMaxSize) ++count;
+    if (live.videoCodecOptions != applied.videoCodecOptions) ++count;
+    if (live.encoderForDevice(serial) != applied.encoderForDevice(serial)) ++count;
+    if (live.useNativeVideo != applied.useNativeVideo) ++count;
+    if (live.virtualDisplayMode != applied.virtualDisplayMode) ++count;
+    if (live.virtualDisplayMode && live.virtualDisplaySpec != applied.virtualDisplaySpec) ++count;
+    if (live.mirrorAudio != applied.mirrorAudio) ++count;
+    if (live.mirrorAudio && live.audioBufferMs != applied.audioBufferMs) ++count;
+    if (live.mirrorAudio && live.audioRawCodec != applied.audioRawCodec) ++count;
+    if (live.stayAwake != applied.stayAwake) ++count;
+    return count;
+}
+
 bool AppSettings::hasPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
                                           const std::string& serial) {
-    if (live.mirrorFps != applied.mirrorFps) return true;
-    if (live.mirrorBitrateMbps != applied.mirrorBitrateMbps) return true;
-    if (live.mirrorMaxSize != applied.mirrorMaxSize) return true;
-    if (live.videoCodecOptions != applied.videoCodecOptions) return true;
-    if (live.encoderForDevice(serial) != applied.encoderForDevice(serial)) return true;
-    if (live.useNativeVideo != applied.useNativeVideo) return true;
-    if (live.virtualDisplayMode != applied.virtualDisplayMode) return true;
-    if (live.virtualDisplayMode && live.virtualDisplaySpec != applied.virtualDisplaySpec) return true;
-    if (live.mirrorAudio != applied.mirrorAudio) return true;
-    if (live.mirrorAudio && (live.audioBufferMs != applied.audioBufferMs ||
-                             live.audioRawCodec != applied.audioRawCodec)) {
-        return true;
-    }
-    if (live.stayAwake != applied.stayAwake) return true;
-    return false;
+    return countPendingStreamChanges(live, applied, serial) > 0;
 }
 
 bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {

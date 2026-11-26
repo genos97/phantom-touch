@@ -33,6 +33,7 @@
 namespace {
 
 static const UINT_PTR TIMER_TICK = 1;
+static const UINT_PTR TIMER_ANIM = 2;
 
 struct ProfileSaveJob {
     std::string path;
@@ -189,6 +190,8 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     InterlockedExchange(&gameProfileAtomic_, profile_.keymapEnabled ? 1 : 0);
     engine_->setGamepadEnabled(settings_.gamepadEnabled);
     drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+    recordRecentProfile(profilePath_);
+    initCommandPalette();
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
     bridge_->setConnectStepCallback(ShellWindow::onConnectStep, this);
 }
@@ -204,6 +207,8 @@ ShellWindow::~ShellWindow() {
         asyncCtx_->hwnd = NULL;
         LeaveCriticalSection(&asyncCtx_->lock);
     }
+    tooltipPopup_.destroy();
+    modalPopup_.destroy();
     bridge_->setClipboardCallback(nullptr, nullptr);
     bridge_->setConnectStepCallback(nullptr, nullptr);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
@@ -295,6 +300,8 @@ bool ShellWindow::create(HINSTANCE hInst) {
     DragAcceptFiles(hwnd_, TRUE);
     viewportHost_.create(hwnd_, hInst_);
     hudOverlay_.create(hwnd_, hInst_);
+    tooltipPopup_.create(hwnd_, hInst_);
+    modalPopup_.create(hwnd_, hInst_, this);
 
     InputHookSnapshot initSnap;
     initSnap.shellHwnd = hwnd_;
@@ -325,6 +332,31 @@ bool ShellWindow::create(HINSTANCE hInst) {
         asyncCtx_->addRef();
         HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
         if (hTools) CloseHandle(hTools);
+    }
+
+    // S6: Pre-allocate & page-fault the offscreen DIB backing buffer before ShowWindow/WM_PAINT
+    if (HDC initDc = GetDC(hwnd_)) {
+        int initW = 0, initH = 0;
+        if (settings_.maximized) {
+            HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            ZeroMemory(&mi, sizeof(mi));
+            mi.cbSize = sizeof(mi);
+            if (mon && GetMonitorInfoW(mon, &mi)) {
+                initW = mi.rcWork.right - mi.rcWork.left;
+                initH = mi.rcWork.bottom - mi.rcWork.top;
+            }
+        }
+        if (initW <= 0 || initH <= 0) {
+            RECT cr;
+            GetClientRect(hwnd_, &cr);
+            initW = cr.right - cr.left;
+            initH = cr.bottom - cr.top;
+        }
+        if (initW > 0 && initH > 0) {
+            ensurePaintCache(initDc, initW, initH);
+        }
+        ReleaseDC(hwnd_, initDc);
     }
 
     if (autoFullscreen_) {
@@ -364,8 +396,10 @@ void ShellWindow::syncInputHookSnapshot() {
     s.nativeVideoActive = viewportHost_.isNativeVideoActive();
     s.uiCapturingText = editingHubWireless_ ||
                         (showOnboarding_ && onboardingView_.isEditingWifi()) ||
-                        (drawerOpen_ && (drawerPanel_.isTypingText() || drawerPanel_.isWaitingSpecialRebind())) ||
-                        (hudOverlay_.rebindTarget() != HUD_REBIND_NONE);
+                        (drawerOpen_ && (drawerPanel_.isTypingText() || drawerPanel_.hasKeyboardFocus() || drawerPanel_.isWaitingSpecialRebind())) ||
+                        (hudOverlay_.rebindTarget() != HUD_REBIND_NONE) ||
+                        (activePopup_ != POPUP_NONE);
+    s.popupOpen = (activePopup_ != POPUP_NONE);
     s.waitingSpecialRebind = (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind());
     s.keymapEnabled = profile_.keymapEnabled;
     s.rightClickBack = settings_.rightClickBack;
@@ -1803,7 +1837,8 @@ bool ShellWindow::switchProfilePath(const std::string& targetPath, bool showAuto
     hudOverlay_.setSelectedBtnIndex(-1);
     hudOverlay_.cancelRebind();
     hudOverlay_.clearUndo();
-    if (pendingUndoKind_ == UNDO_HUD_EDIT) {
+    recordRecentProfile(profilePath_);
+    if (pendingUndoKind_ == UNDO_HUD_EDIT || pendingUndoKind_ == UNDO_STAY_FOR_APP) {
         pendingUndoKind_ = UNDO_NONE;
     }
     if (!profile_.keymapEnabled && aimMode_) {
@@ -2088,6 +2123,9 @@ void ShellWindow::setAimMode(bool enabled) {
         showToast("CURSOR MODE  (KB & WASD stay active!)", 1200);
     }
     syncInputHookSnapshot();
+    animator_.start(ANIM_HUD_MODE_PULSE, 1.0f, 0.0f, ANIM_MODE_PULSE_MS, EASE_OUT_CUBIC, &viewportRc_);
+    syncAnimTimer();
+    if (aimMode_) tooltipPopup_.hide();
     hudOverlay_.invalidate();
     invalidateShell();
 }
@@ -2096,6 +2134,7 @@ void ShellWindow::setDrawerState(bool open, int tab) {
     if (open && fullscreen_) toggleFullscreen();
     if (open && aimMode_ && tab == 0) setAimMode(false);
 
+    bool wasOpen = drawerOpen_;
     drawerOpen_ = open;
     if (open) {
         drawerPanel_.setActiveTab(tab);
@@ -2115,6 +2154,13 @@ void ShellWindow::setDrawerState(bool open, int tab) {
     bool wantEdit = (drawerOpen_ && drawerPanel_.activeTab() == 0 && !editTestLive_ && (bridge_->isConnected() || demoMode_));
     setEditMode(wantEdit);
     layoutChildren();
+    if (open && !wasOpen) {
+        animator_.start(ANIM_DRAWER_SLIDE, static_cast<float>(metrics_.drawerW()), 0.0f, ANIM_BASE_MS, EASE_OUT_CUBIC, &drawerRc_);
+        syncAnimTimer();
+    }
+    if (!open && wasOpen) {
+        recheckAutoSwitchForCurrentApp();
+    }
 }
 
 void ShellWindow::setEditMode(bool enabled) {
@@ -2132,10 +2178,15 @@ void ShellWindow::setEditMode(bool enabled) {
     hudOverlay_.setInteractiveEdit(editMode_, profile_.hudOpacity);
     syncInputHookSnapshot();
     invalidateShell();
+    if (!editMode_) {
+        recheckAutoSwitchForCurrentApp();
+    }
 }
 
 void ShellWindow::toggleFullscreen() {
     if (!hwnd_) return;
+    tooltipPopup_.hide();
+    if (activePopup_ != POPUP_NONE) closePopup();
     if (!fullscreen_) {
         if (drawerOpen_) setDrawerState(false, drawerPanel_.activeTab());
         preFullscreenMax_ = (IsZoomed(hwnd_) != FALSE);
@@ -2227,10 +2278,11 @@ RECT ShellWindow::shellToastRect() const {
     return r;
 }
 
-void ShellWindow::showToast(const std::string& msg, DWORD durationMs) {
+void ShellWindow::showToast(const std::string& msg, DWORD durationMs, int toastKind) {
     if (bridge_->isConnected() || demoMode_) {
         shellToastMsg_.clear();
         shellToastActionLabel_.clear();
+        shellToastKind_ = toastKind;
         ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
         shellToastWasVisible_ = false;
         hudOverlay_.showToast(msg, durationMs);
@@ -2238,11 +2290,14 @@ void ShellWindow::showToast(const std::string& msg, DWORD durationMs) {
     }
     shellToastMsg_ = msg;
     shellToastActionLabel_.clear();
+    shellToastKind_ = toastKind;
     ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
     shellToastExpireTick_ = GetTickCount() + durationMs;
     shellToastWasVisible_ = !msg.empty();
     if (hwnd_) {
         RECT tr = shellToastRect();
+        animator_.start(ANIM_TOAST_ALPHA, 0.0f, 1.0f, ANIM_BASE_MS, EASE_OUT_CUBIC, &tr);
+        syncAnimTimer();
         if (tr.right > tr.left && tr.bottom > tr.top) {
             InvalidateRect(hwnd_, &tr, FALSE);
         } else {
@@ -2251,10 +2306,11 @@ void ShellWindow::showToast(const std::string& msg, DWORD durationMs) {
     }
 }
 
-void ShellWindow::showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs) {
+void ShellWindow::showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs, int toastKind) {
     if (bridge_->isConnected() || demoMode_) {
         shellToastMsg_.clear();
         shellToastActionLabel_.clear();
+        shellToastKind_ = toastKind;
         ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
         shellToastWasVisible_ = false;
         hudOverlay_.showSnackbar(msg, actionLabel, durationMs);
@@ -2262,11 +2318,14 @@ void ShellWindow::showSnackbar(const std::string& msg, const std::string& action
     }
     shellToastMsg_ = msg;
     shellToastActionLabel_ = actionLabel;
+    shellToastKind_ = toastKind;
     ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
     shellToastExpireTick_ = GetTickCount() + durationMs;
     shellToastWasVisible_ = !msg.empty();
     if (hwnd_) {
         RECT tr = shellToastRect();
+        animator_.start(ANIM_TOAST_ALPHA, 0.0f, 1.0f, ANIM_BASE_MS, EASE_OUT_CUBIC, &tr);
+        syncAnimTimer();
         if (tr.right > tr.left && tr.bottom > tr.top) {
             InvalidateRect(hwnd_, &tr, FALSE);
         } else {
@@ -2276,6 +2335,21 @@ void ShellWindow::showSnackbar(const std::string& msg, const std::string& action
 }
 
 bool ShellWindow::triggerShellUndo() {
+    if (pendingUndoKind_ == UNDO_STAY_FOR_APP && !manualSwitchedAppPkg_.empty()) {
+        std::string pkg = manualSwitchedAppPkg_;
+        pendingUndoKind_ = UNDO_NONE;
+        manualSwitchedAppPkg_.clear();
+        if (!ProfileDefaults::matchesPackage(profile_.appPackage, pkg)) {
+            if (!profile_.appPackage.empty()) profile_.appPackage += ",";
+            profile_.appPackage += pkg;
+        }
+        if (profile_.keymapEnabled) {
+            sessionAppProfiles_[pkg] = profilePath_;
+        }
+        applyProfileToEngine(true);
+        showToast("Pinned '" + profile_.name + "' -> " + pkg, 2200, TOAST_SUCCESS);
+        return true;
+    }
     if (pendingUndoKind_ == UNDO_TRASH_PROFILE &&
         !undoTrashPath_.empty() && !undoTrashOrigPath_.empty()) {
         std::string tp = undoTrashPath_;
@@ -2285,7 +2359,7 @@ bool ShellWindow::triggerShellUndo() {
         undoTrashOrigPath_.clear();
         if (ProfileStore::restoreFromTrash(tp, op)) {
             drawerPanel_.refreshProfileList();
-            showToast("Restored deleted config", 1800);
+            showToast("Restored deleted config", 1800, TOAST_SUCCESS);
             invalidateShell();
             return true;
         }
@@ -2401,7 +2475,14 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
             if (!activeAppPackage_.empty() && profile_.keymapEnabled) {
                 sessionAppProfiles_[activeAppPackage_] = profilePath_;
             }
-            showToast("Loaded config: " + profile_.name, 2000);
+            if (!activeAppPackage_.empty() && settings_.autoSwitchProfiles &&
+                !ProfileDefaults::matchesPackage(profile_.appPackage, activeAppPackage_)) {
+                manualSwitchedAppPkg_ = activeAppPackage_;
+                pendingUndoKind_ = UNDO_STAY_FOR_APP;
+                showSnackbar("Switched to " + profile_.name, "Stay on for this app", 6000, TOAST_INFO);
+            } else {
+                showToast("Loaded config: " + profile_.name, 2000, TOAST_SUCCESS);
+            }
         }
     }
     if (res.requestLinkCurrentApp && !activeAppPackage_.empty()) {
@@ -2590,19 +2671,17 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
 void ShellWindow::handleTopBarAction(TopBarAction act) {
     switch (act) {
         case TB_OPEN_PROFILES:
-            if (drawerOpen_ && drawerPanel_.activeTab() == 2) setDrawerState(false, 2);
-            else setDrawerState(true, 2);
+            if (activePopup_ == POPUP_PROFILE_DROPDOWN) closePopup();
+            else openPopup(POPUP_PROFILE_DROPDOWN);
             break;
         case TB_TOGGLE_AIM: setAimMode(!aimMode_); break;
         case TB_OPEN_HELP:
             if (showOnboarding_) {
                 finishOnboarding();
+            } else if (activePopup_ == POPUP_CHEAT_SHEET) {
+                closePopup();
             } else {
-                if (drawerOpen_) setDrawerState(false, drawerPanel_.activeTab());
-                showOnboarding_ = true;
-                onboardingView_.setStep(toolsReady_ ? (bridge_->isConnected() ? OB_STEP_PROFILE : OB_STEP_PREPARE) : OB_STEP_TOOLS);
-                syncHudAndVideo();
-                invalidateShell();
+                openPopup(POPUP_CHEAT_SHEET);
             }
             break;
         case TB_TOGGLE_PIN: toggleAlwaysOnTop(); break;
@@ -2785,9 +2864,15 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             break;
 
-        case WM_ACTIVATE:
-            GdiPlusDraw::setDwmBorderActive(hwnd, LOWORD(wParam) != WA_INACTIVE);
+        case WM_ACTIVATE: {
+            bool active = (LOWORD(wParam) != WA_INACTIVE);
+            GdiPlusDraw::setDwmBorderActive(hwnd, active);
+            if (!active) {
+                tooltipPopup_.hide();
+                if (activePopup_ != POPUP_NONE) closePopup();
+            }
             break;
+        }
 
         case WM_DPICHANGED: {
             int newDpi = HIWORD(wParam);
@@ -2820,11 +2905,15 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         case WM_MOVE:
             // S4: moving window only syncs screen rects (zero relayout, zero UI Present)
+            tooltipPopup_.hide();
+            if (activePopup_ != POPUP_NONE) closePopup();
             syncHudAndVideo();
             syncInputHookSnapshot();
             return 0;
 
         case WM_SIZE:
+            tooltipPopup_.hide();
+            if (activePopup_ != POPUP_NONE) closePopup();
             if (!inSizeMove_ || (GetTickCount() - lastResizeTick_) >= 16) {
                 lastResizeTick_ = GetTickCount();
                 layoutChildren();
@@ -2834,6 +2923,14 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case MSG_TOGGLE_AIM:        setAimMode(!aimMode_); return 0;
         case MSG_UNLOCK_AIM:        setAimMode(false); return 0;
         case MSG_LOCK_AIM:          setAimMode(true); return 0;
+        case MSG_TOGGLE_CMD_PALETTE:
+            if (activePopup_ == POPUP_CMD_PALETTE) closePopup();
+            else openPopup(POPUP_CMD_PALETTE);
+            return 0;
+        case MSG_TOGGLE_CHEAT_SHEET:
+            if (activePopup_ == POPUP_CHEAT_SHEET) closePopup();
+            else openPopup(POPUP_CHEAT_SHEET);
+            return 0;
         case MSG_TOGGLE_STUDIO:
             if (drawerOpen_ && drawerPanel_.activeTab() == 0) setDrawerState(false, 0);
             else setDrawerState(true, 0);
@@ -3235,6 +3332,41 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             return 0;
 
         case WM_TIMER:
+            if (wParam == TIMER_ANIM) {
+                std::vector<RECT> dirty;
+                if (animator_.tick(Animator::currentTimeMs(), dirty)) {
+                    if (animator_.isActive(ANIM_HUD_MODE_PULSE) || animator_.value(ANIM_HUD_MODE_PULSE, 0.0f) > 0.0f) {
+                        float pa = animator_.isActive(ANIM_HUD_MODE_PULSE)
+                            ? animator_.value(ANIM_HUD_MODE_PULSE, 0.0f)
+                            : 0.0f;
+                        if (viewportHost_.isNativeVideoActive()) {
+                            EngineTelemetry tel = engine_->getTelemetry();
+                            DynamicHudMarkers dm;
+                            dm.active = (!editMode_ && !showOnboarding_ && profile_.keymapEnabled &&
+                                         (profile_.showHudInPlay || demoMode_));
+                            dm.showCrosshair = (aimMode_ && profile_.showHudInPlay);
+                            dm.aimFingerDown = tel.aimFingerDown;
+                            dm.aimX = tel.aimFingerNormX;
+                            dm.aimY = tel.aimFingerNormY;
+                            dm.fireHeld = tel.fireHeld;
+                            dm.joyDown = tel.joyDown;
+                            dm.joyX = tel.joyFingerNormX;
+                            dm.joyY = tel.joyFingerNormY;
+                            dm.opacity = profile_.hudOpacity;
+                            dm.modePulseAlpha = pa;
+                            dm.modePulseAim = aimMode_;
+                            viewportHost_.setDynamicHudMarkers(dm);
+                        } else {
+                            hudOverlay_.setModePulse(pa, aimMode_);
+                        }
+                    }
+                    for (size_t di = 0; di < dirty.size(); ++di) {
+                        InvalidateRect(hwnd, &dirty[di], FALSE);
+                    }
+                }
+                syncAnimTimer();
+                return 0;
+            }
             if (wParam == TIMER_TICK) {
                 bool fg = isAppForeground();
                 engine_->setAppFocused(fg); // E4: gate XInput gamepad polling on window focus!
@@ -3371,6 +3503,9 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     dm.joyX = tel.joyFingerNormX;
                     dm.joyY = tel.joyFingerNormY;
                     dm.opacity = profile_.hudOpacity;
+                    dm.modePulseAlpha = animator_.isActive(ANIM_HUD_MODE_PULSE)
+                        ? animator_.value(ANIM_HUD_MODE_PULSE, 0.0f) : 0.0f;
+                    dm.modePulseAim = aimMode_;
                     viewportHost_.setDynamicHudMarkers(dm);
                 }
                 if ((nowTick - lastTelemetryPaintTick_) >= 150) {
@@ -3396,6 +3531,7 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             cur.aimQx = (!nativeVid && tel.aimFingerDown) ? static_cast<int>(tel.aimFingerNormX * 64.0f) : -1;
                             cur.aimQy = (!nativeVid && tel.aimFingerDown) ? static_cast<int>(tel.aimFingerNormY * 64.0f) : -1;
                             cur.fsRate = (fullscreen_ && !aimMode_) ? tel.touchRateHz : 0;
+                            cur.activeBtnMask = tel.activeButtonMask;
 
                             bool changed = !lastHudSig_.valid ||
                                 cur.aimMode != lastHudSig_.aimMode ||
@@ -3408,7 +3544,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                 cur.fullscreen != lastHudSig_.fullscreen ||
                                 cur.aimQx != lastHudSig_.aimQx ||
                                 cur.aimQy != lastHudSig_.aimQy ||
-                                cur.fsRate != lastHudSig_.fsRate;
+                                cur.fsRate != lastHudSig_.fsRate ||
+                                cur.activeBtnMask != lastHudSig_.activeBtnMask;
                             if (changed) {
                                 lastHudSig_ = cur;
                                 hudOverlay_.invalidate();
@@ -3425,6 +3562,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     TopBarVisualSig cur;
                     cur.valid = true;
                     cur.connected = connected;
+                    cur.reconnecting = reconnecting_;
+                    cur.connLost = (!connected && !demoMode_ && !lastConnectError_.empty());
                     cur.aimMode = aimMode_;
                     cur.keymapEnabled = profile_.keymapEnabled;
                     cur.fireMode = profile_.fireMode;
@@ -3435,6 +3574,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
                     bool tbChanged = !lastTopBarSig_.valid ||
                         cur.connected != lastTopBarSig_.connected ||
+                        cur.reconnecting != lastTopBarSig_.reconnecting ||
+                        cur.connLost != lastTopBarSig_.connLost ||
                         cur.aimMode != lastTopBarSig_.aimMode ||
                         cur.keymapEnabled != lastTopBarSig_.keymapEnabled ||
                         cur.fireMode != lastTopBarSig_.fireMode ||
@@ -3505,49 +3646,33 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
 
             if (curRegion != lastHoverRegion_ || curId != lastHoverItemId_) {
-                bool childCovers = viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded();
-                auto invalWithPad = [&](const RECT& r, int region) {
+                auto invalWithPad = [&](const RECT& r) {
                     if (r.right <= r.left || r.bottom <= r.top) return;
                     RECT d = { r.left - 2, r.top - 2, r.right + 2, r.bottom + 2 };
                     InvalidateRect(hwnd, &d, FALSE);
-                    if (region == 2 && !childCovers && !fullscreen_) {
-                        RECT tipBand = {
-                            railRc_.left - metrics_.dp(246),
-                            r.top - metrics_.dp(18),
-                            railRc_.left,
-                            r.bottom + metrics_.dp(18)
-                        };
-                        InvalidateRect(hwnd, &tipBand, FALSE);
-                    }
                 };
-                invalWithPad(lastHoverRc_, lastHoverRegion_);
-                invalWithPad(curRc, curRegion);
+                invalWithPad(lastHoverRc_);
+                invalWithPad(curRc);
+                animator_.start(ANIM_HOVER_FADE, 0.0f, 1.0f, ANIM_FAST_MS, EASE_OUT_CUBIC, &curRc);
+                syncAnimTimer();
                 lastHoverRegion_ = curRegion;
                 lastHoverItemId_ = curId;
                 lastHoverRc_ = curRc;
             }
+            updateTooltipAtPoint(mx, my);
             return 0;
         }
 
         case WM_MOUSELEAVE:
             hoverX_ = -1;
             hoverY_ = -1;
+            tooltipPopup_.hide();
             if (editMode_ && viewportHost_.isNativeVideoActive() && !d3dHudDragging_) {
                 hudOverlay_.dispatchMouseLeave();
             }
             if (lastHoverItemId_ >= 0 && !IsRectEmpty(&lastHoverRc_)) {
                 RECT d = { lastHoverRc_.left - 2, lastHoverRc_.top - 2, lastHoverRc_.right + 2, lastHoverRc_.bottom + 2 };
                 InvalidateRect(hwnd, &d, FALSE);
-                bool childCovers = viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded();
-                if (lastHoverRegion_ == 2 && !childCovers && !fullscreen_) {
-                    RECT tipBand = {
-                        railRc_.left - metrics_.dp(246),
-                        lastHoverRc_.top - metrics_.dp(18),
-                        railRc_.left,
-                        lastHoverRc_.bottom + metrics_.dp(18)
-                    };
-                    InvalidateRect(hwnd, &tipBand, FALSE);
-                }
             }
             lastHoverRegion_ = 0;
             lastHoverItemId_ = -1;
@@ -3720,6 +3845,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
             int vk = static_cast<int>(wParam);
+            if (activePopup_ != POPUP_NONE) {
+                handlePopupKeyDown(vk);
+                return 0;
+            }
             if (showOnboarding_ && onboardingView_.isEditingWifi()) {
                 OnboardingClickResult obRes;
                 if (onboardingView_.onKeyDown(vk, settings_.lastWirelessAddr, obRes)) {
@@ -3750,6 +3879,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 DrawerActionResult res;
                 if (drawerPanel_.onKeyDown(vk, profile_, settings_, hudOverlay_.selectedBtnIndex(), res)) {
                     handleDrawerResult(res);
+                    syncInputHookSnapshot();
+                    invalidateShell();
                     return 0;
                 }
             }
@@ -3769,6 +3900,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         case WM_CHAR: {
             wchar_t ch = static_cast<wchar_t>(wParam);
+            if (activePopup_ != POPUP_NONE) {
+                handlePopupChar(ch);
+                return 0;
+            }
             if (showOnboarding_ && onboardingView_.isEditingWifi() && ch <= 126) {
                 if (onboardingView_.onChar(static_cast<char>(ch), settings_.lastWirelessAddr)) {
                     scheduleSettingsSave();
@@ -3862,7 +3997,11 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             flushOnExit();
             setAimMode(false);
             viewportHost_.detachMirror();
+            tooltipPopup_.destroy();
+            modalPopup_.destroy();
             KillTimer(hwnd, TIMER_TICK);
+            KillTimer(hwnd, TIMER_ANIM);
+            animTimerActive_ = false;
             PostQuitMessage(0);
             return 0;
 
@@ -3875,6 +4014,15 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
     SetFocus(hwnd);
     editingHubWireless_ = false;
+
+    if (activePopup_ != POPUP_NONE) {
+        if (ptIn(topBarRc_, mx, my) && topBar_.hitTest(mx, my) == TB_OPEN_PROFILES &&
+            activePopup_ == POPUP_PROFILE_DROPDOWN) {
+            closePopup();
+            return;
+        }
+        closePopup();
+    }
 
     // 1. TopBar interactive controls
     if (ptIn(topBarRc_, mx, my)) {
@@ -3959,6 +4107,9 @@ void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
                 else startQrWirelessPairing();
             } else if (ob.action == OB_ACT_APPLY_PROFILE_CHOICE) {
                 applyOnboardingProfileChoice(ob.profileChoice);
+                animator_.start(ANIM_ONBOARD_PAGE, 0.0f, 1.0f,
+                                ANIM_BASE_MS, EASE_OUT_CUBIC, &viewportRc_);
+                syncAnimTimer();
             }
             syncInputHookSnapshot();
             invalidateShell();
@@ -4032,6 +4183,41 @@ void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
     }
 }
 
+bool ShellWindow::ensurePaintCache(HDC refDc, int w, int h) {
+    if (!refDc || w <= 0 || h <= 0) return false;
+    if (cacheDC_ && w == cacheW_ && h == cacheH_) return false;
+    if (cacheDC_) {
+        if (cacheOldBmp_) SelectObject(cacheDC_, cacheOldBmp_);
+        if (cacheBmp_) DeleteObject(cacheBmp_);
+        DeleteDC(cacheDC_);
+        cacheDC_ = NULL;
+        cacheBmp_ = NULL;
+        cacheOldBmp_ = NULL;
+    }
+    cacheDC_ = CreateCompatibleDC(refDc);
+    if (!cacheDC_) return false;
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* dibBits = NULL;
+    cacheBmp_ = CreateDIBSection(refDc, &bmi, DIB_RGB_COLORS, &dibBits, NULL, 0);
+    if (!cacheBmp_) {
+        cacheBmp_ = CreateCompatibleBitmap(refDc, w, h);
+    }
+    cacheOldBmp_ = SelectObject(cacheDC_, cacheBmp_);
+    cacheW_ = w;
+    cacheH_ = h;
+    RECT fullRc = { 0, 0, w, h };
+    SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
+    FillRect(cacheDC_, &fullRc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    return true;
+}
+
 void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
     // 1.4(b): In F11 Native Video Fullscreen, swapchain renders directly on top-level hwnd_!
     if (fullscreen_) {
@@ -4057,29 +4243,7 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         paintRc = rc;
     }
 
-    if (!cacheDC_ || w != cacheW_ || h != cacheH_) {
-        if (cacheDC_) {
-            if (cacheOldBmp_) SelectObject(cacheDC_, cacheOldBmp_);
-            if (cacheBmp_) DeleteObject(cacheBmp_);
-            DeleteDC(cacheDC_);
-        }
-        cacheDC_ = CreateCompatibleDC(hdc);
-        BITMAPINFO bmi;
-        ZeroMemory(&bmi, sizeof(bmi));
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = w;
-        bmi.bmiHeader.biHeight = -h;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* dibBits = NULL;
-        cacheBmp_ = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, NULL, 0);
-        if (!cacheBmp_) {
-            cacheBmp_ = CreateCompatibleBitmap(hdc, w, h);
-        }
-        cacheOldBmp_ = SelectObject(cacheDC_, cacheBmp_);
-        cacheW_ = w;
-        cacheH_ = h;
+    if (ensurePaintCache(hdc, w, h)) {
         paintRc = rc;
     }
 
@@ -4088,12 +4252,23 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         return IntersectRect(&inter, &paintRc, &r) != FALSE;
     };
 
+    const bool connected = bridge_->isConnected();
+    const bool childCoversViewport = !showOnboarding_ && (viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded());
+
     double msHub = 0.0, msTop = 0.0, msDraw = 0.0, msRail = 0.0;
     TelemetrySummary vidTel = telemetry_.getSummary();
     {
-        // Fast native GDI clear before GDI+ vector overlay (sub-millisecond even at 2560x1440!)
+        // Fast native GDI clear before GDI+ vector overlay (skip occluded viewport when native/embedded video active)
+        HBRUSH bgBr = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
         SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
-        FillRect(cacheDC_, &paintRc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        if (!childCoversViewport) {
+            FillRect(cacheDC_, &paintRc, bgBr);
+        } else {
+            RECT rClear;
+            if (IntersectRect(&rClear, &paintRc, &topBarRc_)) FillRect(cacheDC_, &rClear, bgBr);
+            if (IntersectRect(&rClear, &paintRc, &railRc_))   FillRect(cacheDC_, &rClear, bgBr);
+            if (drawerOpen_ && IntersectRect(&rClear, &paintRc, &drawerRc_)) FillRect(cacheDC_, &rClear, bgBr);
+        }
 
         Gdiplus::Graphics g(cacheDC_);
         g.SetClip(Gdiplus::Rect(paintRc.left, paintRc.top,
@@ -4101,8 +4276,6 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-        bool connected = bridge_->isConnected();
-        bool childCoversViewport = !showOnboarding_ && (viewportHost_.isNativeVideoActive() || viewportHost_.isMirrorEmbedded());
         std::string devLabel;
         bool needDevLabel = (!fullscreen_ && (hitsDirty(topBarRc_) || (drawerOpen_ && hitsDirty(drawerRc_))));
         if (needDevLabel) {
@@ -4143,9 +4316,14 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
             if (hitsDirty(topBarRc_)) {
                 const int64_t ts = LatencyTelemetry::nowQpc();
                 EngineTelemetry tel = engine_->getTelemetry();
+                TopBarConnState tbConn = TB_CONN_IDLE;
+                if (connected) tbConn = TB_CONN_CONNECTED;
+                else if (demoMode_) tbConn = TB_CONN_DEMO;
+                else if (reconnecting_) tbConn = TB_CONN_RECONNECTING;
+                else if (!lastConnectError_.empty()) tbConn = TB_CONN_LOST;
                 topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
                               profile_, tel, settings_.alwaysOnTop,
-                              (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_, vidTel);
+                              (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_, vidTel, tbConn);
                 if (connected && secureAppDetected_) {
                     RECT rSecBar = { topBarRc_.left + metrics_.dp(170), topBarRc_.bottom - metrics_.dp(16),
                                      topBarRc_.right - metrics_.dp(180), topBarRc_.bottom - metrics_.dp(1) };
@@ -4175,14 +4353,18 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 LeaveCriticalSection(&auxLock_);
                 drawerPanel_.setLatencyDiagnostics(vidTel, pr, viewportHost_.presentationModeLabel());
                 drawerPanel_.setThermalAndEncoderInfo(bridge_->activeSerial(), ti, actEnc, encList);
-                drawerPanel_.setPendingStreamChanges(
-                    connected && hasAppliedStreamSettings_ &&
-                    AppSettings::hasPendingStreamChanges(settings_, appliedStreamSettings_, bridge_->activeSerial()));
+                int pendingCnt = 0;
+                if (connected && hasAppliedStreamSettings_) {
+                    pendingCnt = AppSettings::countPendingStreamChanges(settings_, appliedStreamSettings_, bridge_->activeSerial());
+                }
+                drawerPanel_.setPendingStreamChangeCount(pendingCnt);
+                int slideDx = animator_.isActive(ANIM_DRAWER_SLIDE)
+                    ? static_cast<int>(animator_.value(ANIM_DRAWER_SLIDE, 0.0f) + 0.5f) : 0;
                 std::vector<std::string> logs = bridge_->getRecentLogs();
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),
                                    (hudOverlay_.rebindTarget() == HUD_REBIND_BUTTON),
-                                   connected, devLabel, activeAppPackage_, logs, hoverX_, hoverY_);
+                                   connected, devLabel, activeAppPackage_, logs, hoverX_, hoverY_, slideDx);
                 msDraw = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
             }
 
@@ -4217,25 +4399,7 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                                       static_cast<float>(rDbg.top + 7), 9.5f, true, Theme::ACCENT_CYAN);
             }
 
-            // Subtle hover tooltip left of SideRail (only when actually hovering SideRail)
-            if (!childCoversViewport && ptIn(railRc_, hoverX_, hoverY_)) {
-                std::string tip = sideRail_.tooltipAt(hoverX_, hoverY_);
-                if (!tip.empty()) {
-                    int tw = 22 + static_cast<int>(tip.size()) * 7;
-                    if (tw < 96) tw = 96;
-                    if (tw > 230) tw = 230;
-                    int ty = hoverY_ - 13;
-                    if (ty < topBarRc_.bottom + 4) ty = topBarRc_.bottom + 4;
-                    if (ty + 26 > h - 4) ty = h - 30;
-                    RECT tr = { railRc_.left - tw - 8, ty, railRc_.left - 8, ty + 26 };
-                    GdiPlusDraw::roundedCard(g, tr, 6.0f, Theme::BG_SHELL, Theme::ACCENT_CYAN, 1.0f);
-                    GdiPlusDraw::textCenter(g, tip, static_cast<float>(tr.left + tr.right) * 0.5f,
-                                            static_cast<float>(tr.top + tr.bottom) * 0.5f,
-                                            11.0f, true, Theme::TEXT_PRIMARY);
-                }
-            }
-
-            // N29 + X9: Render shell-layer toast/snackbar when no phone video/HUD layer is active
+            // N29 + X9 + U4: Render shell-layer toast/snackbar when no phone video/HUD layer is active
             if (!childCoversViewport && !shellToastMsg_.empty() &&
                 static_cast<LONG>(GetTickCount() - shellToastExpireTick_) < 0 &&
                 hitsDirty(viewportRc_)) {
@@ -4243,29 +4407,36 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 int btnW = shellToastActionLabel_.empty()
                     ? 0
                     : (metrics_.dp(24) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastActionLabel_.size()) * 7.0f)));
-                int pw = metrics_.dp(36) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastMsg_.size()) * 6.8f)) + (btnW > 0 ? btnW + metrics_.dp(10) : 0);
-                if (pw < metrics_.dp(150)) pw = metrics_.dp(150);
+                int pw = metrics_.dp(42) + static_cast<int>(metrics_.dpf(static_cast<float>(shellToastMsg_.size()) * 6.8f)) + (btnW > 0 ? btnW + metrics_.dp(10) : 0);
+                if (pw < metrics_.dp(156)) pw = metrics_.dp(156);
                 if (pw > vw - metrics_.dp(28)) pw = vw - metrics_.dp(28);
                 int ph = metrics_.dp(32);
                 int cx = (viewportRc_.left + viewportRc_.right) / 2;
                 int cy = viewportRc_.bottom - ph / 2 - metrics_.dp(16);
                 RECT tr = { cx - pw / 2, cy - ph / 2, cx + pw / 2, cy + ph / 2 };
-                GdiPlusDraw::roundedCard(g, tr, metrics_.dpf(14.0f), 0xE2101622u, Theme::ACCENT_CYAN, 1.2f);
+                uint32_t kindCol = (shellToastKind_ == TOAST_SUCCESS) ? Theme::SEM_SUCCESS
+                                 : (shellToastKind_ == TOAST_WARNING) ? Theme::SEM_WARNING
+                                 : (shellToastKind_ == TOAST_ERROR)   ? Theme::SEM_DANGER
+                                                                      : Theme::SEM_INFO;
+                GdiPlusDraw::roundedCard(g, tr, metrics_.dpf(14.0f), 0xE2101622u, kindCol, 1.2f);
+                Gdiplus::SolidBrush dotBr(GdiPlusDraw::argb(kindCol));
+                float dR = metrics_.dpf(3.5f);
+                g.FillEllipse(&dotBr, static_cast<float>(tr.left + metrics_.dp(10)), static_cast<float>(cy) - dR, dR * 2.0f, dR * 2.0f);
                 if (btnW > 0) {
-                    int msgW = pw - btnW - metrics_.dp(22);
-                    GdiPlusDraw::textLeft(g, shellToastMsg_, static_cast<float>(tr.left + metrics_.dp(12)),
+                    int msgW = pw - btnW - metrics_.dp(30);
+                    GdiPlusDraw::textLeft(g, shellToastMsg_, static_cast<float>(tr.left + metrics_.dp(22)),
                                           static_cast<float>(cy), 11.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(msgW));
                     RECT actRc = { tr.right - btnW - metrics_.dp(6), tr.top + metrics_.dp(4),
                                    tr.right - metrics_.dp(6), tr.bottom - metrics_.dp(4) };
                     shellToastActionRc_ = actRc;
-                    GdiPlusDraw::roundedCard(g, actRc, metrics_.dpf(9.0f), Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.1f);
+                    GdiPlusDraw::roundedCard(g, actRc, metrics_.dpf(9.0f), Theme::ACCENT_CYAN_BG, kindCol, 1.1f);
                     GdiPlusDraw::textCenter(g, shellToastActionLabel_,
                                             static_cast<float>(actRc.left + actRc.right) * 0.5f,
                                             static_cast<float>(actRc.top + actRc.bottom) * 0.5f,
-                                            11.0f, true, Theme::ACCENT_CYAN);
+                                            11.0f, true, kindCol);
                 } else {
                     ZeroMemory(&shellToastActionRc_, sizeof(shellToastActionRc_));
-                    GdiPlusDraw::textCenter(g, shellToastMsg_, static_cast<float>(cx), static_cast<float>(cy),
+                    GdiPlusDraw::textCenter(g, shellToastMsg_, static_cast<float>(cx + metrics_.dp(4)), static_cast<float>(cy),
                                             11.5f, true, Theme::TEXT_PRIMARY);
                 }
             } else if (!shellToastWasVisible_) {
@@ -4279,11 +4450,25 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         }
     }
 
-    int bx = paintRc.left;
-    int by = paintRc.top;
-    int bw = paintRc.right - paintRc.left;
-    int bh = paintRc.bottom - paintRc.top;
-    BitBlt(hdc, bx, by, bw, bh, cacheDC_, bx, by, SRCCOPY);
+    if (!childCoversViewport) {
+        int bx = paintRc.left;
+        int by = paintRc.top;
+        int bw = paintRc.right - paintRc.left;
+        int bh = paintRc.bottom - paintRc.top;
+        BitBlt(hdc, bx, by, bw, bh, cacheDC_, bx, by, SRCCOPY);
+    } else {
+        auto blitSub = [&](const RECT& sub) {
+            RECT rBlt;
+            if (IntersectRect(&rBlt, &paintRc, &sub)) {
+                BitBlt(hdc, rBlt.left, rBlt.top,
+                       rBlt.right - rBlt.left, rBlt.bottom - rBlt.top,
+                       cacheDC_, rBlt.left, rBlt.top, SRCCOPY);
+            }
+        };
+        blitSub(topBarRc_);
+        blitSub(railRc_);
+        if (drawerOpen_) blitSub(drawerRc_);
+    }
     lastPaintMs_ = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - tPaint0);
     if (lastPaintMs_ > 16.0 || (consoleEnabled_ && lastPaintMs_ > 8.0)) {
         char pbuf[160];
@@ -4297,4 +4482,434 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
             std::printf("%s\n", pbuf);
         }
     }
+}
+
+// ============================================================================
+// Sprint 3B: Animator, Layered Tooltips, X5 Command Palette, X6 Cheat Sheet,
+//            X7 Searchable Profile Dropdown & Auto-Switch Transparency
+// ============================================================================
+
+void ShellWindow::syncAnimTimer() {
+    if (!hwnd_) return;
+    bool need = animator_.hasActive();
+    if (need && !animTimerActive_) {
+        SetTimer(hwnd_, TIMER_ANIM, 8, NULL);
+        animTimerActive_ = true;
+    } else if (!need && animTimerActive_) {
+        KillTimer(hwnd_, TIMER_ANIM);
+        animTimerActive_ = false;
+    }
+}
+
+void ShellWindow::updateTooltipAtPoint(int mx, int my) {
+    if (!hwnd_ || fullscreen_ || activePopup_ != POPUP_NONE) {
+        tooltipPopup_.hide();
+        return;
+    }
+    if (ptIn(railRc_, mx, my)) {
+        std::string tip = sideRail_.tooltipAt(mx, my);
+        RECT r = { 0, 0, 0, 0 };
+        if (!tip.empty() && sideRail_.itemRectAt(mx, my, r)) {
+            POINT pt = { r.left, (r.top + r.bottom) / 2 };
+            ClientToScreen(hwnd_, &pt);
+            tooltipPopup_.showAt(pt.x, pt.y, tip, true);
+            return;
+        }
+    } else if (ptIn(topBarRc_, mx, my)) {
+        std::string tip = topBar_.tooltipAt(mx, my);
+        if (!tip.empty()) {
+            int dummyId = 0;
+            RECT r = { mx - 20, topBarRc_.top, mx + 20, topBarRc_.bottom };
+            topBar_.hoverItemAt(mx, my, dummyId, r);
+            POINT pt = { (r.left + r.right) / 2, topBarRc_.bottom + metrics_.dp(4) };
+            ClientToScreen(hwnd_, &pt);
+            tooltipPopup_.showAt(pt.x, pt.y, tip, false);
+            return;
+        }
+    }
+    tooltipPopup_.hide();
+}
+
+void ShellWindow::recordRecentProfile(const std::string& path) {
+    if (path.empty()) return;
+    for (std::vector<std::string>::iterator it = recentProfilePaths_.begin();
+         it != recentProfilePaths_.end(); ++it) {
+        if (lstrcmpiA(it->c_str(), path.c_str()) == 0) {
+            recentProfilePaths_.erase(it);
+            break;
+        }
+    }
+    recentProfilePaths_.insert(recentProfilePaths_.begin(), path);
+    if (recentProfilePaths_.size() > 6) {
+        recentProfilePaths_.resize(6);
+    }
+}
+
+void ShellWindow::rebuildProfileMenuItems() {
+    profileMenuItems_.clear();
+    std::vector<std::string> files = ProfileStore::listProfiles(profilesDir_);
+    for (size_t i = 0; i < files.size(); ++i) {
+        ProfileMenuItem item;
+        item.path = files[i];
+        size_t sl = files[i].find_last_of("\\/");
+        std::string base = (sl == std::string::npos) ? files[i] : files[i].substr(sl + 1);
+        Profile tmp;
+        if (ProfileStore::load(files[i], tmp)) {
+            item.displayName = tmp.name.empty() ? base : tmp.name;
+            item.appPackage = tmp.appPackage;
+        } else {
+            item.displayName = base;
+        }
+        item.active = (lstrcmpiA(files[i].c_str(), profilePath_.c_str()) == 0);
+        for (size_t ri = 0; ri < recentProfilePaths_.size(); ++ri) {
+            if (lstrcmpiA(recentProfilePaths_[ri].c_str(), files[i].c_str()) == 0) {
+                item.recent = true;
+                break;
+            }
+        }
+        profileMenuItems_.push_back(item);
+    }
+}
+
+void ShellWindow::recheckAutoSwitchForCurrentApp() {
+    if (!settings_.autoSwitchProfiles || drawerOpen_ || editMode_ || demoMode_) return;
+    if (activeAppPackage_.empty()) return;
+    handleForegroundAppChanged(activeAppPackage_);
+}
+
+void ShellWindow::initCommandPalette() {
+    baseCommands_.clear();
+    auto addCmd = [&](const char* id, const char* title, const char* kw, const char* hk, const char* cat) {
+        CommandEntry e;
+        e.id = id;
+        e.title = title;
+        e.keywords = kw;
+        e.hotkey = hk;
+        e.category = cat;
+        baseCommands_.push_back(e);
+    };
+    addCmd("aim.toggle",      "Toggle Aim Lock / Cursor Mode",     "aim lock cursor camera mouse", "F1",          "Play");
+    addCmd("drawer.keys",     "Open Keymap Studio",                "keys editor palette add bind", "F2",          "Studio");
+    addCmd("drawer.sens",     "Open Sensitivity & Aim Physics",    "sens dpi accel fire joy",      "",            "Studio");
+    addCmd("drawer.profiles", "Open Profiles Manager",             "profile config template import","",            "Profiles");
+    addCmd("drawer.device",   "Open Device & Stream Settings",     "device stream fps bitrate adb","",            "Device");
+    addCmd("fire.cycle",      "Cycle Fire Mode",                   "fire drag claw dual",          "F3",          "Play");
+    addCmd("hud.toggle",      "Toggle HUD Overlay Badges",         "hud hide show opacity",        "F4",          "Play");
+    addCmd("touch.reset",     "Reset All Virtual Touches",         "reset unstick release",        "F5",          "Play");
+    addCmd("win.fullscreen",  "Toggle Fullscreen Mode",            "fullscreen max borderless",    "F11",         "View");
+    addCmd("win.pin",         "Toggle Window Always on Top",       "pin topmost float",            "",            "View");
+    addCmd("cheatsheet.open", "Open Live Keybinding Cheat Sheet",  "help hotkeys bindings list",   "Ctrl+/",      "Help");
+    addCmd("preset.comp",     "Stream Preset: Competitive",        "preset competitive latency",   "",            "Stream");
+    addCmd("preset.bal",      "Stream Preset: Balanced",           "preset balanced",              "",            "Stream");
+    addCmd("preset.qual",     "Stream Preset: Quality",            "preset quality native",        "",            "Stream");
+    addCmd("preset.wifi",     "Stream Preset: Wi-Fi",              "preset wifi wireless",         "",            "Stream");
+    addCmd("setting.audio",   "Toggle Phone Audio Forwarding",     "audio sound scrcpy",           "",            "Stream");
+    addCmd("setting.screenoff","Toggle Turn Phone Screen Off",     "screen off power battery",     "",            "Device");
+    addCmd("setting.autoswitch","Toggle Per-App Auto-Switch",      "auto switch package app",      "",            "Input");
+    addCmd("setting.gamepad", "Toggle XInput Gamepad-to-Touch",    "gamepad controller xbox",      "",            "Gamepad");
+    addCmd("diag.debug",      "Toggle Latency & UI Debug Strip",   "debug overlay stats s6",       "Ctrl+Shift+D","Debug");
+    addCmd("diag.probe",      "Run Round-Trip Latency Probe",      "probe latency benchmark",      "Ctrl+Shift+L","Debug");
+    addCmd("app.screenshot",  "Capture Phone Screenshot",          "screenshot png camera",        "",            "Device");
+    addCmd("app.reconnect",   "Apply Settings & Reconnect Stream", "reconnect restart stream",     "",            "Device");
+    addCmd("app.onboarding",  "Open Setup Guide / Onboarding",     "onboarding guide wizard help", "",            "Help");
+}
+
+void ShellWindow::openPopup(int modeInt) {
+    if (!hwnd_) return;
+    ActivePopupMode mode = static_cast<ActivePopupMode>(modeInt);
+    if (mode == POPUP_NONE) {
+        closePopup();
+        return;
+    }
+    if (aimMode_) setAimMode(false);
+    tooltipPopup_.hide();
+    drawerPanel_.clearFocus();
+    editingHubWireless_ = false;
+
+    activePopup_ = mode;
+    popupQuery_.clear();
+    popupSelectedRow_ = 0;
+    popupHoverRow_ = -1;
+    popupRowRects_.clear();
+    ZeroMemory(&popupManageProfilesRc_, sizeof(popupManageProfilesRc_));
+
+    RECT cr;
+    GetClientRect(hwnd_, &cr);
+    int cw = cr.right - cr.left;
+    int ch = cr.bottom - cr.top;
+
+    RECT localRc = { 0, 0, 320, 240 };
+    if (mode == POPUP_CMD_PALETTE) {
+        std::vector<CommandEntry> all = baseCommands_;
+        rebuildProfileMenuItems();
+        for (size_t i = 0; i < profileMenuItems_.size(); ++i) {
+            CommandEntry pe;
+            pe.id = "profile:" + profileMenuItems_[i].path;
+            pe.title = "Switch Profile: " + profileMenuItems_[i].displayName;
+            pe.keywords = profileMenuItems_[i].appPackage + " profile switch config";
+            pe.hotkey = profileMenuItems_[i].active ? "Active" : "";
+            pe.category = "Profile";
+            all.push_back(pe);
+        }
+        cmdPalette_.setCommands(all);
+        popupFiltered_ = cmdPalette_.filter("");
+
+        int pw = metrics_.dp(540);
+        if (pw > cw - metrics_.dp(32)) pw = cw - metrics_.dp(32);
+        int ph = metrics_.dp(390);
+        if (ph > ch - metrics_.dp(80)) ph = ch - metrics_.dp(80);
+        int x = (cw - pw) / 2;
+        int y = (fullscreen_ ? 0 : topBarRc_.bottom) + metrics_.dp(22);
+        localRc = { x, y, x + pw, y + ph };
+    } else if (mode == POPUP_CHEAT_SHEET) {
+        cheatSheetData_ = CheatSheetModel::build(profile_);
+        int pw = metrics_.dp(720);
+        if (pw > cw - metrics_.dp(28)) pw = cw - metrics_.dp(28);
+        int ph = metrics_.dp(450);
+        if (ph > ch - metrics_.dp(64)) ph = ch - metrics_.dp(64);
+        int x = (cw - pw) / 2;
+        int y = (ch - ph) / 2;
+        localRc = { x, y, x + pw, y + ph };
+    } else if (mode == POPUP_PROFILE_DROPDOWN) {
+        rebuildProfileMenuItems();
+        popupFiltered_ = ProfileDropdownModel::filter(profileMenuItems_, "");
+        int rows = static_cast<int>(popupFiltered_.size());
+        if (rows < 1) rows = 1;
+        if (rows > 7) rows = 7;
+        int pw = metrics_.dp(320);
+        int ph = metrics_.dp(90) + rows * metrics_.dp(40);
+        if (ph > ch - metrics_.dp(70)) ph = ch - metrics_.dp(70);
+        RECT profRc = topBar_.profilePillRect();
+        int x = (profRc.right > profRc.left) ? profRc.left : metrics_.dp(280);
+        int y = topBarRc_.bottom + metrics_.dp(4);
+        localRc = { x, y, x + pw, y + ph };
+    }
+
+    POINT tl = { localRc.left, localRc.top };
+    ClientToScreen(hwnd_, &tl);
+    RECT scrRc = { tl.x, tl.y, tl.x + (localRc.right - localRc.left), tl.y + (localRc.bottom - localRc.top) };
+    modalPopup_.showBounds(scrRc);
+    syncInputHookSnapshot();
+}
+
+void ShellWindow::closePopup() {
+    if (activePopup_ == POPUP_NONE && !modalPopup_.isVisible()) return;
+    activePopup_ = POPUP_NONE;
+    popupQuery_.clear();
+    popupFiltered_.clear();
+    popupRowRects_.clear();
+    modalPopup_.hide();
+    syncInputHookSnapshot();
+}
+
+void ShellWindow::executeCommandById(const std::string& cmdId) {
+    closePopup();
+    if (cmdId.compare(0, 8, "profile:") == 0) {
+        std::string target = cmdId.substr(8);
+        DrawerActionResult res;
+        res.requestSwitchProfile = true;
+        res.switchProfilePath = target;
+        handleDrawerResult(res);
+        return;
+    }
+    if (cmdId == "aim.toggle")      { setAimMode(!aimMode_); return; }
+    if (cmdId == "drawer.keys")     { setDrawerState(true, 0); return; }
+    if (cmdId == "drawer.sens")     { setDrawerState(true, 1); return; }
+    if (cmdId == "drawer.profiles") { setDrawerState(true, 2); return; }
+    if (cmdId == "drawer.device")   { setDrawerState(true, 3); return; }
+    if (cmdId == "fire.cycle")      { toggleFireMode(); return; }
+    if (cmdId == "hud.toggle")      { toggleHud(); return; }
+    if (cmdId == "touch.reset")     { triggerQuickReset(); return; }
+    if (cmdId == "win.fullscreen")  { toggleFullscreen(); return; }
+    if (cmdId == "win.pin")         { toggleAlwaysOnTop(); return; }
+    if (cmdId == "cheatsheet.open") { openPopup(POPUP_CHEAT_SHEET); return; }
+    if (cmdId == "preset.comp" || cmdId == "preset.bal" || cmdId == "preset.qual" || cmdId == "preset.wifi") {
+        StreamPresetId pid = (cmdId == "preset.comp") ? PRESET_COMPETITIVE
+                           : (cmdId == "preset.bal")  ? PRESET_BALANCED
+                           : (cmdId == "preset.qual") ? PRESET_QUALITY : PRESET_WIFI;
+        settings_.applyStreamPreset(pid);
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(std::string("Preset: ") + AppSettings::streamPresetName(pid) + " (Apply & Reconnect to use)", 2400, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "setting.audio") {
+        settings_.mirrorAudio = !settings_.mirrorAudio;
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(settings_.mirrorAudio ? "Phone Audio Forwarding: ON" : "Phone Audio Forwarding: OFF", 1800, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "setting.screenoff") {
+        settings_.turnScreenOff = !settings_.turnScreenOff;
+        scheduleSettingsSave();
+        lastAppliedScreenOff_ = settings_.turnScreenOff;
+        if (bridge_->isConnected() && !bridge_->isVirtualDisplayActive()) {
+            bridge_->setDisplayPower(!settings_.turnScreenOff);
+        }
+        invalidateShell();
+        showToast(settings_.turnScreenOff ? "Phone Screen: OFF" : "Phone Screen: ON", 1600, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "setting.autoswitch") {
+        settings_.autoSwitchProfiles = !settings_.autoSwitchProfiles;
+        InterlockedExchange(&autoSwitchAtomic_, settings_.autoSwitchProfiles ? 1 : 0);
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(settings_.autoSwitchProfiles ? "Per-App Auto-Switch: ON" : "Per-App Auto-Switch: OFF", 1600, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "setting.gamepad") {
+        settings_.gamepadEnabled = !settings_.gamepadEnabled;
+        engine_->setGamepadEnabled(settings_.gamepadEnabled);
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(settings_.gamepadEnabled ? "XInput Gamepad: ON" : "XInput Gamepad: OFF", 1600, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "diag.debug") {
+        debugOverlayVisible_ = !debugOverlayVisible_;
+        lastTopBarSig_.valid = false;
+        invalidateShell();
+        showToast(debugOverlayVisible_ ? "Debug Overlay: ON" : "Debug Overlay: OFF", 1200, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "diag.probe") {
+        startRoundTripProbe(autoProbeSamples_);
+        return;
+    }
+    if (cmdId == "app.screenshot") { takeScreenshot(); return; }
+    if (cmdId == "app.reconnect") {
+        scheduleSettingsSave();
+        if (bridge_->isConnected()) startAsyncConnect(bridge_->activeSerial());
+        return;
+    }
+    if (cmdId == "app.onboarding") {
+        if (drawerOpen_) setDrawerState(false, drawerPanel_.activeTab());
+        showOnboarding_ = true;
+        onboardingView_.setStep(toolsReady_ ? OB_STEP_PREPARE : OB_STEP_TOOLS);
+        syncHudAndVideo();
+        invalidateShell();
+    }
+}
+
+void ShellWindow::handlePopupKeyDown(int vk) {
+    if (vk == VK_ESCAPE) {
+        closePopup();
+        return;
+    }
+    if (activePopup_ == POPUP_CHEAT_SHEET) {
+        return;
+    }
+    int count = static_cast<int>(popupFiltered_.size());
+    if (vk == VK_DOWN && count > 0) {
+        popupSelectedRow_ = (popupSelectedRow_ + 1) % count;
+        modalPopup_.repaint();
+        return;
+    }
+    if (vk == VK_UP && count > 0) {
+        popupSelectedRow_ = (popupSelectedRow_ + count - 1) % count;
+        modalPopup_.repaint();
+        return;
+    }
+    if (vk == VK_BACK && !popupQuery_.empty()) {
+        popupQuery_.pop_back();
+        if (activePopup_ == POPUP_CMD_PALETTE) {
+            popupFiltered_ = cmdPalette_.filter(popupQuery_);
+        } else if (activePopup_ == POPUP_PROFILE_DROPDOWN) {
+            popupFiltered_ = ProfileDropdownModel::filter(profileMenuItems_, popupQuery_);
+        }
+        popupSelectedRow_ = 0;
+        modalPopup_.repaint();
+        return;
+    }
+    if (vk == VK_RETURN && popupSelectedRow_ >= 0 && popupSelectedRow_ < count) {
+        int rawIdx = popupFiltered_[popupSelectedRow_];
+        if (activePopup_ == POPUP_CMD_PALETTE) {
+            executeCommandById(cmdPalette_.commands()[rawIdx].id);
+        } else if (activePopup_ == POPUP_PROFILE_DROPDOWN) {
+            std::string target = profileMenuItems_[rawIdx].path;
+            closePopup();
+            DrawerActionResult res;
+            res.requestSwitchProfile = true;
+            res.switchProfilePath = target;
+            handleDrawerResult(res);
+        }
+    }
+}
+
+void ShellWindow::handlePopupChar(wchar_t ch) {
+    if (activePopup_ != POPUP_CMD_PALETTE && activePopup_ != POPUP_PROFILE_DROPDOWN) return;
+    if (ch < 32 || ch > 126) return;
+    if (popupQuery_.size() >= 32) return;
+    popupQuery_.push_back(static_cast<char>(ch));
+    if (activePopup_ == POPUP_CMD_PALETTE) {
+        popupFiltered_ = cmdPalette_.filter(popupQuery_);
+    } else {
+        popupFiltered_ = ProfileDropdownModel::filter(profileMenuItems_, popupQuery_);
+    }
+    popupSelectedRow_ = 0;
+    modalPopup_.repaint();
+}
+
+void ShellWindow::onPopupPaint(Gdiplus::Graphics& g, int w, int h) {
+    if (activePopup_ == POPUP_CMD_PALETTE) {
+        cmdPalette_.paint(g, w, h, popupQuery_, popupFiltered_, popupSelectedRow_, popupHoverRow_, popupRowRects_);
+    } else if (activePopup_ == POPUP_CHEAT_SHEET) {
+        CheatSheetModel::paint(g, w, h, cheatSheetData_);
+    } else if (activePopup_ == POPUP_PROFILE_DROPDOWN) {
+        ProfileDropdownModel::paint(g, w, h, popupQuery_, profileMenuItems_, popupFiltered_,
+                                    popupSelectedRow_, popupHoverRow_, popupRowRects_, popupManageProfilesRc_);
+    }
+}
+
+void ShellWindow::onPopupHover(int x, int y) {
+    int newHov = -1;
+    for (size_t i = 0; i < popupRowRects_.size(); ++i) {
+        if (ptIn(popupRowRects_[i], x, y)) {
+            newHov = static_cast<int>(i);
+            break;
+        }
+    }
+    if (newHov != popupHoverRow_) {
+        popupHoverRow_ = newHov;
+        modalPopup_.repaint();
+    }
+}
+
+void ShellWindow::onPopupClick(int x, int y) {
+    if (activePopup_ == POPUP_CHEAT_SHEET) {
+        closePopup();
+        return;
+    }
+    if (activePopup_ == POPUP_PROFILE_DROPDOWN && ptIn(popupManageProfilesRc_, x, y)) {
+        closePopup();
+        setDrawerState(true, 2);
+        return;
+    }
+    for (size_t i = 0; i < popupRowRects_.size(); ++i) {
+        if (ptIn(popupRowRects_[i], x, y) && i < popupFiltered_.size()) {
+            int rawIdx = popupFiltered_[i];
+            if (activePopup_ == POPUP_CMD_PALETTE) {
+                executeCommandById(cmdPalette_.commands()[rawIdx].id);
+            } else if (activePopup_ == POPUP_PROFILE_DROPDOWN) {
+                std::string target = profileMenuItems_[rawIdx].path;
+                closePopup();
+                DrawerActionResult res;
+                res.requestSwitchProfile = true;
+                res.switchProfilePath = target;
+                handleDrawerResult(res);
+            }
+            return;
+        }
+    }
+}
+
+void ShellWindow::onPopupWheel(int delta) {
+    int count = static_cast<int>(popupFiltered_.size());
+    if (count <= 0) return;
+    popupSelectedRow_ = (delta < 0)
+        ? ((popupSelectedRow_ + 1) % count)
+        : ((popupSelectedRow_ + count - 1) % count);
+    modalPopup_.repaint();
 }

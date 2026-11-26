@@ -26,6 +26,7 @@ struct EngineTelemetry {
     uint32_t screenW = 1920;
     uint32_t screenH = 1080;
     uint32_t touchRateHz = 0;
+    uint64_t activeButtonMask = 0; // U4: bit i lit for 120ms when button i activates
 };
 
 // High-precision multi-touch orchestrator:
@@ -204,4 +205,5 @@ private:
     uint32_t packetsThisSec_ = 0;
     uint32_t lastPacketsPerSec_ = 0;
     double lastStatMs_ = 0.0;
+    DWORD buttonGlowUntilTick_[64];
 };

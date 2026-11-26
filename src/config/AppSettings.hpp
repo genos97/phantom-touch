@@ -51,6 +51,8 @@ struct AppSettings {
     static const char* streamPresetName(StreamPresetId id);
     std::string encoderForDevice(const std::string& serial) const;
     void setEncoderForDevice(const std::string& serial, const std::string& encoderName);
+    static int countPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
+                                         const std::string& serial);
     static bool hasPendingStreamChanges(const AppSettings& live, const AppSettings& applied,
                                         const std::string& serial);
 };

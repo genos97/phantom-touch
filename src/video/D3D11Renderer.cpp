@@ -1232,8 +1232,8 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
     }
 
-    // 5b. Pass 3 (S5): Zero-upload dynamic GPU markers (crosshair, joystick thumb dot, aim dot)
-    if (drawHudOverlay && dm.active && psMarker_ && videoRectInHost.w > 8 && videoRectInHost.h > 8) {
+    // 5b. Pass 3 (S5): Zero-upload dynamic GPU markers (crosshair, joystick thumb dot, aim dot, mode flash)
+    if (drawHudOverlay && (dm.active || dm.modePulseAlpha > 0.01f) && psMarker_ && videoRectInHost.w > 8 && videoRectInHost.h > 8) {
         const float blendFactor[4] = { 0, 0, 0, 0 };
         ctx_->OMSetBlendState(blendPremul_, blendFactor, 0xFFFFFFFFu);
         ctx_->PSSetShader(psMarker_, NULL, 0);
@@ -1250,19 +1250,34 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
             ctx_->Draw(4, 0);
         };
 
-        float op = (dm.opacity < 0.15f) ? 0.15f : (dm.opacity > 1.0f ? 1.0f : dm.opacity);
-        if (dm.showCrosshair) {
-            drawMarkerDot(0.5f, 0.5f, 3.0f, 0.17f, 0.90f, 0.61f, 0.88f);
-        }
-        if (dm.joyDown) {
-            drawMarkerDot(dm.joyX, dm.joyY, 6.5f, 0.17f, 0.90f, 0.61f, 0.82f * op);
-        }
-        if (dm.aimFingerDown) {
-            if (dm.fireHeld) {
-                drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 1.00f, 0.36f, 0.42f, 0.78f * op);
-            } else {
-                drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 0.00f, 0.83f, 1.00f, 0.78f * op);
+        if (dm.active) {
+            float op = (dm.opacity < 0.15f) ? 0.15f : (dm.opacity > 1.0f ? 1.0f : dm.opacity);
+            if (dm.showCrosshair) {
+                drawMarkerDot(0.5f, 0.5f, 3.0f, 0.17f, 0.90f, 0.61f, 0.88f);
             }
+            if (dm.joyDown) {
+                drawMarkerDot(dm.joyX, dm.joyY, 6.5f, 0.17f, 0.90f, 0.61f, 0.82f * op);
+            }
+            if (dm.aimFingerDown) {
+                if (dm.fireHeld) {
+                    drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 1.00f, 0.36f, 0.42f, 0.78f * op);
+                } else {
+                    drawMarkerDot(dm.aimX, dm.aimY, 4.5f, 0.00f, 0.83f, 1.00f, 0.78f * op);
+                }
+            }
+        }
+        if (dm.modePulseAlpha > 0.01f) {
+            float py0 = 1.0f - (static_cast<float>(videoRectInHost.y) / static_cast<float>(backbufH_)) * 2.0f;
+            float py1 = 1.0f - (static_cast<float>(videoRectInHost.y + 4) / static_cast<float>(backbufH_)) * 2.0f;
+            float px0 = (static_cast<float>(videoRectInHost.x) / static_cast<float>(backbufW_)) * 2.0f - 1.0f;
+            float px1 = (static_cast<float>(videoRectInHost.x + videoRectInHost.w) / static_cast<float>(backbufW_)) * 2.0f - 1.0f;
+            float a = (dm.modePulseAlpha > 1.0f) ? 1.0f : dm.modePulseAlpha;
+            if (dm.modePulseAim) {
+                updateConstantBufferLocked(px0, py1, px1, py0, 0.5f, 0.5f, 0.5f, 0.5f, 0.17f, 0.90f, 0.61f, a * 0.85f);
+            } else {
+                updateConstantBufferLocked(px0, py1, px1, py0, 0.5f, 0.5f, 0.5f, 0.5f, 1.00f, 0.72f, 0.30f, a * 0.85f);
+            }
+            ctx_->Draw(4, 0);
         }
     }
 

@@ -37,7 +37,15 @@ enum UiIcon {
     ICON_USB,
     ICON_WIFI,
     ICON_PLAY,
-    ICON_REFRESH
+    ICON_REFRESH,
+    ICON_GAMEPAD,
+    ICON_CAST,
+    ICON_RECORD,
+    ICON_FOLDER,
+    ICON_LANGUAGE,
+    ICON_SHIELD,
+    ICON_QR,
+    ICON_APPS
 };
 
 // Pure geometry struct for aspect-ratio viewport layout (unit-testable without HWND)

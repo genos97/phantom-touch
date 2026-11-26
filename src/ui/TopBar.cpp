@@ -18,7 +18,8 @@ int dp(int px) {
 void TopBar::layout(const RECT& bounds,
                     const std::string& deviceLabel, bool connected, bool demoMode,
                     const Profile& profile, const EngineTelemetry& tel,
-                    const TelemetrySummary& videoTel) {
+                    const TelemetrySummary& videoTel,
+                    TopBarConnState connState) {
     buttons_.clear();
     bounds_ = bounds;
     showLatPill_ = false;
@@ -31,10 +32,20 @@ void TopBar::layout(const RECT& bounds,
     const int x1 = bounds.right;
     const int y1 = bounds.bottom;
 
+    TopBarConnState st = connState;
+    if (st == TB_CONN_IDLE) {
+        if (connected) st = TB_CONN_CONNECTED;
+        else if (demoMode) st = TB_CONN_DEMO;
+    }
+
     // Device Status Pill
     int curX = x0 + dp(174);
-    dotCol_ = connected ? Theme::ACCENT_GREEN : (demoMode ? Theme::ACCENT_CYAN : Theme::ACCENT_AMBER);
-    devTxt_ = connected ? deviceLabel : (demoMode ? "Offline Studio" : "No Device");
+    if (st == TB_CONN_CONNECTED)         dotCol_ = Theme::ACCENT_GREEN;
+    else if (st == TB_CONN_RECONNECTING) dotCol_ = Theme::ACCENT_AMBER;
+    else if (st == TB_CONN_LOST)         dotCol_ = Theme::ACCENT_RED;
+    else if (st == TB_CONN_DEMO)         dotCol_ = Theme::ACCENT_CYAN;
+    else                                 dotCol_ = Theme::TEXT_MUTED;
+    devTxt_ = connected ? deviceLabel : (demoMode ? "Offline Studio" : (st == TB_CONN_RECONNECTING ? "Reconnecting..." : (st == TB_CONN_LOST ? "Lost Link" : "No Device")));
     if (devTxt_.size() > 26) devTxt_ = devTxt_.substr(0, 25) + "...";
     int devW = dp(26 + static_cast<int>(devTxt_.size()) * 7);
     if (devW < dp(110)) devW = dp(110);
@@ -42,13 +53,13 @@ void TopBar::layout(const RECT& bounds,
     rDev_ = { curX, y0 + dp(7), curX + devW, y1 - dp(7) };
     curX = rDev_.right + dp(8);
 
-    // Clickable Active Profile Pill
+    // Clickable Active Profile Pill (opens searchable dropdown)
     std::string profName = profile.name.empty() ? "Profile" : profile.name;
-    if (profName.size() > 22) profName = profName.substr(0, 21) + "...";
-    profTxt_ = "CFG: " + profName;
-    int profW = dp(34 + static_cast<int>(profName.size()) * 7);
-    if (profW < dp(112)) profW = dp(112);
-    if (profW > dp(205)) profW = dp(205);
+    if (profName.size() > 20) profName = profName.substr(0, 19) + "...";
+    profTxt_ = "CFG: " + profName + " v";
+    int profW = dp(40 + static_cast<int>(profName.size()) * 7);
+    if (profW < dp(118)) profW = dp(118);
+    if (profW > dp(215)) profW = dp(215);
     rProf_ = { curX, y0 + dp(7), curX + profW, y1 - dp(7) };
     buttons_.push_back(Btn{ rProf_, TB_OPEN_PROFILES });
     curX = rProf_.right + dp(8);
@@ -67,17 +78,15 @@ void TopBar::layout(const RECT& bounds,
     buttons_.push_back(Btn{ maxBtnRc_, TB_MAXIMIZE });
     buttons_.push_back(Btn{ rClose_, TB_CLOSE });
 
-    // Live Telemetry Pill + Video Pipeline Latency Pill (0.1)
+    // Live Telemetry Pill + Video Pipeline Latency Pill (0.1 + U4)
     int availRight = rHelp_.left - dp(12);
     if (connected && videoTel.presentedCount > 0 && (availRight - curX) >= dp(400)) {
         char latBuf[80];
-        std::snprintf(latBuf, sizeof(latBuf), "p50 %.1f / p95 %.1fms | %llu/%llu/%llu",
-                      videoTel.rxToPresentP50Ms, videoTel.rxToPresentP95Ms,
-                      static_cast<unsigned long long>(videoTel.decodedCount),
-                      static_cast<unsigned long long>(videoTel.presentedCount),
-                      static_cast<unsigned long long>(videoTel.skippedCount));
+        std::snprintf(latBuf, sizeof(latBuf), "%.0ffps · p50 %.1f/%.1fms",
+                      videoTel.measuredFps,
+                      videoTel.rxToPresentP50Ms, videoTel.rxToPresentP95Ms);
         latTxt_ = latBuf;
-        rLat_ = { curX, y0 + dp(7), curX + dp(196), y1 - dp(7) };
+        rLat_ = { curX, y0 + dp(7), curX + dp(184), y1 - dp(7) };
         showLatPill_ = true;
         curX = rLat_.right + dp(8);
     }
@@ -88,21 +97,21 @@ void TopBar::layout(const RECT& bounds,
         telFg_ = Theme::ACCENT_AMBER;
 
         if (!profile.keymapEnabled) {
-            std::snprintf(telBuf, sizeof(telBuf), "TYPING MODE  |  F1: Game");
+            std::snprintf(telBuf, sizeof(telBuf), "TYPING  |  F1: Game");
             telBg_ = Theme::ACCENT_CYAN_BG;
             telBd_ = Theme::ACCENT_CYAN;
             telFg_ = Theme::ACCENT_CYAN;
         } else {
             const char* modeTxt = tel.holdViewActive ? "FREELOOK"
-                                : (tel.aimMode && tel.scopeActive) ? "AIM + ADS"
-                                : tel.aimMode ? "AIM LOCKED" : "CURSOR MODE";
+                                : (tel.aimMode && tel.scopeActive) ? "AIM+ADS (~)"
+                                : tel.aimMode ? "AIM (~ / F1)" : "CURSOR (F1)";
             const char* fireTxt = (profile.fireMode == FIRE_MODE_DRAG_RIGHT) ? "DRAG-FIRE"
                                 : (profile.fireMode == FIRE_MODE_CLAW_LEFT)  ? "CLAW-LEFT"
                                                                              : "DUAL-DRAG";
             if (tel.gamepadConnected) {
                 std::snprintf(telBuf, sizeof(telBuf), "%s | PAD | %u/s", modeTxt, tel.touchRateHz);
             } else {
-                std::snprintf(telBuf, sizeof(telBuf), "%s  |  %s  |  %u/s", modeTxt, fireTxt, tel.touchRateHz);
+                std::snprintf(telBuf, sizeof(telBuf), "%s | %s | %u/s", modeTxt, fireTxt, tel.touchRateHz);
             }
             if (tel.aimMode) {
                 telBg_ = Theme::ACCENT_GREEN_BG;
@@ -111,7 +120,7 @@ void TopBar::layout(const RECT& bounds,
             }
         }
         telTxt_ = telBuf;
-        int pillW = dp(216);
+        int pillW = dp(224);
         if (availRight - curX < pillW) pillW = availRight - curX;
         rTel_ = { availRight - pillW, y0 + dp(7), availRight, y1 - dp(7) };
         showTelPill_ = true;
@@ -123,8 +132,9 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
                    const std::string& deviceLabel, bool connected, bool demoMode,
                    const Profile& profile, const EngineTelemetry& tel,
                    bool alwaysOnTop, bool maximized, int hoverX, int hoverY,
-                   const TelemetrySummary& videoTel) {
-    layout(bounds, deviceLabel, connected, demoMode, profile, tel, videoTel);
+                   const TelemetrySummary& videoTel,
+                   TopBarConnState connState) {
+    layout(bounds, deviceLabel, connected, demoMode, profile, tel, videoTel, connState);
 
     const int x0 = bounds.left;
     const int x1 = bounds.right;
@@ -209,4 +219,21 @@ bool TopBar::hoverItemAt(int x, int y, int& outId, RECT& outRc) const {
         }
     }
     return false;
+}
+
+std::string TopBar::tooltipAt(int x, int y) const {
+    if (showLatPill_ && ptIn(rLat_, x, y)) {
+        return "Live video FPS and rx->present latency (Ctrl+Shift+D)";
+    }
+    TopBarAction a = hitTest(x, y);
+    switch (a) {
+        case TB_OPEN_PROFILES: return "Switch or search profiles (Ctrl+K)";
+        case TB_TOGGLE_AIM:    return "Toggle Aim Lock <-> Cursor Mode (F1)";
+        case TB_OPEN_HELP:     return "Setup guide & Cheat Sheet (Ctrl+/)";
+        case TB_TOGGLE_PIN:    return "Pin window Always on Top";
+        case TB_MINIMIZE:      return "Minimize";
+        case TB_MAXIMIZE:      return "Maximize / Restore (Win11 Snap)";
+        case TB_CLOSE:         return "Close Phantom Touch (Alt+F4)";
+        default:               return "";
+    }
 }

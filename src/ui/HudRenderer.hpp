@@ -15,15 +15,26 @@ struct HudEditExtras {
     bool marqueeActive;
     RECT marqueeRc;
     bool skipDynamicDots;
+    float modePulseAlpha;
+    bool modePulseAim;
 
     HudEditExtras()
         : multiSelected(nullptr),
           alignGuides(nullptr),
           conflicts(nullptr),
           marqueeActive(false),
-          skipDynamicDots(false) {
+          skipDynamicDots(false),
+          modePulseAlpha(0.0f),
+          modePulseAim(false) {
         ZeroMemory(&marqueeRc, sizeof(marqueeRc));
     }
+};
+
+enum HudToastKind {
+    TOAST_INFO    = 0,
+    TOAST_SUCCESS = 1,
+    TOAST_WARNING = 2,
+    TOAST_ERROR   = 3
 };
 
 // Clean, minimalist emulator-style GDI+ HUD renderer (BlueStacks 5 / MuMu style).
@@ -59,5 +70,5 @@ public:
     static void paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg);
     static void paintToastWithAction(Gdiplus::Graphics& g, int w, int h,
                                      const std::string& msg, const std::string& actionLabel,
-                                     RECT* outActionRc = nullptr);
+                                     RECT* outActionRc = nullptr, int toastKind = TOAST_INFO);
 };

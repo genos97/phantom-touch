@@ -14,11 +14,13 @@
 #include "engine/InputHookThread.hpp"
 #include "engine/JoystickController.hpp"
 #include "engine/ThreadScheduling.hpp"
+#include "ui/Animator.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
 #include "ui/HudRenderer.hpp"
 #include "ui/OnboardingView.hpp"
+#include "ui/OverlayPopups.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
@@ -1651,6 +1653,175 @@ static void testSprint3aProfileLibraryEditorAndDynamicHud() {
     std::printf("[Test] Sprint 3A (F4/X4/X9/S5) OK!\n");
 }
 
+static void testSprint3bPolishCommandPaletteMotionAndA11y() {
+    std::printf("[Test] Sprint 3B (U5/U6/X5/X6/X7/X8/U4/U7)...\n");
+
+    // 1. U6: Animator easing, dirty-rect tracking, completion, and Reduce Motion override
+    Animator::setReduceMotionOverrideForTest(0);
+    Animator anim;
+    RECT animRc = { 10, 20, 310, 620 };
+    anim.start(ANIM_DRAWER_SLIDE, 300.0f, 0.0f, ANIM_BASE_MS, EASE_OUT_CUBIC, &animRc, 1000.0);
+    assert(anim.isActive(ANIM_DRAWER_SLIDE));
+    assert(anim.hasActive());
+    std::vector<RECT> dirty;
+    assert(anim.tick(1090.0, dirty));
+    assert(dirty.size() == 1);
+    float mid = anim.value(ANIM_DRAWER_SLIDE, -1.0f);
+    assert(mid > 0.0f && mid < 150.0f); // ease-out cubic reaches >50% progress by t=0.5
+    dirty.clear();
+    assert(anim.tick(1250.0, dirty));
+    assert(!anim.isActive(ANIM_DRAWER_SLIDE));
+    assert(!anim.hasActive());
+    assert(std::fabs(anim.value(ANIM_DRAWER_SLIDE, -1.0f)) < 0.01f);
+
+    Animator::setReduceMotionOverrideForTest(1); // Reduce Motion snaps immediately
+    anim.start(ANIM_HOVER_FADE, 0.0f, 1.0f, ANIM_FAST_MS, EASE_LINEAR, &animRc, 2000.0);
+    assert(!anim.isActive(ANIM_HOVER_FADE));
+    assert(std::fabs(anim.value(ANIM_HOVER_FADE, 0.0f) - 1.0f) < 0.01f);
+    Animator::setReduceMotionOverrideForTest(-1);
+
+    // 2. X5: CommandPaletteModel fuzzy matching + paint rows
+    CommandPaletteModel pal;
+    std::vector<CommandEntry> cmds;
+    {
+        CommandEntry e1; e1.id = "mode.aim"; e1.title = "Toggle Keymap Mode"; e1.keywords = "aim typing f12"; e1.hotkey = "F12"; e1.category = "MODE";
+        CommandEntry e2; e2.id = "app.screenshot"; e2.title = "Take Screenshot"; e2.keywords = "capture snap"; e2.hotkey = ""; e2.category = "VIEW";
+        CommandEntry e3; e3.id = "tab.device"; e3.title = "Open Device Settings"; e3.keywords = "adb usb wifi"; e3.hotkey = ""; e3.category = "DEVICE";
+        cmds.push_back(e1); cmds.push_back(e2); cmds.push_back(e3);
+    }
+    pal.setCommands(cmds);
+    assert(CommandPaletteModel::fuzzyScore("Take Screenshot", "shot") > 0);
+    std::vector<int> fAll = pal.filter("");
+    assert(fAll.size() == 3);
+    std::vector<int> fShot = pal.filter("shot");
+    assert(fShot.size() == 1 && cmds[fShot[0]].id == "app.screenshot");
+
+    // 3. X6: CheatSheetModel dynamic build from current profile
+    Profile prof;
+    prof.name = "Free Fire Test";
+    prof.keymapEnabled = true;
+    KeyNode rNode;
+    rNode.vk = 'R';
+    rNode.label = "Reload";
+    rNode.x = 0.75f;
+    rNode.y = 0.80f;
+    prof.buttons.push_back(rNode);
+    CheatSheetData sheet = CheatSheetModel::build(prof);
+    assert(sheet.profileName == "Free Fire Test");
+    assert(sheet.keymapEnabled == true);
+    assert(!sheet.profileBindings.empty());
+    assert(!sheet.globalHotkeys.empty());
+
+    // 4. X7: ProfileDropdownModel filter + X8: countPendingStreamChanges
+    std::vector<ProfileMenuItem> menuItems(2);
+    menuItems[0].path = "p1.json"; menuItems[0].displayName = "Free Fire"; menuItems[0].appPackage = "com.dts.freefireth"; menuItems[0].active = true;
+    menuItems[1].path = "p2.json"; menuItems[1].displayName = "BGMI"; menuItems[1].appPackage = "com.pubg.imobile"; menuItems[1].recent = true;
+    std::vector<int> pf = ProfileDropdownModel::filter(menuItems, "bgmi");
+    assert(pf.size() == 1 && pf[0] == 1);
+
+    AppSettings sLive;
+    AppSettings sApplied = sLive;
+    assert(AppSettings::countPendingStreamChanges(sLive, sApplied, "SER1") == 0);
+    sLive.mirrorFps = 120;
+    sLive.mirrorBitrateMbps = 24;
+    sLive.virtualDisplayMode = true;
+    assert(AppSettings::countPendingStreamChanges(sLive, sApplied, "SER1") == 3);
+
+    // 5. U5/U4/U7/X5/X6/X7 Paint + Focus + Telemetry glow smoke on offscreen GDI+ DC
+    HDC scDC = GetDC(NULL);
+    HDC mDC = CreateCompatibleDC(scDC);
+    HBITMAP bmp = CreateCompatibleBitmap(scDC, 1100, 760);
+    HGDIOBJ old = SelectObject(mDC, bmp);
+    {
+        Gdiplus::Graphics g(mDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+        UiIcon newIcons[] = {
+            ICON_GAMEPAD, ICON_CAST, ICON_RECORD, ICON_FOLDER,
+            ICON_LANGUAGE, ICON_SHIELD, ICON_QR, ICON_APPS
+        };
+        for (int i = 0; i < 8; ++i) {
+            GdiPlusDraw::drawIcon(g, newIcons[i], 30.0f + i * 24.0f, 30.0f, 16.0f, Theme::ACCENT_CYAN);
+        }
+
+        std::vector<RECT> palRows;
+        pal.paint(g, 560, 400, "shot", fShot, 0, -1, palRows);
+        assert(palRows.size() == 1 && palRows[0].bottom > palRows[0].top);
+        CheatSheetModel::paint(g, 680, 480, sheet);
+        std::vector<RECT> profRows;
+        RECT manageRc = { 0, 0, 0, 0 };
+        ProfileDropdownModel::paint(g, 320, 320, "", menuItems, pf, 0, -1, profRows, manageRc);
+        assert(profRows.size() == 1 && manageRc.bottom > manageRc.top);
+
+        TopBar topBar;
+        EngineTelemetry tel;
+        tel.activeButtonMask = 1ULL;
+        TelemetrySummary vTel;
+        vTel.measuredFps = 92.0;
+        RECT tbRc = { 0, 0, 1080, 46 };
+        topBar.paint(g, tbRc, "SM-G990E", true, false, prof, tel, false, false, 10, 10, vTel, TB_CONN_CONNECTED);
+        RECT pr = topBar.profilePillRect();
+        assert(pr.right > pr.left);
+        assert(!topBar.tooltipAt((pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2).empty());
+
+        SideRail rail;
+        SideRailState srs;
+        srs.connected = true;
+        RECT srRc = { 1016, 46, 1080, 740 };
+        rail.paint(g, srRc, srs, 1048, 80);
+        RECT srItem = { 0, 0, 0, 0 };
+        int hitY = -1;
+        for (int y = srRc.top; y < srRc.bottom; y += 4) {
+            if (rail.itemRectAt(1048, y, srItem)) {
+                hitY = y;
+                break;
+            }
+        }
+        assert(hitY >= 0);
+        assert(!rail.tooltipAt(1048, hitY).empty());
+
+        HudRenderer::paintKeymapNodes(g, 590, 700, prof, tel, false, false, -1, -1, false, false, 0.85f);
+        RECT toastAct = { 0, 0, 0, 0 };
+        HudRenderer::paintToastWithAction(g, 590, 700, "Action failed", "Retry", &toastAct, TOAST_ERROR);
+        assert(toastAct.right > toastAct.left);
+
+        DrawerPanel dp;
+        dp.setActiveTab(3);
+        dp.setPendingStreamChangeCount(3);
+        RECT dRc = { 680, 46, 1016, 740 };
+        dp.paint(g, dRc, prof, sLive, "p1.json", -1, false, true, "SM-G990E", "com.dts.freefireth",
+                 std::vector<std::string>(), 0, 0, 0);
+        assert(!dp.hasKeyboardFocus());
+        DrawerActionResult kRes;
+        assert(dp.onKeyDown(VK_TAB, prof, sLive, -1, kRes));
+        assert(dp.hasKeyboardFocus());
+        assert(dp.onKeyDown(VK_ESCAPE, prof, sLive, -1, kRes));
+        assert(!dp.hasKeyboardFocus());
+
+        RECT advRc = { 0, 0, 0, 0 };
+        for (int step = 0; step < 40 && !dp.rectForAction(DA_TOGGLE_DEV_ADVANCED, -1, advRc); ++step) {
+            dp.onMouseWheel(800, 400, -360);
+            dp.paint(g, dRc, prof, sLive, "p1.json", -1, false, true, "SM-G990E", "com.dts.freefireth",
+                     std::vector<std::string>(), 0, 0, 0);
+        }
+        assert(dp.rectForAction(DA_TOGGLE_DEV_ADVANCED, -1, advRc));
+    }
+    SelectObject(mDC, old);
+    DeleteObject(bmp);
+    DeleteDC(mDC);
+    ReleaseDC(NULL, scDC);
+
+    // 6. U6: D3D11Renderer mode pulse alpha pre-init call
+    D3D11Renderer renderer;
+    DynamicHudMarkers dm;
+    dm.active = true;
+    dm.modePulseAlpha = 0.75f;
+    dm.modePulseAim = true;
+    renderer.setDynamicHudMarkers(dm);
+
+    std::printf("[Test] Sprint 3B (U5/U6/X5/X6/X7/X8/U4/U7) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1669,6 +1840,7 @@ int main() {
     testSprint2aUiFoundation();
     testSprint2bConnectionOnboardingAndSettings();
     testSprint3aProfileLibraryEditorAndDynamicHud();
-    std::printf("ALL SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    testSprint3bPolishCommandPaletteMotionAndA11y();
+    std::printf("ALL SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

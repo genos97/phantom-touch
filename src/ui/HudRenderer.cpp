@@ -281,19 +281,24 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
         computeNodePillSize(keyTxt, editMode, pw, ph);
         float rad = ph * 0.5f;
 
-        // Soft outer selection halo (Edit Mode selected node)
+        // Soft outer selection halo (Edit Mode) or 120ms pressed glow (Play Mode, U4)
+        bool pressedGlow = (!editMode && i < 64 && ((tel.activeButtonMask & (1ULL << i)) != 0));
         if (selected) {
             GdiPlusDraw::strokeRoundedRect(g, bx - pw * 0.5f - 3.0f, by - ph * 0.5f - 3.0f,
                                            pw + 6.0f, ph + 6.0f, rad + 3.0f,
                                            withAlpha(0x00D4FFu, 0.40f), 2.5f);
+        } else if (pressedGlow) {
+            GdiPlusDraw::strokeRoundedRect(g, bx - pw * 0.5f - 2.5f, by - ph * 0.5f - 2.5f,
+                                           pw + 5.0f, ph + 5.0f, rad + 2.5f,
+                                           withAlpha(accentRgb, 0.72f * op), 2.2f);
         }
 
         // Translucent frosted keycap fill + hairline border (dashed when node cannot fire in current mode)
-        uint32_t fillRgb = selected ? 0x0E2A3Cu : (hovered ? 0x1A2434u : 0x0E131Cu);
-        float fillA      = editMode ? (selected ? 0.84f : 0.70f) : (0.42f * op);
-        uint32_t rimRgb  = selected ? 0x00D4FFu : (hasConflict ? 0xFFB84Du : (hovered ? 0xFFFFFFu : accentRgb));
-        float rimA       = editMode ? (selected ? 0.98f : (hovered ? 0.88f : (hasConflict ? 0.92f : 0.58f))) : (0.48f * op);
-        float rimW       = selected ? 1.8f : (editMode ? 1.3f : 1.0f);
+        uint32_t fillRgb = selected ? 0x0E2A3Cu : (pressedGlow ? 0x1A2E44u : (hovered ? 0x1A2434u : 0x0E131Cu));
+        float fillA      = editMode ? (selected ? 0.84f : 0.70f) : (pressedGlow ? 0.86f * op : 0.42f * op);
+        uint32_t rimRgb  = selected ? 0x00D4FFu : (pressedGlow ? accentRgb : (hasConflict ? 0xFFB84Du : (hovered ? 0xFFFFFFu : accentRgb)));
+        float rimA       = editMode ? (selected ? 0.98f : (hovered ? 0.88f : (hasConflict ? 0.92f : 0.58f))) : (pressedGlow ? 0.98f : 0.48f * op);
+        float rimW       = selected ? 1.8f : (pressedGlow ? 1.6f : (editMode ? 1.3f : 1.0f));
 
         if (cannotFire) {
             GdiPlusDraw::fillRoundedRect(g, bx - pw * 0.5f, by - ph * 0.5f, pw, ph, rad, withAlpha(fillRgb, fillA));
@@ -314,10 +319,39 @@ void HudRenderer::paintKeymapNodes(Gdiplus::Graphics& g, int w, int h,
         uint32_t txtCol = withAlpha(selected ? 0xFFFFFFu : 0xF2F7FFu, editMode ? 0.98f : 0.88f * op);
         drawSubtleText(g, keyTxt, bx, by, fontSz, true, txtCol);
 
-        // Tiny subtle mode indicator pip on bottom rim for non-PRESS special nodes
+        // Tiny subtle mode indicator pip on bottom rim + U4 action-type corner glyph
         if (b.action != NODE_PRESS && b.action != NODE_CLICK) {
             Gdiplus::SolidBrush pipBr(GdiPlusDraw::argb(withAlpha(accentRgb, editMode ? 0.95f : 0.65f * op)));
             g.FillEllipse(&pipBr, bx - 2.2f, by + ph * 0.5f - 4.2f, 4.4f, 4.4f);
+        }
+        {
+            float gx = bx + pw * 0.5f - 6.0f;
+            float gy = by - ph * 0.5f + 5.5f;
+            float ga = editMode ? 0.85f : 0.55f * op;
+            Gdiplus::Pen gPen(GdiPlusDraw::argb(withAlpha(accentRgb, ga)), 1.1f);
+            Gdiplus::SolidBrush gBr(GdiPlusDraw::argb(withAlpha(accentRgb, ga)));
+            if (b.action == NODE_SWIPE) {
+                Gdiplus::PointF ar[3] = {
+                    Gdiplus::PointF(gx - 2.0f, gy - 2.0f),
+                    Gdiplus::PointF(gx + 1.5f, gy),
+                    Gdiplus::PointF(gx - 2.0f, gy + 2.0f)
+                };
+                g.DrawLines(&gPen, ar, 3);
+            } else if (b.action == NODE_HOLD_VIEW || b.action == NODE_CURSOR_TOGGLE ||
+                       b.action == NODE_RESET_VIEW || b.action == NODE_SWITCH_SENS ||
+                       b.action == NODE_REACTIVATE_JOY) {
+                Gdiplus::PointF dm[4] = {
+                    Gdiplus::PointF(gx, gy - 2.2f),
+                    Gdiplus::PointF(gx + 2.2f, gy),
+                    Gdiplus::PointF(gx, gy + 2.2f),
+                    Gdiplus::PointF(gx - 2.2f, gy)
+                };
+                g.FillPolygon(&gBr, dm, 4);
+            } else if (b.action == NODE_PRESS || b.action == NODE_DOWN_UP) {
+                g.DrawLine(&gPen, gx - 2.2f, gy, gx + 2.2f, gy);
+            } else {
+                g.FillEllipse(&gBr, gx - 1.5f, gy - 1.5f, 3.0f, 3.0f);
+            }
         }
 
         // Edit Mode ONLY: subtle floating micro-label underneath + conflict badge + 'x' delete badge on primary selected node
@@ -416,36 +450,43 @@ void HudRenderer::paintRebindPrompt(Gdiplus::Graphics& g, int w, int h,
 
 void HudRenderer::paintToastWithAction(Gdiplus::Graphics& g, int w, int h,
                                          const std::string& msg, const std::string& actionLabel,
-                                         RECT* outActionRc) {
+                                         RECT* outActionRc, int toastKind) {
     if (outActionRc) ZeroMemory(outActionRc, sizeof(*outActionRc));
     float actW = actionLabel.empty() ? 0.0f : (22.0f + static_cast<float>(actionLabel.size()) * 7.0f);
-    float pw = 34.0f + static_cast<float>(msg.size()) * 6.8f + (actW > 0.0f ? actW + 12.0f : 0.0f);
-    if (pw < 150.0f) pw = 150.0f;
+    float pw = 42.0f + static_cast<float>(msg.size()) * 6.8f + (actW > 0.0f ? actW + 12.0f : 0.0f);
+    if (pw < 156.0f) pw = 156.0f;
     if (pw > static_cast<float>(w - 28)) pw = static_cast<float>(w - 28);
     float ph = 32.0f;
     float cx = static_cast<float>(w) * 0.5f;
     float cy = static_cast<float>(h) - ph * 0.5f - 18.0f;
 
-    drawFrostedCap(g, cx, cy, pw, ph, 15.0f, 0xE2101622u, 0xAA00D4FFu, 1.2f);
+    uint32_t kindCol = Theme::SEM_INFO;
+    if (toastKind == TOAST_SUCCESS) kindCol = Theme::SEM_SUCCESS;
+    else if (toastKind == TOAST_WARNING) kindCol = Theme::SEM_WARNING;
+    else if (toastKind == TOAST_ERROR) kindCol = Theme::SEM_DANGER;
+
+    drawFrostedCap(g, cx, cy, pw, ph, 15.0f, 0xE2101622u, withAlpha(kindCol, 0.72f), 1.2f);
+    float left = cx - pw * 0.5f;
+    Gdiplus::SolidBrush dotBr(GdiPlusDraw::argb(kindCol));
+    g.FillEllipse(&dotBr, left + 10.0f, cy - 3.5f, 7.0f, 7.0f);
     if (actionLabel.empty()) {
-        GdiPlusDraw::textCenter(g, msg, cx, cy, 11.5f, true, Theme::TEXT_PRIMARY);
+        GdiPlusDraw::textCenter(g, msg, cx + 4.0f, cy, 11.5f, true, Theme::TEXT_PRIMARY);
     } else {
-        float left = cx - pw * 0.5f;
         float right = cx + pw * 0.5f;
-        GdiPlusDraw::textLeft(g, msg, left + 14.0f, cy, 11.5f, true, Theme::TEXT_PRIMARY, pw - actW - 28.0f);
+        GdiPlusDraw::textLeft(g, msg, left + 22.0f, cy, 11.5f, true, Theme::TEXT_PRIMARY, pw - actW - 36.0f);
         RECT rAct = {
             static_cast<LONG>(right - actW - 8.0f),
             static_cast<LONG>(cy - 11.0f),
             static_cast<LONG>(right - 6.0f),
             static_cast<LONG>(cy + 11.0f)
         };
-        GdiPlusDraw::roundedCard(g, rAct, 8.0f, Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.0f);
+        GdiPlusDraw::roundedCard(g, rAct, 8.0f, Theme::ACCENT_CYAN_BG, kindCol, 1.0f);
         GdiPlusDraw::textCenter(g, actionLabel, static_cast<float>(rAct.left + rAct.right) * 0.5f, cy,
-                                10.5f, true, Theme::ACCENT_CYAN);
+                                10.5f, true, kindCol);
         if (outActionRc) *outActionRc = rAct;
     }
 }
 
 void HudRenderer::paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg) {
-    paintToastWithAction(g, w, h, msg, "", nullptr);
+    paintToastWithAction(g, w, h, msg, "", nullptr, TOAST_INFO);
 }

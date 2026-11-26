@@ -400,6 +400,22 @@ LRESULT InputHookThread::handleKeyHook(int nCode, WPARAM wParam, LPARAM lParam) 
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
+    bool altDown = ((kb->flags & LLKHF_ALTDOWN) != 0) || ((GetKeyState(VK_MENU) & 0x8000) != 0);
+    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    // X5 / X6: Global Command Palette (Ctrl+K) & Binding Cheat Sheet (Ctrl+/)
+    if (fg && down && ctrlDown && !shiftDown && !altDown && !s.waitingSpecialRebind && s.shellHwnd) {
+        if (vk == 'K') {
+            if (!isRepeat) PostMessageW(s.shellHwnd, MSG_TOGGLE_CMD_PALETTE, 0, 0);
+            return 1;
+        }
+        if (vk == VK_OEM_2 && (!s.uiCapturingText || s.popupOpen)) {
+            if (!isRepeat) PostMessageW(s.shellHwnd, MSG_TOGGLE_CHEAT_SHEET, 0, 0);
+            return 1;
+        }
+    }
+
     if (s.editMode || s.uiCapturingText) {
         if (down && !isRepeat && vk == VK_F2 && !s.uiCapturingText && s.shellHwnd) {
             PostMessageW(s.shellHwnd, MSG_TOGGLE_STUDIO, 0, 0);
@@ -407,10 +423,6 @@ LRESULT InputHookThread::handleKeyHook(int nCode, WPARAM wParam, LPARAM lParam) 
         }
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
-
-    bool altDown = ((kb->flags & LLKHF_ALTDOWN) != 0) || ((GetKeyState(VK_MENU) & 0x8000) != 0);
-    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 
     // Sprint 1 diagnostic hotkeys (Ctrl+Shift+D/L/T) always available in foreground
     if (down && !isRepeat && ctrlDown && shiftDown && !altDown && s.shellHwnd) {

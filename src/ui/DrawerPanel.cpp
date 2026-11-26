@@ -4,6 +4,7 @@
 #include "ui/EditorState.hpp"
 #include "ui/Theme.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -168,6 +169,20 @@ void DrawerPanel::drawSliderRow(Gdiplus::Graphics& g, int x, int y, int w,
     float norm = (maxV > minV) ? clampf((val - minV) / (maxV - minV), 0.0f, 1.0f) : 0.0f;
     bool hov = (activeSliderId_ == sliderId) || ptIn(hit, hoverX, hoverY);
     GdiPlusDraw::drawSlider(g, tr, norm, accent, hov);
+    if (activeSliderId_ == sliderId) {
+        // U4: Floating value bubble over active slider thumb
+        float kx = static_cast<float>(tr.left) + static_cast<float>(tr.right - tr.left) * norm;
+        int bw = dp(44);
+        int bh = dp(18);
+        int bx = static_cast<int>(kx) - bw / 2;
+        int by = tr.top - bh - dp(4);
+        if (bx < x) bx = x;
+        if (bx + bw > x + w) bx = x + w - bw;
+        RECT rBub = { bx, by, bx + bw, by + bh };
+        GdiPlusDraw::roundedCard(g, rBub, GdiPlusDraw::dpf(5.0f), Theme::BG_SHELL, accent, 1.1f);
+        GdiPlusDraw::textCenter(g, valText, static_cast<float>(rBub.left + rBub.right) * 0.5f,
+                                static_cast<float>(rBub.top + rBub.bottom) * 0.5f, 9.5f, true, accent);
+    }
     GdiPlusDraw::textRight(g, valText, static_cast<float>(x + w), static_cast<float>(cy), 11.5f, true, accent);
 
     if (hit.bottom > bodyClip_.top && hit.top < bodyClip_.bottom) {
@@ -178,30 +193,35 @@ void DrawerPanel::drawSliderRow(Gdiplus::Graphics& g, int x, int y, int w,
 void DrawerPanel::drawToggleRow(Gdiplus::Graphics& g, int x, int y, int w,
                                 const char* label, bool on, uint32_t accent, int actionId,
                                 int hoverX, int hoverY) {
-    RECT row = { x, y, x + w, y + dp(30) };
+    RECT row = { x, y, x + w, y + dp(32) };
     bool hov = ptIn(row, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, row, GdiPlusDraw::dpf(7.0f), hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              Theme::BORDER_SUBTLE, 1.0f);
-    GdiPlusDraw::textLeft(g, label, static_cast<float>(x + dp(10)), static_cast<float>(y + dp(15)), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - dp(64)));
-    RECT sw = { x + w - dp(48), y + dp(5), x + w - dp(8), y + dp(25) };
+    GdiPlusDraw::textLeft(g, label, static_cast<float>(x + dp(10)), static_cast<float>(y + dp(16)), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - dp(64)));
+    RECT sw = { x + w - dp(48), y + dp(6), x + w - dp(8), y + dp(26) };
     GdiPlusDraw::drawToggleSwitch(g, sw, on, accent);
     if (row.bottom > bodyClip_.top && row.top < bodyClip_.bottom) {
         hotspots_.push_back(Hotspot{ row, actionId, 0 });
     }
 }
 
-void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
+void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
                         const Profile& profile, const AppSettings& settings,
                         const std::string& activeProfilePath,
                         int selectedBtnIndex, bool waitingNodeRebind,
                         bool connected, const std::string& deviceLabel,
                         const std::string& foregroundPkg,
                         const std::vector<std::string>& logs,
-                        int hoverX, int hoverY) {
+                        int hoverX, int hoverY,
+                        int slideOffsetX) {
+    RECT bounds = rawBounds;
+    bounds.left += slideOffsetX;
+    bounds.right += slideOffsetX;
     bounds_ = bounds;
     activeProfilePath_ = activeProfilePath;
     hotspots_.clear();
     sliders_.clear();
+    focusables_.clear();
 
     GdiPlusDraw::fillRect(g, bounds, Theme::BG_DRAWER);
     GdiPlusDraw::vLine(g, bounds.left, bounds.top, bounds.bottom, Theme::BORDER_STRONG);
@@ -246,6 +266,7 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
                                 10.5f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
         hotspots_.push_back(Hotspot{ tr, DA_TAB_0 + i, 0 });
     }
+    const size_t chromeHdrHotspotsEnd = hotspots_.size();
 
     int sepTop = tabY + dp(34);
     int footerH = dp(46);
@@ -288,6 +309,53 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
         GdiPlusDraw::fillRoundedRect(g, static_cast<float>(bounds.right - dp(6)), thumbY, GdiPlusDraw::dpf(4.0f), thumbH, GdiPlusDraw::dpf(2.0f), Theme::BORDER_STRONG);
     }
 
+    // Build focusable order: Tabs & Close -> Sorted Body Controls -> Footer Save & Done
+    for (size_t hi = 0; hi < chromeHdrHotspotsEnd; ++hi) {
+        FocusableItem fi;
+        fi.rc = hotspots_[hi].rc;
+        fi.isSlider = false;
+        fi.inBody = false;
+        fi.id = hotspots_[hi].id;
+        fi.extra = hotspots_[hi].extra;
+        focusables_.push_back(fi);
+    }
+    std::vector<FocusableItem> bodyFocus;
+    for (size_t hi = chromeHdrHotspotsEnd; hi < hotspots_.size(); ++hi) {
+        FocusableItem fi;
+        fi.rc = hotspots_[hi].rc;
+        fi.isSlider = false;
+        fi.inBody = true;
+        fi.id = hotspots_[hi].id;
+        fi.extra = hotspots_[hi].extra;
+        bodyFocus.push_back(fi);
+    }
+    for (size_t si = 0; si < sliders_.size(); ++si) {
+        FocusableItem fi;
+        fi.rc = sliders_[si].hitRc;
+        fi.isSlider = true;
+        fi.inBody = true;
+        fi.id = sliders_[si].id;
+        fi.extra = 0;
+        fi.minVal = sliders_[si].minVal;
+        fi.maxVal = sliders_[si].maxVal;
+        bodyFocus.push_back(fi);
+    }
+    std::sort(bodyFocus.begin(), bodyFocus.end(), [](const FocusableItem& a, const FocusableItem& b) {
+        int dy = (a.rc.top / 6) - (b.rc.top / 6);
+        if (dy != 0) return dy < 0;
+        return a.rc.left < b.rc.left;
+    });
+    focusables_.insert(focusables_.end(), bodyFocus.begin(), bodyFocus.end());
+
+    if (focusedIdx_ >= 0 && focusedIdx_ < static_cast<int>(focusables_.size()) &&
+        focusables_[focusedIdx_].inBody) {
+        const RECT& fr = focusables_[focusedIdx_].rc;
+        GdiPlusDraw::strokeRoundedRect(g,
+            static_cast<float>(fr.left - 2), static_cast<float>(fr.top - 2),
+            static_cast<float>(fr.right - fr.left + 4), static_cast<float>(fr.bottom - fr.top + 4),
+            GdiPlusDraw::dpf(7.0f), Theme::ACCENT_CYAN, 2.0f);
+    }
+
     g.Restore(savedState);
 
     // 4. Persistent Footer Bar (Auto-Save Status + Save Now + Done)
@@ -301,6 +369,11 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
     GdiPlusDraw::textCenter(g, "SAVE (Ctrl+S)", static_cast<float>(rSave.left + rSave.right) * 0.5f,
                             static_cast<float>(fy + dp(14)), 11.0f, true, hovSave ? 0xFF07130Du : Theme::TEXT_PRIMARY);
     hotspots_.push_back(Hotspot{ rSave, DA_SAVE, 0 });
+    {
+        FocusableItem fi;
+        fi.rc = rSave; fi.id = DA_SAVE;
+        focusables_.push_back(fi);
+    }
 
     RECT rDone = { rSave.right + dp(8), fy, bounds.right - dp(12), fy + dp(28) };
     bool hovDone = ptIn(rDone, hoverX, hoverY);
@@ -309,6 +382,23 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& bounds,
     GdiPlusDraw::textCenter(g, "DONE (F2)", static_cast<float>(rDone.left + rDone.right) * 0.5f,
                             static_cast<float>(fy + dp(14)), 11.0f, true, hovDone ? 0xFF07131Au : Theme::TEXT_PRIMARY);
     hotspots_.push_back(Hotspot{ rDone, DA_CLOSE, 0 });
+    {
+        FocusableItem fi;
+        fi.rc = rDone; fi.id = DA_CLOSE;
+        focusables_.push_back(fi);
+    }
+
+    if (focusedIdx_ >= static_cast<int>(focusables_.size())) {
+        focusedIdx_ = focusables_.empty() ? -1 : (static_cast<int>(focusables_.size()) - 1);
+    }
+    if (focusedIdx_ >= 0 && focusedIdx_ < static_cast<int>(focusables_.size()) &&
+        !focusables_[focusedIdx_].inBody) {
+        const RECT& fr = focusables_[focusedIdx_].rc;
+        GdiPlusDraw::strokeRoundedRect(g,
+            static_cast<float>(fr.left - 2), static_cast<float>(fr.top - 2),
+            static_cast<float>(fr.right - fr.left + 4), static_cast<float>(fr.bottom - fr.top + 4),
+            GdiPlusDraw::dpf(7.0f), Theme::ACCENT_CYAN, 2.0f);
+    }
 }
 
 int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
@@ -558,14 +648,18 @@ int DrawerPanel::paintTabKeys(Gdiplus::Graphics& g, int x, int y, int w,
         y += rows * (tileH + 6) + 8;
     }
 
-    RECT rClr = { x, y, x + w, y + 28 };
+    // U4: Danger Zone card
+    RECT rDZ = { x, y, x + w, y + 54 };
+    GdiPlusDraw::roundedCard(g, rDZ, 8.0f, Theme::BG_CARD, Theme::SEM_DANGER, 1.0f);
+    GdiPlusDraw::textLeft(g, "DANGER ZONE", static_cast<float>(x + 10), static_cast<float>(y + 11), 9.5f, true, Theme::SEM_DANGER);
+    RECT rClr = { x + 8, y + 20, x + w - 8, y + 46 };
     bool hovClr = ptIn(rClr, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rClr, 7.0f, hovClr ? Theme::ACCENT_RED : Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
+    GdiPlusDraw::roundedCard(g, rClr, 6.0f, hovClr ? Theme::ACCENT_RED : Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
     GdiPlusDraw::textCenter(g, "CLEAR ALL EXTRA KEYS (Keep WASD / AIM / FIRE)",
-                            static_cast<float>(x + w / 2), static_cast<float>(y + 14),
-                            10.5f, true, hovClr ? 0xFFFFFFFFu : Theme::ACCENT_RED);
+                            static_cast<float>(x + w / 2), static_cast<float>(y + 33),
+                            10.0f, true, hovClr ? 0xFFFFFFFFu : Theme::ACCENT_RED);
     if (rClr.bottom > bodyClip_.top && rClr.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rClr, DA_CLEAR_BUTTONS, 0 });
-    return y + 34;
+    return rDZ.bottom + 8;
 }
 
 int DrawerPanel::paintTabSens(Gdiplus::Graphics& g, int x, int y, int w,
@@ -917,46 +1011,11 @@ int DrawerPanel::paintTabProfiles(Gdiplus::Graphics& g, int x, int y, int w,
 int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
                                 const AppSettings& s, bool connected, const std::string& deviceLabel,
                                 const std::vector<std::string>& logs, int hoverX, int hoverY) {
-    // 1. Connection Card
-    RECT rDev = { x, y, x + w, y + 66 };
-    GdiPlusDraw::roundedCard(g, rDev, 9.0f, Theme::BG_CARD, connected ? Theme::ACCENT_GREEN : Theme::BORDER_STRONG, 1.2f);
-    GdiPlusDraw::textLeft(g, connected ? "CONNECTED PHONE" : "DISCONNECTED", static_cast<float>(x + 12), static_cast<float>(y + 15), 10.0f, true,
-                          connected ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER);
-    GdiPlusDraw::textLeft(g, connected ? deviceLabel : "Open Device Hub or plug in USB", static_cast<float>(x + 12), static_cast<float>(y + 34), 12.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 24));
-    GdiPlusDraw::textLeft(g, "Stream: " + s.buildScrcpyArgs(), static_cast<float>(x + 12), static_cast<float>(y + 52), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 24));
-    y += 76;
-
-    // F16: Pending stream-settings banner (only shown when reconnect-requiring settings differ)
-    if (connected && pendingStreamChanges_) {
-        RECT rPend = { x, y, x + w, y + 38 };
-        GdiPlusDraw::roundedCard(g, rPend, 8.0f, Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 1.2f);
-        GdiPlusDraw::textLeft(g, "Stream settings changed", static_cast<float>(x + 10), static_cast<float>(y + 19), 11.0f, true, Theme::ACCENT_AMBER, static_cast<float>(w - 142));
-        RECT rRecNow = { rPend.right - 126, y + 6, rPend.right - 8, y + 32 };
-        bool hovRn = ptIn(rRecNow, hoverX, hoverY);
-        GdiPlusDraw::roundedCard(g, rRecNow, 6.0f, hovRn ? Theme::ACCENT_AMBER : Theme::BG_CARD, Theme::ACCENT_AMBER, 1.1f);
-        GdiPlusDraw::textCenter(g, "Reconnect to apply", static_cast<float>(rRecNow.left + rRecNow.right) * 0.5f,
-                                static_cast<float>(y + 19), 10.0f, true, hovRn ? 0xFF081018u : Theme::TEXT_PRIMARY);
-        if (rRecNow.bottom > bodyClip_.top && rRecNow.top < bodyClip_.bottom) {
-            hotspots_.push_back(Hotspot{ rRecNow, DA_APPLY_RECONNECT, 0 });
-        }
-        y += 46;
-    }
-
-    // 2. Stream Presets (LATENCY 2.1-2.4) & Quality Controls
-    GdiPlusDraw::textLeft(g, "STREAM PRESET (PHASE 2)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
-    y += 18;
-    const char* spLbls[4] = { "Comp", "Bal", "Qual", "WiFi" };
-    const StreamPresetId spIds[4] = { PRESET_COMPETITIVE, PRESET_BALANCED, PRESET_QUALITY, PRESET_WIFI };
-    StreamPresetId curPreset = s.detectStreamPreset();
-    int spw = (w - 12) / 4;
-    for (int i = 0; i < 4; ++i) {
-        RECT r = { x + i * (spw + 4), y, x + i * (spw + 4) + spw, y + 26 };
-        bool on = (curPreset == spIds[i]);
-        GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_GREEN_BG : Theme::BG_CARD, on ? Theme::ACCENT_GREEN : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
-        GdiPlusDraw::textCenter(g, spLbls[i], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.5f, true, on ? Theme::ACCENT_GREEN : Theme::TEXT_SECONDARY);
-        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_STREAM_PRESET, static_cast<int>(spIds[i]) });
-    }
-    y += 34;
+    auto drawSectionHdr = [&](UiIcon icon, const char* title, uint32_t accent) {
+        GdiPlusDraw::drawIcon(g, icon, static_cast<float>(x + 7), static_cast<float>(y + 8), 12.0f, accent);
+        GdiPlusDraw::textLeft(g, title, static_cast<float>(x + 18), static_cast<float>(y + 8), 10.5f, true, Theme::TEXT_MUTED);
+        y += 20;
+    };
 
     auto drawSeg3 = [&](const char* title, const char* l0, const char* l1, const char* l2,
                         int v0, int v1, int v2, int curV, int actId) {
@@ -975,7 +1034,77 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         y += 34;
     };
 
-    // 4-way selector for MIRROR MAX FPS (V10: Uncapped = 0 default, plus 60/90/120 caps)
+    // Connection Summary Card
+    RECT rDev = { x, y, x + w, y + 66 };
+    GdiPlusDraw::roundedCard(g, rDev, 9.0f, Theme::BG_CARD, connected ? Theme::ACCENT_GREEN : Theme::BORDER_STRONG, 1.2f);
+    GdiPlusDraw::textLeft(g, connected ? "CONNECTED PHONE" : "DISCONNECTED", static_cast<float>(x + 12), static_cast<float>(y + 15), 10.0f, true,
+                          connected ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER);
+    GdiPlusDraw::textLeft(g, connected ? deviceLabel : "Open Device Hub or plug in USB", static_cast<float>(x + 12), static_cast<float>(y + 34), 12.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 24));
+    GdiPlusDraw::textLeft(g, "Stream: " + s.buildScrcpyArgs(), static_cast<float>(x + 12), static_cast<float>(y + 52), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 24));
+    y += 76;
+
+    // F16 / N16 / X8: Pending stream-settings bar ("N changes need reconnect · Apply")
+    if (connected && pendingStreamChangeCount_ > 0) {
+        RECT rPend = { x, y, x + w, y + 36 };
+        GdiPlusDraw::roundedCard(g, rPend, 8.0f, Theme::ACCENT_AMBER_BG, Theme::ACCENT_AMBER, 1.2f);
+        char pbuf[64];
+        if (pendingStreamChangeCount_ == 1) {
+            std::snprintf(pbuf, sizeof(pbuf), "1 change needs reconnect");
+        } else {
+            std::snprintf(pbuf, sizeof(pbuf), "%d changes need reconnect", pendingStreamChangeCount_);
+        }
+        GdiPlusDraw::textLeft(g, pbuf, static_cast<float>(x + 10), static_cast<float>(y + 18), 11.0f, true, Theme::ACCENT_AMBER, static_cast<float>(w - 92));
+        RECT rRecNow = { rPend.right - 74, y + 5, rPend.right - 8, y + 31 };
+        bool hovRn = ptIn(rRecNow, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rRecNow, 6.0f, hovRn ? Theme::ACCENT_AMBER : Theme::BG_CARD, Theme::ACCENT_AMBER, 1.1f);
+        GdiPlusDraw::textCenter(g, "Apply", static_cast<float>(rRecNow.left + rRecNow.right) * 0.5f,
+                                static_cast<float>(y + 18), 10.5f, true, hovRn ? 0xFF081018u : Theme::TEXT_PRIMARY);
+        if (rRecNow.bottom > bodyClip_.top && rRecNow.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rRecNow, DA_APPLY_RECONNECT, 0 });
+        }
+        y += 44;
+    }
+
+    // 1. DEVICE
+    drawSectionHdr(ICON_QR, "DEVICE", Theme::ACCENT_CYAN);
+    RECT rWInp = { x, y, x + w - 82, y + 28 };
+    GdiPlusDraw::roundedCard(g, rWInp, 6.0f, Theme::BG_INPUT, editingWireless_ ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, editingWireless_ ? 1.5f : 1.0f);
+    GdiPlusDraw::textLeft(g, s.lastWirelessAddr + (editingWireless_ ? "_" : ""), static_cast<float>(x + 8), static_cast<float>(y + 14), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 94));
+    RECT rWGo = { rWInp.right + 6, y, x + w, y + 28 };
+    GdiPlusDraw::roundedCard(g, rWGo, 6.0f, ptIn(rWGo, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::ACCENT_CYAN, 1.0f);
+    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWGo.left + rWGo.right) * 0.5f, static_cast<float>(y + 14), 10.5f, true, Theme::ACCENT_CYAN);
+    if (rWInp.bottom > bodyClip_.top && rWInp.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rWInp, DA_FOCUS_WIRELESS, 0 });
+        hotspots_.push_back(Hotspot{ rWGo, DA_CONNECT_WIRELESS, 0 });
+    }
+    y += 34;
+    drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
+    RECT rGuide = { x, y, x + w, y + 28 };
+    bool hovG = ptIn(rGuide, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rGuide, 7.0f, hovG ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "OPEN SETUP GUIDE / ONBOARDING", static_cast<float>(x + w / 2),
+                            static_cast<float>(y + 14), 10.5f, true, Theme::TEXT_SECONDARY);
+    if (rGuide.bottom > bodyClip_.top && rGuide.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rGuide, DA_OPEN_ONBOARDING, 0 });
+    }
+    y += 38;
+
+    // 2. STREAM
+    drawSectionHdr(ICON_CAST, "STREAM", Theme::ACCENT_GREEN);
+    const char* spLbls[4] = { "Comp", "Bal", "Qual", "WiFi" };
+    const StreamPresetId spIds[4] = { PRESET_COMPETITIVE, PRESET_BALANCED, PRESET_QUALITY, PRESET_WIFI };
+    StreamPresetId curPreset = s.detectStreamPreset();
+    int spw = (w - 12) / 4;
+    for (int i = 0; i < 4; ++i) {
+        RECT r = { x + i * (spw + 4), y, x + i * (spw + 4) + spw, y + 26 };
+        bool on = (curPreset == spIds[i]);
+        GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_GREEN_BG : Theme::BG_CARD, on ? Theme::ACCENT_GREEN : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
+        GdiPlusDraw::textCenter(g, spLbls[i], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.5f, true, on ? Theme::ACCENT_GREEN : Theme::TEXT_SECONDARY);
+        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_STREAM_PRESET, static_cast<int>(spIds[i]) });
+    }
+    y += 34;
+
     GdiPlusDraw::textLeft(g, "MIRROR MAX FPS", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 18;
     const char* fLbls[4] = { "Uncapped", "60", "90", "120" };
@@ -990,7 +1119,6 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    // Bitrate 4-way
     GdiPlusDraw::textLeft(g, "VIDEO BITRATE", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 18;
     const char* bLbls[4] = { "8M", "12M", "16M", "24M" };
@@ -1005,7 +1133,6 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    // Resolution 4-way (2.1)
     GdiPlusDraw::textLeft(g, "VIDEO RESOLUTION (2.1)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 18;
     const char* rLbls[4] = { "Native", "1920", "1600", "1280" };
@@ -1019,66 +1146,24 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    int curOpts = 0;
-    if (s.videoCodecOptions == "bitrate-mode=2,max-bframes=0") curOpts = 1;
-    else if (s.videoCodecOptions == "intra-refresh-period=60,bitrate-mode=2,max-bframes=0") curOpts = 2;
-    drawSeg3("ENCODER LOW-LATENCY KEYS (2.2)", "Default", "CBR+NoB", "WiFi Intra", 0, 1, 2, curOpts, DA_CODEC_OPTS);
-
-    std::string encShown = s.encoderForDevice(activeDeviceSerial_);
-    if (encShown.empty()) encShown = activeEncoder_;
-    std::string encLabel = encShown.empty() ? "Auto (Hardware)" : encShown;
-    RECT rEnc = { x, y, x + w, y + 30 };
-    bool hovEnc = ptIn(rEnc, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rEnc, 7.0f, hovEnc ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
-    GdiPlusDraw::textLeft(g, "Encoder (2.3): " + encLabel, static_cast<float>(x + 10), static_cast<float>(y + 15), 11.0f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 72));
-    GdiPlusDraw::textRight(g, "Cycle", static_cast<float>(x + w - 10), static_cast<float>(y + 15), 10.5f, true, Theme::ACCENT_CYAN);
-    if (rEnc.bottom > bodyClip_.top && rEnc.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rEnc, DA_CYCLE_ENCODER, 0 });
-    y += 36;
-
-    // Stage 2 & Stage 3 Renderer + Second-Phone Virtual Display controls
-    drawToggleRow(g, x, y, w, "Native D3D11 Single-Stream Video", s.useNativeVideo, Theme::ACCENT_CYAN, DA_TOGGLE_NATIVE_VIDEO, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "VSync (Waitable, No Tearing)", s.vsyncEnabled, Theme::ACCENT_CYAN, DA_TOGGLE_VSYNC, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "Second-Phone Virtual Display", s.virtualDisplayMode, Theme::ACCENT_PURPLE, DA_TOGGLE_VIRTUAL_DISPLAY, hoverX, hoverY); y += 34;
-
-    if (s.virtualDisplayMode) {
-        int curVd = 0;
-        if (s.virtualDisplaySpec == "1280x720/240") curVd = 1;
-        else if (s.virtualDisplaySpec == "auto") curVd = 2;
-        drawSeg3("VIRTUAL DISPLAY SIZE", "1080p PC", "720p Fast", "Auto", 0, 1, 2, curVd, DA_VD_PRESET);
-        GdiPlusDraw::textLeft(g, "Note: Android virtual displays may cap games at 60 fps (2.6).", static_cast<float>(x + 4), static_cast<float>(y - 2), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
-        y += 14;
-    }
-
-    drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Forward Phone Audio (scrcpy 5.0)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
     if (s.mirrorAudio) {
         drawSeg3("AUDIO RELAY BUFFER (1.6)", "20ms", "25ms", "30ms", 20, 25, 30, s.audioBufferMs, DA_AUDIO_BUFFER);
         drawToggleRow(g, x, y, w, "Raw PCM Audio (USB Low-Latency)", s.audioRawCodec, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO_RAW, hoverX, hoverY); y += 36;
     }
-    drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
+    y += 4;
+
+    // 3. INPUT
+    drawSectionHdr(ICON_KEYMAP, "INPUT", Theme::ACCENT_AMBER);
     drawToggleRow(g, x, y, w, "Auto-Switch Profile by Open App", s.autoSwitchProfiles, Theme::ACCENT_GREEN, DA_TOGGLE_AUTO_SWITCH, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Right-Click = Android Back (Cursor)", s.rightClickBack, Theme::ACCENT_CYAN, DA_TOGGLE_RCLICK_BACK, hoverX, hoverY); y += 40;
 
-    // Apply & Restart Stream / Disconnect
-    int hw = (w - 8) / 2;
-    RECT rRec = { x, y, x + hw + 28, y + 30 };
-    RECT rDis = { rRec.right + 8, y, x + w, y + 30 };
-    GdiPlusDraw::roundedCard(g, rRec, 7.0f, ptIn(rRec, hoverX, hoverY) ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.2f);
-    GdiPlusDraw::textCenter(g, "APPLY & RECONNECT", static_cast<float>(rRec.left + rRec.right) * 0.5f, static_cast<float>(y + 15), 11.0f, true,
-                            ptIn(rRec, hoverX, hoverY) ? 0xFF08121Au : Theme::TEXT_PRIMARY);
-    GdiPlusDraw::roundedCard(g, rDis, 7.0f, ptIn(rDis, hoverX, hoverY) ? Theme::ACCENT_RED : Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
-    GdiPlusDraw::textCenter(g, "DISCONNECT", static_cast<float>(rDis.left + rDis.right) * 0.5f, static_cast<float>(y + 15), 10.5f, true,
-                            ptIn(rDis, hoverX, hoverY) ? 0xFFFFFFFFu : Theme::ACCENT_RED);
-    if (rRec.bottom > bodyClip_.top && rRec.top < bodyClip_.bottom) {
-        hotspots_.push_back(Hotspot{ rRec, DA_APPLY_RECONNECT, 0 });
-        hotspots_.push_back(Hotspot{ rDis, DA_DISCONNECT, 0 });
-    }
-    y += 42;
+    // 4. GAMEPAD
+    drawSectionHdr(ICON_GAMEPAD, "GAMEPAD", Theme::ACCENT_GREEN);
+    drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 40;
 
-    // Latency Probe & Telemetry Card (0.1, 0.2, 0.3, 2.5)
-    GdiPlusDraw::textLeft(g, "LATENCY & THERMAL TELEMETRY (Ctrl+Shift+L)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
-    y += 20;
+    // 5. PRIVACY & LOGS
+    drawSectionHdr(ICON_SHIELD, "PRIVACY & LOGS", Theme::ACCENT_CYAN);
     RECT rLatCard = { x, y, x + w, y + 90 };
     GdiPlusDraw::roundedCard(g, rLatCard, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
     char modeLine[112];
@@ -1117,27 +1202,9 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     if (rProbeBtn.bottom > bodyClip_.top && rProbeBtn.top < bodyClip_.bottom && !probeResult_.running) {
         hotspots_.push_back(Hotspot{ rProbeBtn, DA_RUN_LATENCY_PROBE, 0 });
     }
-    y += 98;
+    y += 96;
 
-    // Wireless ADB quick connect
-    GdiPlusDraw::textLeft(g, "WIRELESS ADB", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
-    y += 20;
-    RECT rWInp = { x, y, x + w - 82, y + 28 };
-    GdiPlusDraw::roundedCard(g, rWInp, 6.0f, Theme::BG_INPUT, editingWireless_ ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, editingWireless_ ? 1.5f : 1.0f);
-    GdiPlusDraw::textLeft(g, s.lastWirelessAddr + (editingWireless_ ? "_" : ""), static_cast<float>(x + 8), static_cast<float>(y + 14), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 94));
-    RECT rWGo = { rWInp.right + 6, y, x + w, y + 28 };
-    GdiPlusDraw::roundedCard(g, rWGo, 6.0f, ptIn(rWGo, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::ACCENT_CYAN, 1.0f);
-    GdiPlusDraw::textCenter(g, "CONNECT", static_cast<float>(rWGo.left + rWGo.right) * 0.5f, static_cast<float>(y + 14), 10.5f, true, Theme::ACCENT_CYAN);
-    if (rWInp.bottom > bodyClip_.top && rWInp.top < bodyClip_.bottom) {
-        hotspots_.push_back(Hotspot{ rWInp, DA_FOCUS_WIRELESS, 0 });
-        hotspots_.push_back(Hotspot{ rWGo, DA_CONNECT_WIRELESS, 0 });
-    }
-    y += 40;
-
-    // Activity Log Card
-    GdiPlusDraw::textLeft(g, "ACTIVITY LOG", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
-    y += 20;
-    RECT rLog = { x, y, x + w, y + 118 };
+    RECT rLog = { x, y, x + w, y + 114 };
     GdiPlusDraw::roundedCard(g, rLog, 8.0f, Theme::BG_INPUT, Theme::BORDER_SUBTLE, 1.0f);
     int ly = y + 12;
     size_t startIdx = (logs.size() > 6) ? (logs.size() - 6) : 0;
@@ -1146,18 +1213,70 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         ly += 17;
     }
     if (logs.empty()) {
-        GdiPlusDraw::textLeft(g, "Ready. Connect phone or edit keymaps.", static_cast<float>(x + 8), static_cast<float>(ly), 10.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 16));
+        GdiPlusDraw::textLeft(g, "Ready. Connect phone or edit keymaps.", static_cast<float>(x + 8), static_cast<float>(ly), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 16));
     }
-    int gy = rLog.bottom + 12;
-    RECT rGuide = { x, gy, x + w, gy + 28 };
-    bool hovG = ptIn(rGuide, hoverX, hoverY);
-    GdiPlusDraw::roundedCard(g, rGuide, 7.0f, hovG ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
-    GdiPlusDraw::textCenter(g, "OPEN SETUP GUIDE / ONBOARDING", static_cast<float>(x + w / 2),
-                            static_cast<float>(gy + 14), 10.5f, true, Theme::TEXT_SECONDARY);
-    if (rGuide.bottom > bodyClip_.top && rGuide.top < bodyClip_.bottom) {
-        hotspots_.push_back(Hotspot{ rGuide, DA_OPEN_ONBOARDING, 0 });
+    y = rLog.bottom + 10;
+
+    // 6. ADVANCED (F16 - collapsible)
+    RECT rAdv = { x, y, x + w, y + 28 };
+    GdiPlusDraw::roundedCard(g, rAdv, 7.0f, ptIn(rAdv, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::drawIcon(g, ICON_APPS, static_cast<float>(x + 14), static_cast<float>(y + 14), 12.0f, Theme::ACCENT_PURPLE);
+    GdiPlusDraw::textLeft(g, devAdvancedExpanded_ ? "ADVANCED (F16)  [-]" : "ADVANCED (F16)  [+]",
+                          static_cast<float>(x + 28), static_cast<float>(y + 14), 10.5f, true, Theme::TEXT_SECONDARY);
+    if (rAdv.bottom > bodyClip_.top && rAdv.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rAdv, DA_TOGGLE_DEV_ADVANCED, 0 });
     }
-    return rGuide.bottom + 10;
+    y += 34;
+
+    if (devAdvancedExpanded_) {
+        int curOpts = 0;
+        if (s.videoCodecOptions == "bitrate-mode=2,max-bframes=0") curOpts = 1;
+        else if (s.videoCodecOptions == "intra-refresh-period=60,bitrate-mode=2,max-bframes=0") curOpts = 2;
+        drawSeg3("ENCODER LOW-LATENCY KEYS (2.2)", "Default", "CBR+NoB", "WiFi Intra", 0, 1, 2, curOpts, DA_CODEC_OPTS);
+
+        std::string encShown = s.encoderForDevice(activeDeviceSerial_);
+        if (encShown.empty()) encShown = activeEncoder_;
+        std::string encLabel = encShown.empty() ? "Auto (Hardware)" : encShown;
+        RECT rEnc = { x, y, x + w, y + 30 };
+        bool hovEnc = ptIn(rEnc, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rEnc, 7.0f, hovEnc ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textLeft(g, "Encoder (2.3): " + encLabel, static_cast<float>(x + 10), static_cast<float>(y + 15), 11.0f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 72));
+        GdiPlusDraw::textRight(g, "Cycle", static_cast<float>(x + w - 10), static_cast<float>(y + 15), 10.5f, true, Theme::ACCENT_CYAN);
+        if (rEnc.bottom > bodyClip_.top && rEnc.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rEnc, DA_CYCLE_ENCODER, 0 });
+        y += 36;
+
+        drawToggleRow(g, x, y, w, "Native D3D11 Single-Stream Video", s.useNativeVideo, Theme::ACCENT_CYAN, DA_TOGGLE_NATIVE_VIDEO, hoverX, hoverY); y += 36;
+        drawToggleRow(g, x, y, w, "VSync (Waitable, No Tearing)", s.vsyncEnabled, Theme::ACCENT_CYAN, DA_TOGGLE_VSYNC, hoverX, hoverY); y += 36;
+        drawToggleRow(g, x, y, w, "Second-Phone Virtual Display", s.virtualDisplayMode, Theme::ACCENT_PURPLE, DA_TOGGLE_VIRTUAL_DISPLAY, hoverX, hoverY); y += 34;
+
+        if (s.virtualDisplayMode) {
+            int curVd = 0;
+            if (s.virtualDisplaySpec == "1280x720/240") curVd = 1;
+            else if (s.virtualDisplaySpec == "auto") curVd = 2;
+            drawSeg3("VIRTUAL DISPLAY SIZE", "1080p PC", "720p Fast", "Auto", 0, 1, 2, curVd, DA_VD_PRESET);
+            GdiPlusDraw::textLeft(g, "Note: Android virtual displays may cap games at 60 fps (2.6).", static_cast<float>(x + 4), static_cast<float>(y - 2), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
+            y += 14;
+        }
+    }
+
+    // U4: Danger Zone / Stream Session Controls
+    RECT rDZ = { x, y, x + w, y + 58 };
+    GdiPlusDraw::roundedCard(g, rDZ, 8.0f, Theme::BG_CARD, Theme::SEM_DANGER, 1.0f);
+    GdiPlusDraw::textLeft(g, "STREAM SESSION & DANGER ZONE", static_cast<float>(x + 10), static_cast<float>(y + 11), 9.5f, true, Theme::SEM_DANGER);
+    int hw = (w - 24) / 2;
+    RECT rRec = { x + 8, y + 22, x + 8 + hw + 18, y + 50 };
+    RECT rDis = { rRec.right + 8, y + 22, x + w - 8, y + 50 };
+    GdiPlusDraw::roundedCard(g, rRec, 6.0f, ptIn(rRec, hoverX, hoverY) ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.1f);
+    GdiPlusDraw::textCenter(g, "APPLY & RECONNECT", static_cast<float>(rRec.left + rRec.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
+                            ptIn(rRec, hoverX, hoverY) ? 0xFF08121Au : Theme::TEXT_PRIMARY);
+    GdiPlusDraw::roundedCard(g, rDis, 6.0f, ptIn(rDis, hoverX, hoverY) ? Theme::ACCENT_RED : Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
+    GdiPlusDraw::textCenter(g, "DISCONNECT", static_cast<float>(rDis.left + rDis.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
+                            ptIn(rDis, hoverX, hoverY) ? 0xFFFFFFFFu : Theme::ACCENT_RED);
+    if (rRec.bottom > bodyClip_.top && rRec.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rRec, DA_APPLY_RECONNECT, 0 });
+        hotspots_.push_back(Hotspot{ rDis, DA_DISCONNECT, 0 });
+    }
+    return rDZ.bottom + 10;
 }
 
 void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
@@ -1196,6 +1315,36 @@ void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int se
     }
 }
 
+float DrawerPanel::currentSliderValue(int sliderId, const Profile& p, int selectedBtnIndex) const {
+    switch (sliderId) {
+        case DSL_SENS_X:      return p.sensX;
+        case DSL_SENS_Y:      return p.sensY;
+        case DSL_FIRE_X:      return p.fireSensX;
+        case DSL_FIRE_Y:      return p.fireSensY;
+        case DSL_SCOPE_X:     return p.scopeSensX;
+        case DSL_SCOPE_Y:     return p.scopeSensY;
+        case DSL_FF_CA:       return p.ffCounterAccel;
+        case DSL_SMOOTH:      return p.smoothing;
+        case DSL_HUD_OPACITY: return p.hudOpacity;
+        case DSL_IDLE_RESET:  return static_cast<float>(p.idleResetMs);
+        case DSL_TAP_JITTER:  return static_cast<float>(p.tapJitterPx);
+        case DSL_ACCEL_POWER: return p.accelPower;
+        case DSL_ACCEL_REF:   return p.accelRefSpeed;
+        case DSL_ACCEL_CAP:   return p.accelCap;
+        case DSL_TDOWN_DELAY: return static_cast<float>(p.touchDownDelayMs);
+        case DSL_TUP_DELAY:   return static_cast<float>(p.touchUpDelayMs);
+        case DSL_SCROLL_STEP: return static_cast<float>(p.cursorScrollStepPx);
+        case DSL_WALK_RADIUS: return p.joyWalkRadius;
+        case DSL_FIRE_BOX_W:  return p.fireBoxHalfW;
+        case DSL_NODE_DUR:
+            if (selectedBtnIndex >= 0 && selectedBtnIndex < static_cast<int>(p.buttons.size())) {
+                return static_cast<float>(p.buttons[selectedBtnIndex].durationMs);
+            }
+            return 35.0f;
+        default: return 0.0f;
+    }
+}
+
 bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& settings,
                               int& selectedBtnIndex, DrawerActionResult& out) {
     if (!containsPoint(x, y)) {
@@ -1221,13 +1370,19 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
     for (size_t i = 0; i < hotspots_.size(); ++i) {
         const Hotspot& hs = hotspots_[i];
         if (!ptIn(hs.rc, x, y)) continue;
-
         clearFocus();
-        if (hs.id != DA_INSP_REBIND && hs.id != DA_ADD_NODE) {
-            out.cancelRebind = true;
-        }
+        return activateHotspot(hs, profile, settings, selectedBtnIndex, out);
+    }
+    return true;
+}
 
-        switch (hs.id) {
+bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettings& settings,
+                                  int& selectedBtnIndex, DrawerActionResult& out) {
+    if (hs.id != DA_INSP_REBIND && hs.id != DA_ADD_NODE) {
+        out.cancelRebind = true;
+    }
+
+    switch (hs.id) {
             case DA_TAB_0: case DA_TAB_1: case DA_TAB_2: case DA_TAB_3:
                 setActiveTab(hs.id - DA_TAB_0);
                 return true;
@@ -1511,6 +1666,9 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 out.settingsModified = true;
                 out.toastMessage = settings.rightClickBack ? "Cursor Right-Click = Back: ON" : "Cursor Right-Click = Back: OFF";
                 return true;
+            case DA_TOGGLE_DEV_ADVANCED:
+                devAdvancedExpanded_ = !devAdvancedExpanded_;
+                return true;
             case DA_APPLY_RECONNECT:   out.requestReconnectStream = true; return true;
             case DA_DISCONNECT:        out.requestDisconnectDevice = true; return true;
             case DA_RUN_LATENCY_PROBE: out.requestRunLatencyProbe = true; return true;
@@ -1524,7 +1682,6 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 return true;
             default:
                 break;
-        }
     }
     return true;
 }
@@ -1616,6 +1773,65 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
             }
         }
         return true;
+    }
+    // U7: Keyboard accessibility (Tab / Shift+Tab focus cycle, Left/Right adjust, Space/Enter activate)
+    if (vk == VK_TAB && !focusables_.empty()) {
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        int n = static_cast<int>(focusables_.size());
+        if (focusedIdx_ < 0 || focusedIdx_ >= n) {
+            focusedIdx_ = shift ? (n - 1) : 0;
+        } else {
+            focusedIdx_ = (focusedIdx_ + (shift ? (n - 1) : 1)) % n;
+        }
+        return true;
+    }
+    if (focusedIdx_ >= 0 && focusedIdx_ < static_cast<int>(focusables_.size())) {
+        const FocusableItem& fi = focusables_[focusedIdx_];
+        if (vk == VK_ESCAPE) {
+            focusedIdx_ = -1;
+            return true;
+        }
+        if ((vk == VK_SPACE || vk == VK_RETURN) && !fi.isSlider) {
+            Hotspot hs = { fi.rc, fi.id, fi.extra };
+            int sel = selectedBtnIndex;
+            return activateHotspot(hs, profile, settings, sel, out);
+        }
+        if (vk == VK_LEFT || vk == VK_RIGHT) {
+            int dir = (vk == VK_RIGHT) ? 1 : -1;
+            if (fi.isSlider) {
+                float span = fi.maxVal - fi.minVal;
+                float cur = currentSliderValue(fi.id, profile, selectedBtnIndex);
+                float norm = (span > 0.0f) ? clampf((cur - fi.minVal) / span, 0.0f, 1.0f) : 0.0f;
+                applySliderValue(fi.id, clampf(norm + dir * 0.05f, 0.0f, 1.0f), profile, selectedBtnIndex);
+                if (fi.id == DSL_NODE_DUR) out.profileModified = true;
+                else                       out.tuningOnlyModified = true;
+                return true;
+            }
+            auto segGroup = [](int id) -> int {
+                if (id >= DA_TAB_0 && id <= DA_TAB_3) return 1;
+                if (id == DA_FIRE_CLAW || id == DA_FIRE_DRAG || id == DA_FIRE_DUAL) return 2;
+                if (id == DA_BOUNDS_UNBOUNDED || id == DA_BOUNDS_BOXED) return 3;
+                if (id >= DA_POLL_125 && id <= DA_POLL_MAX) return 4;
+                if (id == DA_JOY_GLIDE || id == DA_JOY_FAST) return 5;
+                if (id == DA_STREAM_PRESET || id == DA_STREAM_FPS || id == DA_STREAM_BITRATE ||
+                    id == DA_STREAM_MAXSIZE || id == DA_CODEC_OPTS || id == DA_VD_PRESET ||
+                    id == DA_AUDIO_BUFFER || id == DA_INSP_MOUSE_VK) {
+                    return 100 + id;
+                }
+                return 0;
+            };
+            int grp = segGroup(fi.id);
+            if (grp != 0) {
+                int nxt = focusedIdx_ + dir;
+                if (nxt >= 0 && nxt < static_cast<int>(focusables_.size()) &&
+                    !focusables_[nxt].isSlider && segGroup(focusables_[nxt].id) == grp) {
+                    focusedIdx_ = nxt;
+                    Hotspot hs = { focusables_[nxt].rc, focusables_[nxt].id, focusables_[nxt].extra };
+                    int sel = selectedBtnIndex;
+                    return activateHotspot(hs, profile, settings, sel, out);
+                }
+            }
+        }
     }
     return false;
 }

@@ -81,6 +81,7 @@ public:
     void showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs = 6000);
     bool checkToastExpired();
     bool hitTestToastAction(int vx, int vy) const;
+    void setModePulse(float alpha, bool aim);
 
     // Forwarded from ShellWindow / ViewportHost (coords relative to video rect top-left)
     bool handleKeyDown(int vk);
@@ -174,4 +175,6 @@ private:
     bool embeddedD3DMode_ = false;
     HudBitmapReadyFn d3dBitmapCb_ = nullptr;
     void* d3dBitmapCtx_ = nullptr;
+    float modePulseAlpha_ = 0.0f;
+    bool modePulseAim_ = false;
 };

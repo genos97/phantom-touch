@@ -19,21 +19,33 @@ enum TopBarAction {
     TB_CLOSE
 };
 
+enum TopBarConnState {
+    TB_CONN_IDLE = 0,
+    TB_CONN_CONNECTED,
+    TB_CONN_RECONNECTING,
+    TB_CONN_LOST,
+    TB_CONN_DEMO
+};
+
 class TopBar {
 public:
     void layout(const RECT& bounds,
                 const std::string& deviceLabel, bool connected, bool demoMode,
                 const Profile& profile, const EngineTelemetry& tel,
-                const TelemetrySummary& videoTel = TelemetrySummary());
+                const TelemetrySummary& videoTel = TelemetrySummary(),
+                TopBarConnState connState = TB_CONN_IDLE);
 
     void paint(Gdiplus::Graphics& g, const RECT& bounds,
                const std::string& deviceLabel, bool connected, bool demoMode,
                const Profile& profile, const EngineTelemetry& tel,
                bool alwaysOnTop, bool maximized, int hoverX, int hoverY,
-               const TelemetrySummary& videoTel = TelemetrySummary());
+               const TelemetrySummary& videoTel = TelemetrySummary(),
+               TopBarConnState connState = TB_CONN_IDLE);
 
     TopBarAction hitTest(int x, int y) const;
     bool hoverItemAt(int x, int y, int& outId, RECT& outRc) const;
+    std::string tooltipAt(int x, int y) const;
+    RECT profilePillRect() const { return rProf_; }
     RECT maximizeButtonRect() const { return maxBtnRc_; }
     bool isInteractivePoint(int x, int y) const { return hitTest(x, y) != TB_NONE; }
 

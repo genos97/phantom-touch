@@ -119,7 +119,9 @@ struct GdiFontCache {
                         g.FillPath(&fillBr, &path);
 
                         Gdiplus::SolidBrush br(Gdiplus::Color(255, 255, 255, 255));
-                        static const float kWarmTextSizes[] = { 10.5f, 11.5f, 12.5f, 17.5f };
+                        static const float kWarmTextSizes[] = {
+                            9.5f, 10.5f, 11.0f, 11.5f, 12.0f, 12.5f, 13.0f, 14.0f, 17.5f
+                        };
                         for (size_t i = 0; i < sizeof(kWarmTextSizes) / sizeof(kWarmTextSizes[0]); ++i) {
                             const float sz = kWarmTextSizes[i] * scale;
                             Gdiplus::Font* reg = getOrCreateFontLocked(sz, false);
@@ -443,7 +445,8 @@ void GdiPlusDraw::drawSlider(Gdiplus::Graphics& g, const RECT& trackRc, float no
 
 void GdiPlusDraw::drawIcon(Gdiplus::Graphics& g, UiIcon icon, float cx, float cy, float sz, uint32_t colorArgb) {
     float r = sz * 0.5f;
-    Gdiplus::Pen pen(argb(colorArgb), 1.75f);
+    float sw = dpf(1.5f);
+    Gdiplus::Pen pen(argb(colorArgb), sw);
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
     pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -648,6 +651,87 @@ void GdiPlusDraw::drawIcon(Gdiplus::Graphics& g, UiIcon icon, float cx, float cy
                 Gdiplus::PointF(cx - r * 0.45f, cy + r * 0.72f)
             };
             g.FillPolygon(&br, tri, 3);
+            break;
+        }
+        case ICON_GAMEPAD: {
+            strokeRoundedRect(g, cx - r * 0.92f, cy - r * 0.48f, r * 1.84f, r * 0.96f, r * 0.42f, colorArgb, sw);
+            g.DrawLine(&pen, cx - r * 0.58f, cy, cx - r * 0.24f, cy);
+            g.DrawLine(&pen, cx - r * 0.41f, cy - r * 0.17f, cx - r * 0.41f, cy + r * 0.17f);
+            g.FillEllipse(&br, cx + r * 0.25f - 1.5f, cy - r * 0.18f - 1.5f, 3.0f, 3.0f);
+            g.FillEllipse(&br, cx + r * 0.50f - 1.5f, cy + r * 0.12f - 1.5f, 3.0f, 3.0f);
+            break;
+        }
+        case ICON_CAST: {
+            strokeRoundedRect(g, cx - r * 0.90f, cy - r * 0.68f, r * 1.80f, r * 1.36f, r * 0.18f, colorArgb, sw);
+            g.FillEllipse(&br, cx - r * 0.68f, cy + r * 0.28f, 3.0f, 3.0f);
+            Gdiplus::GraphicsPath arc1, arc2;
+            arc1.AddArc(cx - r * 0.85f, cy + r * 0.05f, r * 0.75f, r * 0.75f, 270.0f, 90.0f);
+            arc2.AddArc(cx - r * 1.05f, cy - r * 0.20f, r * 1.25f, r * 1.25f, 270.0f, 90.0f);
+            g.DrawPath(&pen, &arc1);
+            g.DrawPath(&pen, &arc2);
+            break;
+        }
+        case ICON_RECORD: {
+            float orad = r * 0.80f;
+            float irad = r * 0.38f;
+            g.DrawEllipse(&pen, cx - orad, cy - orad, orad * 2.0f, orad * 2.0f);
+            g.FillEllipse(&br, cx - irad, cy - irad, irad * 2.0f, irad * 2.0f);
+            break;
+        }
+        case ICON_FOLDER: {
+            Gdiplus::PointF pts[6] = {
+                Gdiplus::PointF(cx - r * 0.88f, cy + r * 0.62f),
+                Gdiplus::PointF(cx - r * 0.88f, cy - r * 0.62f),
+                Gdiplus::PointF(cx - r * 0.22f, cy - r * 0.62f),
+                Gdiplus::PointF(cx - r * 0.02f, cy - r * 0.36f),
+                Gdiplus::PointF(cx + r * 0.88f, cy - r * 0.36f),
+                Gdiplus::PointF(cx + r * 0.88f, cy + r * 0.62f)
+            };
+            g.DrawPolygon(&pen, pts, 6);
+            break;
+        }
+        case ICON_LANGUAGE: {
+            float gr = r * 0.80f;
+            g.DrawEllipse(&pen, cx - gr, cy - gr, gr * 2.0f, gr * 2.0f);
+            g.DrawEllipse(&pen, cx - gr * 0.44f, cy - gr, gr * 0.88f, gr * 2.0f);
+            g.DrawLine(&pen, cx - gr, cy, cx + gr, cy);
+            break;
+        }
+        case ICON_SHIELD: {
+            Gdiplus::PointF pts[5] = {
+                Gdiplus::PointF(cx, cy - r * 0.88f),
+                Gdiplus::PointF(cx + r * 0.76f, cy - r * 0.56f),
+                Gdiplus::PointF(cx + r * 0.64f, cy + r * 0.32f),
+                Gdiplus::PointF(cx, cy + r * 0.88f),
+                Gdiplus::PointF(cx - r * 0.64f, cy + r * 0.32f)
+            };
+            Gdiplus::PointF ptsFull[6] = {
+                pts[0], pts[1], pts[2], pts[3], pts[4],
+                Gdiplus::PointF(cx - r * 0.76f, cy - r * 0.56f)
+            };
+            g.DrawPolygon(&pen, ptsFull, 6);
+            g.DrawLine(&pen, cx - r * 0.26f, cy + r * 0.04f, cx - r * 0.04f, cy + r * 0.26f);
+            g.DrawLine(&pen, cx - r * 0.04f, cy + r * 0.26f, cx + r * 0.32f, cy - r * 0.16f);
+            break;
+        }
+        case ICON_QR: {
+            float q = r * 0.36f;
+            g.DrawRectangle(&pen, cx - r * 0.78f, cy - r * 0.78f, q, q);
+            g.DrawRectangle(&pen, cx + r * 0.42f, cy - r * 0.78f, q, q);
+            g.DrawRectangle(&pen, cx - r * 0.78f, cy + r * 0.42f, q, q);
+            g.FillRectangle(&br, cx + r * 0.16f, cy + r * 0.16f, r * 0.28f, r * 0.28f);
+            g.FillRectangle(&br, cx + r * 0.52f, cy + r * 0.52f, r * 0.28f, r * 0.28f);
+            break;
+        }
+        case ICON_APPS: {
+            float b = r * 0.34f;
+            float xs[2] = { cx - r * 0.56f, cx + r * 0.18f };
+            float ys[2] = { cy - r * 0.56f, cy + r * 0.18f };
+            for (int ry = 0; ry < 2; ++ry) {
+                for (int rx = 0; rx < 2; ++rx) {
+                    strokeRoundedRect(g, xs[rx], ys[ry], b, b, 1.5f, colorArgb, sw);
+                }
+            }
             break;
         }
         default:

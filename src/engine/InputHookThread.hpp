@@ -42,7 +42,9 @@ enum ShellAppMsg {
     MSG_PROBE_UPDATE       = WM_APP + 30,
     MSG_THERMAL_UPDATE     = WM_APP + 31,
     MSG_CONNECT_STEP       = WM_APP + 32,
-    MSG_REPAIR_TOOLS_DONE  = WM_APP + 33
+    MSG_REPAIR_TOOLS_DONE  = WM_APP + 33,
+    MSG_TOGGLE_CMD_PALETTE = WM_APP + 34,
+    MSG_TOGGLE_CHEAT_SHEET = WM_APP + 35
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread
@@ -60,6 +62,7 @@ struct InputHookSnapshot {
     bool editMode = false;
     bool nativeVideoActive = false;
     bool uiCapturingText = false;
+    bool popupOpen = false;
     bool waitingSpecialRebind = false;
     bool keymapEnabled = false;
     bool rightClickBack = true;

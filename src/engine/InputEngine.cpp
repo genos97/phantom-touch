@@ -79,6 +79,7 @@ InputEngine::InputEngine(ScrcpyBridge* bridge)
     hiResTimer_ = createHighResTimer();
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
+    std::memset(buttonGlowUntilTick_, 0, sizeof(buttonGlowUntilTick_));
 
     rawProfile_ = ProfileDefaults::createFreeFire();
     profile_ = rawProfile_;
@@ -760,6 +761,19 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs, bool fr
     actions_.dispatchKey(vk, down, (isAim || fromGamepad), profile_, heldKeys_, w, h, nowMs,
                          scopeSensActive_, eff, packetsThisSec_);
 
+    if (down) {
+        DWORD glowEnd = GetTickCount() + 120u;
+        for (size_t i = 0; i < profile_.buttons.size() && i < 64; ++i) {
+            const KeyNode& b = profile_.buttons[i];
+            bool keyMatches = KeyCodes::matches(vk, b.vk) &&
+                              (b.comboVk == 0 || KeyCodes::isKeyHeld(heldKeys_, b.comboVk));
+            if (!keyMatches) continue;
+            if (!isAim && !fromGamepad && b.action == NODE_HOLD_VIEW) continue;
+            if (!isAim && !fromGamepad && KeyCodes::isMouseKey(b.vk) && b.action != NODE_CURSOR_TOGGLE) continue;
+            buttonGlowUntilTick_[i] = glowEnd;
+        }
+    }
+
     if (eff.pushHoldView && eff.holdViewIdx >= 0 &&
         eff.holdViewIdx < static_cast<int>(profile_.buttons.size())) {
         const KeyNode& b = profile_.buttons[eff.holdViewIdx];
@@ -869,6 +883,7 @@ void InputEngine::releaseAllLocked() {
     joyOwner_ = JOY_NONE;
     prevGpStickDeflected_ = false;
     std::memset(heldKeys_, 0, sizeof(heldKeys_));
+    std::memset(buttonGlowUntilTick_, 0, sizeof(buttonGlowUntilTick_));
     actions_.releaseButtons(profile_, false, packetsThisSec_);
     // Final bounded-pool safety sweep: guarantees 0 active touches left on the phone
     fingerPool_.releaseAll();
@@ -1251,6 +1266,14 @@ EngineTelemetry InputEngine::getTelemetry() const {
         t.joyFingerNormY = profile_.joyY;
     }
     t.touchRateHz = lastPacketsPerSec_;
+    uint64_t glowMask = 0;
+    DWORD nowTick = GetTickCount();
+    for (size_t i = 0; i < profile_.buttons.size() && i < 64; ++i) {
+        if (buttonGlowUntilTick_[i] != 0 && static_cast<LONG>(nowTick - buttonGlowUntilTick_[i]) < 0) {
+            glowMask |= (1ULL << i);
+        }
+    }
+    t.activeButtonMask = glowMask;
     LeaveCriticalSection(&lock_);
     return t;
 }

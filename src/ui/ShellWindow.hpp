@@ -6,9 +6,11 @@
 #include "config/Profile.hpp"
 #include "engine/InputEngine.hpp"
 #include "engine/InputHookThread.hpp"
+#include "ui/Animator.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/HudOverlay.hpp"
 #include "ui/OnboardingView.hpp"
+#include "ui/OverlayPopups.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
@@ -26,7 +28,7 @@
 //   - Owned HudOverlay pinned strictly over the active phone video rect
 //   - Raw Mouse Input (WM_INPUT) + non-blocking WH_MOUSE_LL / WH_KEYBOARD_LL hooks
 //   - Fullscreen gaming (F11), Android nav controls, screenshots, Wireless ADB, atomic auto-save
-class ShellWindow : public IHudOverlayHost {
+class ShellWindow : public IHudOverlayHost, public IOverlayPopupHost {
 public:
     ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
                 const std::string& exeDir, const std::string& profilesDir,
@@ -62,6 +64,12 @@ public:
     void hudOnRequestCloseEdit() override;
     void hudOnMouseBindToDrawer(int mouseVk) override;
     void hudOnToast(const std::string& msg, DWORD durationMs) override;
+
+    // IOverlayPopupHost implementation (X5 Command Palette, X6 Cheat Sheet, X7 Profile Dropdown)
+    void onPopupPaint(Gdiplus::Graphics& g, int w, int h) override;
+    void onPopupClick(int x, int y) override;
+    void onPopupHover(int x, int y) override;
+    void onPopupWheel(int delta) override;
 
 private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -126,6 +134,9 @@ private:
 
     void handleForegroundAppChanged(const std::string& pkg);
     bool switchProfilePath(const std::string& targetPath, bool showAutoToast);
+    void recheckAutoSwitchForCurrentApp();
+    void recordRecentProfile(const std::string& path);
+    void rebuildProfileMenuItems();
     std::string ensureDesktopProfileExists();
     bool handleDesktopKeyEvent(int vk, bool down);
     bool handleDesktopChar(wchar_t ch);
@@ -140,10 +151,18 @@ private:
     void toggleFireMode();
     void toggleHud();
     void triggerQuickReset();
-    void showToast(const std::string& msg, DWORD durationMs = 2200);
-    void showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs = 6000);
+    void showToast(const std::string& msg, DWORD durationMs = 2200, int toastKind = TOAST_INFO);
+    void showSnackbar(const std::string& msg, const std::string& actionLabel, DWORD durationMs = 6000, int toastKind = TOAST_INFO);
     bool triggerShellUndo();
     RECT shellToastRect() const;
+    void syncAnimTimer();
+    void updateTooltipAtPoint(int mx, int my);
+    void initCommandPalette();
+    void openPopup(int mode);
+    void closePopup();
+    void executeCommandById(const std::string& cmdId);
+    void handlePopupKeyDown(int vk);
+    void handlePopupChar(wchar_t ch);
 
     void applyProfileToEngine(bool autoSaveNow = true);
     bool saveCurrentProfile(bool silent = false);
@@ -154,6 +173,7 @@ private:
 
     bool isAppForeground() const;
     bool isPointInVideoScreen(POINT screenPt, float& outNormX, float& outNormY) const;
+    bool ensurePaintCache(HDC refDc, int w, int h);
     void onPaint(HDC hdc, const RECT& dirtyRc);
     void invalidateShell();
 
@@ -346,12 +366,15 @@ private:
         int aimQx = -1;
         int aimQy = -1;
         uint32_t fsRate = 0;
+        uint64_t activeBtnMask = 0;
     };
     HudVisualSig lastHudSig_;
 
     struct TopBarVisualSig {
         bool valid = false;
         bool connected = false;
+        bool reconnecting = false;
+        bool connLost = false;
         bool aimMode = false;
         bool keymapEnabled = false;
         int fireMode = 0;
@@ -373,13 +396,39 @@ private:
     RECT lastHoverRc_ = { 0, 0, 0, 0 };
     std::string shellToastMsg_;
     std::string shellToastActionLabel_;
+    int shellToastKind_ = TOAST_INFO;
     RECT shellToastActionRc_ = {0, 0, 0, 0};
     DWORD shellToastExpireTick_ = 0;
     bool shellToastWasVisible_ = false;
-    enum PendingUndoKind { UNDO_NONE = 0, UNDO_HUD_EDIT, UNDO_TRASH_PROFILE };
+    enum PendingUndoKind { UNDO_NONE = 0, UNDO_HUD_EDIT, UNDO_TRASH_PROFILE, UNDO_STAY_FOR_APP };
     PendingUndoKind pendingUndoKind_ = UNDO_NONE;
     std::string undoTrashPath_;
     std::string undoTrashOrigPath_;
+
+    // U4 / U6 / X5 / X6 / X7 Floating Overlays & Motion System
+    enum ActivePopupMode {
+        POPUP_NONE = 0,
+        POPUP_CMD_PALETTE,
+        POPUP_CHEAT_SHEET,
+        POPUP_PROFILE_DROPDOWN
+    };
+    Animator animator_;
+    bool animTimerActive_ = false;
+    LayeredTooltipWindow tooltipPopup_;
+    LayeredModalPopup modalPopup_;
+    ActivePopupMode activePopup_ = POPUP_NONE;
+    CommandPaletteModel cmdPalette_;
+    std::vector<CommandEntry> baseCommands_;
+    std::string popupQuery_;
+    std::vector<int> popupFiltered_;
+    int popupSelectedRow_ = 0;
+    int popupHoverRow_ = -1;
+    std::vector<RECT> popupRowRects_;
+    RECT popupManageProfilesRc_ = { 0, 0, 0, 0 };
+    CheatSheetData cheatSheetData_;
+    std::vector<ProfileMenuItem> profileMenuItems_;
+    std::vector<std::string> recentProfilePaths_;
+    std::string manualSwitchedAppPkg_;
 
     // F1 / F3 / X2 / F16 Connection Manager, Onboarding & Pending-Stream State
     bool showOnboarding_ = false;

@@ -55,6 +55,8 @@ if %ERRORLEVEL% NEQ 0 (
     src\engine\InputHookThread.cpp ^
     src\engine\InputEngine.cpp ^
     src\ui\GdiPlusDraw.cpp ^
+    src\ui\Animator.cpp ^
+    src\ui\OverlayPopups.cpp ^
     src\ui\EditorState.cpp ^
     src\ui\HudRenderer.cpp ^
     src\ui\TopBar.cpp ^

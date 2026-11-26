@@ -1,5 +1,6 @@
 #include "ui/HudOverlay.hpp"
 #include "config/KeyCodes.hpp"
+#include "ui/Theme.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -321,6 +322,14 @@ bool HudOverlay::hitTestToastAction(int vx, int vy) const {
             vy >= toastActionRc_.top && vy < toastActionRc_.bottom);
 }
 
+void HudOverlay::setModePulse(float alpha, bool aim) {
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    modePulseAlpha_ = alpha;
+    modePulseAim_ = aim;
+    renderLayered();
+}
+
 bool HudOverlay::checkToastExpired() {
     bool active = (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0);
     bool expired = (toastWasVisible_ && !active);
@@ -399,10 +408,18 @@ void HudOverlay::renderLayered() {
             HudEditExtras ex;
             ex.conflicts = &playConflicts;
             ex.skipDynamicDots = embeddedD3DMode_;
+            ex.modePulseAlpha = modePulseAlpha_;
+            ex.modePulseAim = modePulseAim_;
 
             if (p.keymapEnabled && (p.showHudInPlay || demoMode)) {
                 HudRenderer::paintKeymapNodes(g, w, h, p, tel, false, demoMode,
                                               -1, -1, false, false, p.hudOpacity, &ex);
+            }
+            if (!embeddedD3DMode_ && modePulseAlpha_ > 0.01f) {
+                uint8_t pa = static_cast<uint8_t>(modePulseAlpha_ * 220.0f);
+                uint32_t col = (static_cast<uint32_t>(pa) << 24) |
+                    ((modePulseAim_ ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER) & 0x00FFFFFFu);
+                GdiPlusDraw::fillRoundedRect(g, 0.0f, 0.0f, static_cast<float>(w), 4.0f, 2.0f, col);
             }
             if (p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) {
                 HudRenderer::paintCrosshairDot(g, w, h);

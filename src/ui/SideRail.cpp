@@ -26,18 +26,21 @@ void SideRail::layout(const RECT& bounds, const SideRailState& st) {
         bool enabled;
     };
 
-    RailSpec topItems[] = {
+    RailSpec playItems[] = {
         { SR_AIM_TOGGLE,      ICON_AIM,        "AIM",  "Aim Lock (~ / F1)",              st.aimMode, Theme::ACCENT_GREEN, true },
-        { SR_DRAWER_KEYS,     ICON_KEYMAP,     "KEYS", "Keymap Studio (F2)",             st.drawerOpen && st.activeDrawerTab == 0, Theme::ACCENT_CYAN, true },
-        { SR_DRAWER_SENS,     ICON_SENS,       "SENS", "Sensitivity & Aim Physics",      st.drawerOpen && st.activeDrawerTab == 1, Theme::ACCENT_CYAN, true },
-        { SR_DRAWER_PROFILES, ICON_PROFILES,   "CFG",  "Saved Profiles",                 st.drawerOpen && st.activeDrawerTab == 2, Theme::ACCENT_CYAN, true },
         { SR_HUD_TOGGLE,      ICON_HUD,        "HUD",  "Show / Hide Key Badges (F4)",    st.showHud, Theme::ACCENT_CYAN, true },
         { SR_FIRE_CYCLE,      ICON_FIRE,       "FIRE", "Cycle Fire Mode (F3)",           false, Theme::ACCENT_AMBER, true },
         { SR_RESET_TOUCH,     ICON_RESET,      "RST",  "Anti-Stuck Touch Reset (F5)",    false, Theme::ACCENT_AMBER, true },
         { SR_FULLSCREEN,      ICON_FULLSCREEN, "FULL", "Fullscreen Gaming (F11)",        st.fullscreen, Theme::ACCENT_CYAN, true }
     };
 
-    RailSpec botItems[] = {
+    RailSpec studioItems[] = {
+        { SR_DRAWER_KEYS,     ICON_KEYMAP,     "KEYS", "Keymap Studio (F2)",             st.drawerOpen && st.activeDrawerTab == 0, Theme::ACCENT_CYAN, true },
+        { SR_DRAWER_SENS,     ICON_SENS,       "SENS", "Sensitivity & Aim Physics",      st.drawerOpen && st.activeDrawerTab == 1, Theme::ACCENT_CYAN, true },
+        { SR_DRAWER_PROFILES, ICON_PROFILES,   "CFG",  "Saved Profiles (Ctrl+K)",        st.drawerOpen && st.activeDrawerTab == 2, Theme::ACCENT_CYAN, true }
+    };
+
+    RailSpec devItems[] = {
         { SR_ANDROID_BACK,    ICON_BACK,       "BACK", "Android Back",                   false, Theme::ACCENT_CYAN, st.connected },
         { SR_ANDROID_HOME,    ICON_HOME,       "HOME", "Android Home",                   false, Theme::ACCENT_CYAN, st.connected },
         { SR_ANDROID_RECENTS, ICON_RECENTS,    "APPS", "Android Recents",                false, Theme::ACCENT_CYAN, st.connected },
@@ -48,35 +51,46 @@ void SideRail::layout(const RECT& bounds, const SideRailState& st) {
     };
 
     const int totalH = bounds.bottom - bounds.top;
-    const int nTop = 8;
-    const int nBot = 7;
-    int btnH = (totalH >= dp(680)) ? dp(40) : dp(34);
-    int gap  = (totalH >= dp(680)) ? dp(3)  : dp(2);
-    if ((nTop + nBot) * (btnH + gap) + dp(22) > totalH) {
-        btnH = (totalH - dp(22)) / (nTop + nBot) - 1;
-        if (btnH < dp(26)) btnH = dp(26);
+    const int nPlay = 5;
+    const int nStudio = 3;
+    const int nDev = 7;
+    const int totalItems = nPlay + nStudio + nDev;
+    int btnH = (totalH >= dp(700)) ? dp(39) : dp(33);
+    int gap  = (totalH >= dp(700)) ? dp(3)  : dp(2);
+    if (totalItems * (btnH + gap) + dp(32) > totalH) {
+        btnH = (totalH - dp(32)) / totalItems - 1;
+        if (btnH < dp(24)) btnH = dp(24);
         gap = 1;
     }
 
     int y = bounds.top + dp(6);
-    for (int i = 0; i < nTop; ++i) {
+    for (int i = 0; i < nPlay; ++i) {
         RECT r = { bounds.left + dp(5), y, bounds.right - dp(5), y + btnH };
-        items_.push_back(Item{ r, topItems[i].act, topItems[i].icon, topItems[i].label,
-                               topItems[i].tip, topItems[i].active, topItems[i].activeCol, topItems[i].enabled });
+        items_.push_back(Item{ r, playItems[i].act, playItems[i].icon, playItems[i].label,
+                               playItems[i].tip, playItems[i].active, playItems[i].activeCol, playItems[i].enabled });
         y += btnH + gap;
     }
 
-    int botBlockH = nBot * (btnH + gap) + dp(6);
+    sepPlayY_ = y + dp(4);
+    y += dp(9);
+    for (int i = 0; i < nStudio; ++i) {
+        RECT r = { bounds.left + dp(5), y, bounds.right - dp(5), y + btnH };
+        items_.push_back(Item{ r, studioItems[i].act, studioItems[i].icon, studioItems[i].label,
+                               studioItems[i].tip, studioItems[i].active, studioItems[i].activeCol, studioItems[i].enabled });
+        y += btnH + gap;
+    }
+
+    int botBlockH = nDev * (btnH + gap) + dp(6);
     int botStartY = bounds.bottom - botBlockH;
     if (botStartY < y + dp(10)) botStartY = y + dp(10);
-    sepY_ = botStartY - dp(6);
+    sepDevY_ = botStartY - dp(5);
 
     int by = botStartY;
-    for (int i = 0; i < nBot; ++i) {
+    for (int i = 0; i < nDev; ++i) {
         if (by + btnH > bounds.bottom - 2) break;
         RECT r = { bounds.left + dp(5), by, bounds.right - dp(5), by + btnH };
-        items_.push_back(Item{ r, botItems[i].act, botItems[i].icon, botItems[i].label,
-                               botItems[i].tip, botItems[i].active, botItems[i].activeCol, botItems[i].enabled });
+        items_.push_back(Item{ r, devItems[i].act, devItems[i].icon, devItems[i].label,
+                               devItems[i].tip, devItems[i].active, devItems[i].activeCol, devItems[i].enabled });
         by += btnH + gap;
     }
 }
@@ -87,7 +101,8 @@ void SideRail::paint(Gdiplus::Graphics& g, const RECT& bounds,
 
     GdiPlusDraw::fillRect(g, bounds, Theme::BG_SHELL);
     GdiPlusDraw::vLine(g, bounds.left, bounds.top, bounds.bottom, Theme::BORDER_CHROME);
-    GdiPlusDraw::hLine(g, bounds.left + dp(10), bounds.right - dp(10), sepY_, Theme::BORDER_SUBTLE);
+    GdiPlusDraw::hLine(g, bounds.left + dp(10), bounds.right - dp(10), sepPlayY_, Theme::BORDER_SUBTLE);
+    GdiPlusDraw::hLine(g, bounds.left + dp(10), bounds.right - dp(10), sepDevY_, Theme::BORDER_SUBTLE);
 
     for (size_t i = 0; i < items_.size(); ++i) {
         const Item& sp = items_[i];
@@ -134,6 +149,16 @@ bool SideRail::hoverItemAt(int x, int y, int& outId, RECT& outRc) const {
     for (size_t i = 0; i < items_.size(); ++i) {
         if (items_[i].enabled && ptIn(items_[i].rc, x, y)) {
             outId = static_cast<int>(items_[i].action);
+            outRc = items_[i].rc;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SideRail::itemRectAt(int x, int y, RECT& outRc) const {
+    for (size_t i = 0; i < items_.size(); ++i) {
+        if (items_[i].enabled && ptIn(items_[i].rc, x, y)) {
             outRc = items_[i].rc;
             return true;
         }

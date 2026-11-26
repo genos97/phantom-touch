@@ -98,6 +98,7 @@ enum DrawerActionId {
     DA_TOGGLE_STAY_AWAKE,
     DA_TOGGLE_AUTO_SWITCH,
     DA_TOGGLE_RCLICK_BACK,
+    DA_TOGGLE_DEV_ADVANCED,
     DA_APPLY_RECONNECT,
     DA_DISCONNECT,
     DA_RUN_LATENCY_PROBE,
@@ -170,7 +171,11 @@ public:
         activeEncoder_ = activeEncoder;
         deviceEncoders_ = encoders;
     }
-    void setPendingStreamChanges(bool pending) { pendingStreamChanges_ = pending; }
+    void setPendingStreamChanges(bool pending) { setPendingStreamChangeCount(pending ? 1 : 0); }
+    void setPendingStreamChangeCount(int count) {
+        pendingStreamChangeCount_ = (count < 0) ? 0 : count;
+        pendingStreamChanges_ = (pendingStreamChangeCount_ > 0);
+    }
     void setEditTestLive(bool live) { editTestLive_ = live; }
 
     bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_ || editingPaletteSearch_; }
@@ -180,12 +185,15 @@ public:
     std::string specialRebindLabel() const;
     bool isDraggingSlider() const { return activeSliderId_ != 0; }
     bool isAdvancedExpanded() const { return advancedExpanded_; }
+    bool hasKeyboardFocus() const { return focusedIdx_ >= 0; }
+    int focusedIndex() const { return focusedIdx_; }
 
     void clearFocus() {
         editingNewProfileName_ = false;
         editingNodeLabel_ = false;
         editingWireless_ = false;
         editingPaletteSearch_ = false;
+        focusedIdx_ = -1;
         specialRebind_ = SRB_NONE;
     }
 
@@ -196,7 +204,8 @@ public:
                bool connected, const std::string& deviceLabel,
                const std::string& foregroundPkg,
                const std::vector<std::string>& logs,
-               int hoverX, int hoverY);
+               int hoverX, int hoverY,
+               int slideOffsetX = 0);
 
     bool containsPoint(int x, int y) const;
     bool hoverItemAt(int x, int y, int& outId, RECT& outRc) const;
@@ -227,6 +236,25 @@ private:
         float minVal;
         float maxVal;
     };
+
+    struct FocusableItem {
+        RECT rc;
+        bool isSlider;
+        bool inBody;
+        int id;
+        int extra;
+        float minVal;
+        float maxVal;
+
+        FocusableItem()
+            : isSlider(false), inBody(false), id(0), extra(0), minVal(0.0f), maxVal(1.0f) {
+            ZeroMemory(&rc, sizeof(rc));
+        }
+    };
+
+    bool activateHotspot(const Hotspot& hs, Profile& profile, AppSettings& settings,
+                         int& selectedBtnIndex, DrawerActionResult& out);
+    float currentSliderValue(int sliderId, const Profile& p, int selectedBtnIndex) const;
 
     struct ProfileEntry {
         std::string path;
@@ -263,6 +291,8 @@ private:
 
     std::vector<Hotspot> hotspots_;
     std::vector<SliderHit> sliders_;
+    std::vector<FocusableItem> focusables_;
+    int focusedIdx_ = -1;
 
     int activeSliderId_ = 0;
     RECT activeSliderTrack_;
@@ -292,7 +322,9 @@ private:
     bool editTestLive_ = false;
     std::string paletteSearch_;
     bool advancedExpanded_ = false;
+    bool devAdvancedExpanded_ = false;
     bool pendingStreamChanges_ = false;
+    int pendingStreamChangeCount_ = 0;
     SpecialRebindTarget specialRebind_ = SRB_NONE;
 
     TelemetrySummary vidTelemetry_;

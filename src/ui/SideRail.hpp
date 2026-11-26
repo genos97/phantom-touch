@@ -41,6 +41,7 @@ public:
 
     SideRailAction hitTest(int x, int y) const;
     bool hoverItemAt(int x, int y, int& outId, RECT& outRc) const;
+    bool itemRectAt(int x, int y, RECT& outRc) const;
     std::string tooltipAt(int x, int y) const;
 
 private:
@@ -55,5 +56,6 @@ private:
         bool enabled;
     };
     std::vector<Item> items_;
-    int sepY_ = 0;
+    int sepPlayY_ = 0;
+    int sepDevY_ = 0;
 };

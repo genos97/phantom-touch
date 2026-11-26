@@ -39,11 +39,14 @@ struct DynamicHudMarkers {
     float joyX;
     float joyY;
     float opacity;
+    float modePulseAlpha;
+    bool modePulseAim;
 
     DynamicHudMarkers()
         : active(false), showCrosshair(false), aimFingerDown(false),
           aimX(0.5f), aimY(0.5f), fireHeld(false), joyDown(false),
-          joyX(0.16f), joyY(0.75f), opacity(0.75f) {}
+          joyX(0.16f), joyY(0.75f), opacity(0.75f),
+          modePulseAlpha(0.0f), modePulseAim(false) {}
 };
 
 class D3D11Renderer {
