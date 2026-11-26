@@ -1,6 +1,15 @@
 #pragma once
 
+#include <map>
 #include <string>
+
+enum StreamPresetId {
+    PRESET_CUSTOM = 0,
+    PRESET_COMPETITIVE = 1,
+    PRESET_BALANCED = 2,
+    PRESET_QUALITY = 3,
+    PRESET_WIFI = 4
+};
 
 // Persists desktop emulator shell layout & scrcpy mirror stream preferences
 // in <profilesDir>\.shell_settings.cfg (independent from per-game keymap profiles).
@@ -15,7 +24,9 @@ struct AppSettings {
     // Mirror stream parameters (Uncapped default per LATENCY_PLAN V10; set 60/90/120 on Wi-Fi)
     int mirrorFps = 0;        // 0 = Uncapped, 60 / 90 / 120
     int mirrorBitrateMbps = 16; // 8 / 12 / 16 / 24
-    int mirrorMaxSize = 0;    // 0 = Native, 1600, 1280
+    int mirrorMaxSize = 0;    // 0 = Native, 1920, 1600, 1280
+    std::string videoCodecOptions; // LATENCY 2.2: comma-separated MediaCodec keys (e.g. bitrate-mode=2,max-bframes=0)
+    std::map<std::string, std::string> deviceVideoEncoders; // LATENCY 2.3: per-serial HW H.264 encoder
     bool mirrorAudio = false; // Forward device audio (scrcpy 5.0 supports native audio)
     bool turnScreenOff = false;
     bool stayAwake = true;
@@ -32,6 +43,11 @@ struct AppSettings {
     std::string lastGameProfile;    // Remembers preferred game profile across Desktop auto-switch & restarts
 
     std::string buildScrcpyArgs() const;
+    void applyStreamPreset(StreamPresetId id);
+    StreamPresetId detectStreamPreset() const;
+    static const char* streamPresetName(StreamPresetId id);
+    std::string encoderForDevice(const std::string& serial) const;
+    void setEncoderForDevice(const std::string& serial, const std::string& encoderName);
 };
 
 class AppSettingsStore {

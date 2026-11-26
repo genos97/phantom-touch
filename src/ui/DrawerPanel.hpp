@@ -54,6 +54,13 @@ public:
         probeResult_ = probe;
         presentModeLabel_ = presentMode;
     }
+    void setThermalAndEncoderInfo(const std::string& serial, const PhoneThermalInfo& thermal,
+                                  const std::string& activeEncoder, const std::vector<VideoEncoderInfo>& encoders) {
+        activeDeviceSerial_ = serial;
+        thermalInfo_ = thermal;
+        activeEncoder_ = activeEncoder;
+        deviceEncoders_ = encoders;
+    }
 
     bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_; }
     bool isWaitingSpecialRebind() const { return rebindingToggleAim_ || rebindingHoldUnlock_; }
@@ -159,4 +166,8 @@ private:
     TelemetrySummary vidTelemetry_;
     ProbeResult probeResult_;
     std::string presentModeLabel_;
+    std::string activeDeviceSerial_;
+    PhoneThermalInfo thermalInfo_;
+    std::string activeEncoder_;
+    std::vector<VideoEncoderInfo> deviceEncoders_;
 };

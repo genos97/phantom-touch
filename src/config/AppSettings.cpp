@@ -29,6 +29,18 @@ int clampInt(int v, int lo, int hi) {
     return v;
 }
 
+std::string sanitizeSafeToken(const std::string& raw, bool allowCommaEq) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size() && out.size() < 256; ++i) {
+        unsigned char uc = static_cast<unsigned char>(raw[i]);
+        bool ok = std::isalnum(uc) || uc == '_' || uc == '-' || uc == '.' || uc == ':';
+        if (allowCommaEq && (uc == ',' || uc == '=')) ok = true;
+        if (ok) out.push_back(static_cast<char>(uc));
+    }
+    return out;
+}
+
 } // namespace
 
 std::string AppSettings::buildScrcpyArgs() const {
@@ -49,10 +61,98 @@ std::string AppSettings::buildScrcpyArgs() const {
         std::snprintf(sz, sizeof(sz), " --max-size=%d", clampInt(mirrorMaxSize, 640, 4096));
         args += sz;
     }
+    std::string safeOpts = sanitizeSafeToken(videoCodecOptions, true);
+    if (!safeOpts.empty()) {
+        args += " --video-codec-options=" + safeOpts;
+    }
     if (!mirrorAudio) {
         args += " --no-audio";
     }
     return args;
+}
+
+void AppSettings::applyStreamPreset(StreamPresetId id) {
+    if (id == PRESET_COMPETITIVE) {
+        mirrorMaxSize = 1280;
+        mirrorFps = 0;
+        mirrorBitrateMbps = 16;
+        videoCodecOptions = "bitrate-mode=2,max-bframes=0";
+        vsyncEnabled = false;
+        audioBufferMs = 25;
+        audioRawCodec = true;
+    } else if (id == PRESET_BALANCED) {
+        mirrorMaxSize = 1600;
+        mirrorFps = 0;
+        mirrorBitrateMbps = 20;
+        videoCodecOptions = "max-bframes=0";
+        vsyncEnabled = false;
+        audioBufferMs = 25;
+        audioRawCodec = false;
+    } else if (id == PRESET_QUALITY) {
+        mirrorMaxSize = 0;
+        mirrorFps = 0;
+        mirrorBitrateMbps = 24;
+        videoCodecOptions = "max-bframes=0";
+        vsyncEnabled = false;
+        audioBufferMs = 30;
+        audioRawCodec = false;
+    } else if (id == PRESET_WIFI) {
+        mirrorMaxSize = 1280;
+        mirrorFps = 60;
+        mirrorBitrateMbps = 8;
+        videoCodecOptions = "intra-refresh-period=60,bitrate-mode=2,max-bframes=0";
+        vsyncEnabled = false;
+        audioBufferMs = 30;
+        audioRawCodec = false;
+    }
+}
+
+StreamPresetId AppSettings::detectStreamPreset() const {
+    if (mirrorMaxSize == 1280 && mirrorFps == 0 && mirrorBitrateMbps == 16 &&
+        videoCodecOptions == "bitrate-mode=2,max-bframes=0" && !vsyncEnabled && audioRawCodec) {
+        return PRESET_COMPETITIVE;
+    }
+    if (mirrorMaxSize == 1600 && mirrorFps == 0 && mirrorBitrateMbps == 20 &&
+        videoCodecOptions == "max-bframes=0" && !vsyncEnabled && !audioRawCodec) {
+        return PRESET_BALANCED;
+    }
+    if (mirrorMaxSize == 0 && mirrorFps == 0 && mirrorBitrateMbps == 24 &&
+        videoCodecOptions == "max-bframes=0" && !vsyncEnabled && !audioRawCodec) {
+        return PRESET_QUALITY;
+    }
+    if (mirrorMaxSize == 1280 && mirrorFps == 60 && mirrorBitrateMbps == 8 &&
+        videoCodecOptions == "intra-refresh-period=60,bitrate-mode=2,max-bframes=0" && !vsyncEnabled) {
+        return PRESET_WIFI;
+    }
+    return PRESET_CUSTOM;
+}
+
+const char* AppSettings::streamPresetName(StreamPresetId id) {
+    switch (id) {
+        case PRESET_COMPETITIVE: return "Competitive";
+        case PRESET_BALANCED:    return "Balanced";
+        case PRESET_QUALITY:     return "Quality";
+        case PRESET_WIFI:        return "Wi-Fi";
+        default:                 return "Custom";
+    }
+}
+
+std::string AppSettings::encoderForDevice(const std::string& serial) const {
+    if (serial.empty()) return "";
+    std::string key = sanitizeSafeToken(serial, false);
+    std::map<std::string, std::string>::const_iterator it = deviceVideoEncoders.find(key);
+    return (it != deviceVideoEncoders.end()) ? it->second : std::string();
+}
+
+void AppSettings::setEncoderForDevice(const std::string& serial, const std::string& encoderName) {
+    std::string key = sanitizeSafeToken(serial, false);
+    if (key.empty()) return;
+    std::string val = sanitizeSafeToken(encoderName, false);
+    if (val.empty()) {
+        deviceVideoEncoders.erase(key);
+    } else {
+        deviceVideoEncoders[key] = val;
+    }
 }
 
 bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
@@ -84,6 +184,12 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         }
         else if (k == "mirror_bitrate_mbps") s.mirrorBitrateMbps = clampInt(std::atoi(v.c_str()), 2, 64);
         else if (k == "mirror_max_size") s.mirrorMaxSize = clampInt(std::atoi(v.c_str()), 0, 4096);
+        else if (k == "video_codec_options") s.videoCodecOptions = sanitizeSafeToken(v, true);
+        else if (k.find("device_encoder.") == 0) {
+            std::string ser = sanitizeSafeToken(k.substr(15), false);
+            std::string enc = sanitizeSafeToken(v, false);
+            if (!ser.empty() && !enc.empty()) s.deviceVideoEncoders[ser] = enc;
+        }
         else if (k == "mirror_audio") s.mirrorAudio = (v == "1");
         else if (k == "turn_screen_off") s.turnScreenOff = (v == "1");
         else if (k == "stay_awake") s.stayAwake = (v == "1");
@@ -119,6 +225,15 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "mirror_fps = " << s.mirrorFps << "\n";
         out << "mirror_bitrate_mbps = " << s.mirrorBitrateMbps << "\n";
         out << "mirror_max_size = " << s.mirrorMaxSize << "\n";
+        if (!s.videoCodecOptions.empty()) {
+            out << "video_codec_options = " << sanitizeSafeToken(s.videoCodecOptions, true) << "\n";
+        }
+        for (std::map<std::string, std::string>::const_iterator it = s.deviceVideoEncoders.begin();
+             it != s.deviceVideoEncoders.end(); ++it) {
+            if (!it->first.empty() && !it->second.empty()) {
+                out << "device_encoder." << it->first << " = " << it->second << "\n";
+            }
+        }
         out << "mirror_audio = " << (s.mirrorAudio ? 1 : 0) << "\n";
         out << "turn_screen_off = " << (s.turnScreenOff ? 1 : 0) << "\n";
         out << "stay_awake = " << (s.stayAwake ? 1 : 0) << "\n";

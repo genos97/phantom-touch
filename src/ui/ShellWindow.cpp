@@ -702,6 +702,20 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         self->nativeVideoSession_ = true;
         self->bridge_->setVideoPacketCallback(ShellWindow::onVideoPacket, self);
 
+        std::vector<VideoEncoderInfo> probedEncs;
+        std::string chosenEnc = self->settings_.encoderForDevice(job->arg);
+        self->bridge_->listH264Encoders(self->tools_, job->arg, probedEncs);
+        std::string discoveredHw = ScrcpyBridge::pickBestHardwareH264Encoder(probedEncs);
+        if (chosenEnc.empty()) {
+            chosenEnc = discoveredHw;
+        }
+        EnterCriticalSection(&self->auxLock_);
+        self->deviceEncoders_ = probedEncs;
+        self->activeEncoderName_ = chosenEnc;
+        self->pendingDiscoveredSerial_.clear();
+        self->pendingDiscoveredEncoder_.clear();
+        LeaveCriticalSection(&self->auxLock_);
+
         BridgeStreamConfig cfg;
         cfg.maxSize = self->settings_.mirrorMaxSize;
         cfg.maxFps = self->settings_.mirrorFps;
@@ -709,9 +723,24 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.stayAwake = self->settings_.stayAwake;
         cfg.virtualDisplay = self->settings_.virtualDisplayMode;
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
+        cfg.videoCodecOptions = self->settings_.videoCodecOptions;
+        cfg.videoEncoder = chosenEnc;
 
         ok = self->bridge_->connectSession(self->tools_, cfg, err, job->arg);
         if (ok) {
+            std::string actSer = self->bridge_->activeSerial();
+            if (!discoveredHw.empty() && !actSer.empty() && self->settings_.encoderForDevice(actSer).empty()) {
+                EnterCriticalSection(&self->auxLock_);
+                self->pendingDiscoveredSerial_ = actSer;
+                self->pendingDiscoveredEncoder_ = discoveredHw;
+                LeaveCriticalSection(&self->auxLock_);
+            }
+            PhoneThermalInfo ti;
+            if (self->bridge_->queryThermalTelemetry(ti)) {
+                EnterCriticalSection(&self->auxLock_);
+                self->thermalInfo_ = ti;
+                LeaveCriticalSection(&self->auxLock_);
+            }
             if (cfg.virtualDisplay) {
                 std::string appToLaunch = "com.android.settings";
                 if (self->profile_.keymapEnabled && !self->profile_.appPackage.empty()) {
@@ -1131,7 +1160,16 @@ DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
 
     self->viewportHost_.setProbeSampleRect(true, gx, gy);
     ResetEvent(self->probeEvent_);
-    WaitForSingleObject(self->probeEvent_, 300);
+    const ULONGLONG warmDeadline = GetTickCount64() + 500;
+    while (GetTickCount64() < warmDeadline && !self->stopProbe_ && !self->stopAuxThreads_) {
+        float wy = 0.0f;
+        int64_t wqpc = 0;
+        uint64_t wseq = 0;
+        if (self->viewportHost_.getLastProbeSample(wy, wqpc, wseq) && wseq > 0) {
+            break;
+        }
+        WaitForSingleObject(self->probeEvent_, 40);
+    }
 
     std::vector<double> samples;
     samples.reserve(static_cast<size_t>(trials));
@@ -1209,12 +1247,13 @@ DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
         res.maxMs = sorted.back();
         std::string ser = self->bridge_->activeSerial();
         const char* transport = (ser.find(':') != std::string::npos) ? "WiFi" : "USB";
-        char line[320];
+        char line[384];
         std::snprintf(line, sizeof(line),
-                      "Probe(%s n=%zu/%d pt=%.2f,%.2f baseY=%.1f peakY=%.1f): p50=%.1fms p95=%.1fms p99=%.1fms min=%.1f max=%.1f | rx->pres p50=%.1f p95=%.1f (samp=%u dec=%llu prs=%llu skp=%llu) | UI max=%.2fms stalls=%u | pres=%s",
+                      "Probe(%s n=%zu/%d pt=%.2f,%.2f baseY=%.1f peakY=%.1f): p50=%.1fms p95=%.1fms p99=%.1fms min=%.1f max=%.1f | rx->pres %.1f/%.1fms rx->dec %.1f/%.1fms %.0ffps (samp=%u dec=%llu prs=%llu skp=%llu) | UI max=%.2fms stalls=%u | pres=%s",
                       transport, samples.size(), trials, gx, gy, diagPreY, diagPeakY,
                       res.p50Ms, res.p95Ms, res.p99Ms, res.minMs, res.maxMs,
                       vsum.rxToPresentP50Ms, vsum.rxToPresentP95Ms,
+                      vsum.rxToDecodeP50Ms, vsum.rxToDecodeP95Ms, vsum.measuredFps,
                       vsum.sampleCount,
                       static_cast<unsigned long long>(vsum.decodedCount),
                       static_cast<unsigned long long>(vsum.presentedCount),
@@ -1223,13 +1262,14 @@ DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
                       self->viewportHost_.presentationModeLabel().c_str());
         res.summaryLine = line;
     } else {
-        char line[400];
+        char line[440];
         FrameTiming lastFt;
         bool hasLastFt = self->telemetry_.getLastTiming(lastFt);
         std::snprintf(line, sizeof(line),
-                      "Probe saw 0 hits (pt=%.2f,%.2f baseY=%.1f peakY=%.1f | rx->pres p50=%.1f p95=%.1f samp=%u dec=%llu prs=%llu skp=%llu | lastFt(%d):rx=%lld,in=%lld,dec=%lld,pc=%lld,pr=%lld | occ=%d rtv=%d bw=%d hr=0x%08lX | UI max=%.2fms stalls=%u | pres=%s)",
+                      "Probe saw 0 hits (pt=%.2f,%.2f baseY=%.1f peakY=%.1f | rx->pres %.1f/%.1fms rx->dec %.1f/%.1fms %.0ffps samp=%u dec=%llu prs=%llu skp=%llu | lastFt(%d):rx=%lld,in=%lld,dec=%lld,pc=%lld,pr=%lld | occ=%d rtv=%d bw=%d hr=0x%08lX | UI max=%.2fms stalls=%u | pres=%s)",
                       gx, gy, diagPreY, diagPeakY,
                       vsum.rxToPresentP50Ms, vsum.rxToPresentP95Ms,
+                      vsum.rxToDecodeP50Ms, vsum.rxToDecodeP95Ms, vsum.measuredFps,
                       vsum.sampleCount,
                       static_cast<unsigned long long>(vsum.decodedCount),
                       static_cast<unsigned long long>(vsum.presentedCount),
@@ -1354,6 +1394,7 @@ DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
     }
     ShellWindow* self = job->shell;
     std::string lastPkg;
+    int pollCycle = 0;
     while (!self->stopAuxThreads_ && job->ctx->alive) {
         bool connected = self->bridge_->isConnected();
         bool autoSw = (self->autoSwitchAtomic_ != 0);
@@ -1369,6 +1410,16 @@ DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
             }
         } else if (!connected) {
             lastPkg.clear();
+        }
+        // LATENCY 2.5: refresh battery temp & thermal status every ~10s off the UI thread
+        if (connected && !inAim && (++pollCycle % 3) == 0 && !self->stopAuxThreads_ && job->ctx->alive) {
+            PhoneThermalInfo ti;
+            if (self->bridge_->queryThermalTelemetry(ti)) {
+                EnterCriticalSection(&self->auxLock_);
+                self->thermalInfo_ = ti;
+                LeaveCriticalSection(&self->auxLock_);
+                job->ctx->postMsg(MSG_THERMAL_UPDATE, 0, 0);
+            }
         }
         // Poll less often while in a game profile (4.0s vs 2.0s) so adb dumpsys never stutters Android system_server!
         int ticks = (self->gameProfileAtomic_ != 0) ? 80 : 40;
@@ -2234,9 +2285,27 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             invalidateShell();
             return 0;
         }
+        case MSG_THERMAL_UPDATE: {
+            if (drawerOpen_ && drawerPanel_.activeTab() == 3) {
+                InvalidateRect(hwnd, &drawerRc_, FALSE);
+            }
+            return 0;
+        }
 
         case MSG_CONNECT_DONE: {
             hubStatusMsg_ = asyncResultOk_ ? "" : asyncResultMsg_;
+            std::string discSer, discEnc;
+            EnterCriticalSection(&auxLock_);
+            discSer = pendingDiscoveredSerial_;
+            discEnc = pendingDiscoveredEncoder_;
+            pendingDiscoveredSerial_.clear();
+            pendingDiscoveredEncoder_.clear();
+            LeaveCriticalSection(&auxLock_);
+            if (asyncResultOk_ && !discSer.empty() && !discEnc.empty() &&
+                settings_.encoderForDevice(discSer).empty()) {
+                settings_.setEncoderForDevice(discSer, discEnc);
+                scheduleSettingsSave();
+            }
             if (!asyncResultOk_) {
                 refreshAdbDevices();
             } else if (nativeVideoSession_) {
@@ -3064,10 +3133,17 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
             if (drawerOpen_ && hitsDirty(drawerRc_)) {
                 const int64_t ts = LatencyTelemetry::nowQpc();
                 ProbeResult pr;
+                PhoneThermalInfo ti;
+                std::string actEnc;
+                std::vector<VideoEncoderInfo> encList;
                 EnterCriticalSection(&auxLock_);
                 pr = probeResult_;
+                ti = thermalInfo_;
+                actEnc = activeEncoderName_;
+                encList = deviceEncoders_;
                 LeaveCriticalSection(&auxLock_);
                 drawerPanel_.setLatencyDiagnostics(vidTel, pr, viewportHost_.presentationModeLabel());
+                drawerPanel_.setThermalAndEncoderInfo(bridge_->activeSerial(), ti, actEnc, encList);
                 std::vector<std::string> logs = bridge_->getRecentLogs();
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),

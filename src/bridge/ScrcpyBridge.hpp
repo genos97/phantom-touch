@@ -55,6 +55,20 @@ struct MdnsServiceInfo {
     std::string addr;    // e.g. "192.168.1.42:37891"
 };
 
+struct VideoEncoderInfo {
+    std::string codec;
+    std::string name;
+    bool isHardware = false;
+};
+
+struct PhoneThermalInfo {
+    bool valid = false;
+    float batteryTempC = 0.0f;
+    int batteryLevel = -1;
+    int thermalStatus = 0;
+    std::string thermalLabel;
+};
+
 typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
 typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
                               uint64_t ptsUs, bool isConfig, bool isKeyFrame,
@@ -68,6 +82,8 @@ struct BridgeStreamConfig {
     bool stayAwake = true;
     bool virtualDisplay = false;
     std::string virtualDisplaySpec; // e.g. "1920x1080/320", "1280x720/240", or "auto"
+    std::string videoCodecOptions;  // LATENCY 2.2: MediaCodec key=val pairs
+    std::string videoEncoder;       // LATENCY 2.3: preferred HW H.264 encoder name
 };
 
 class ScrcpyBridge {
@@ -89,6 +105,13 @@ public:
     static size_t serializeResizeDisplay(uint8_t* buf, uint16_t width, uint16_t height);
     static bool isPureAscii(const std::string& utf8);
     static std::vector<std::string> splitUtf8Chunks(const std::string& utf8, size_t maxBytes);
+    static std::string sanitizeServerOption(const std::string& raw);
+    static std::vector<VideoEncoderInfo> parseH264Encoders(const std::string& raw);
+    static std::string pickBestHardwareH264Encoder(const std::vector<VideoEncoderInfo>& encoders);
+    static PhoneThermalInfo parseThermalTelemetry(const std::string& combinedRaw);
+
+    bool listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial, std::vector<VideoEncoderInfo>& outEncoders);
+    bool queryThermalTelemetry(PhoneThermalInfo& outInfo);
 
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,

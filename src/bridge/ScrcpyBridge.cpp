@@ -513,6 +513,151 @@ std::vector<std::string> ScrcpyBridge::splitUtf8Chunks(const std::string& utf8, 
     return chunks;
 }
 
+std::string ScrcpyBridge::sanitizeServerOption(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size() && out.size() < 256; ++i) {
+        unsigned char uc = static_cast<unsigned char>(raw[i]);
+        bool ok = (uc >= 'A' && uc <= 'Z') ||
+                  (uc >= 'a' && uc <= 'z') ||
+                  (uc >= '0' && uc <= '9') ||
+                  uc == '_' || uc == '=' || uc == ':' || uc == ',' || uc == '.' || uc == '-';
+        if (ok) out.push_back(static_cast<char>(uc));
+    }
+    return out;
+}
+
+std::vector<VideoEncoderInfo> ScrcpyBridge::parseH264Encoders(const std::string& raw) {
+    std::vector<VideoEncoderInfo> out;
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("--video-codec=h264") == std::string::npos) continue;
+        size_t encPos = line.find("--video-encoder=");
+        if (encPos == std::string::npos) continue;
+        encPos += 16;
+        size_t encEnd = encPos;
+        while (encEnd < line.size() &&
+               line[encEnd] != ' ' && line[encEnd] != '\t' &&
+               line[encEnd] != '\r' && line[encEnd] != '\n') {
+            ++encEnd;
+        }
+        std::string name = sanitizeServerOption(line.substr(encPos, encEnd - encPos));
+        if (name.empty()) continue;
+
+        bool isHw = (line.find("(hw)") != std::string::npos) &&
+                    (line.find("(sw)") == std::string::npos);
+        if (name.find("c2.android.") == 0 || name.find("OMX.google.") == 0) {
+            isHw = false;
+        }
+        bool dup = false;
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (out[i].name == name) { dup = true; break; }
+        }
+        if (!dup) {
+            VideoEncoderInfo info;
+            info.codec = "h264";
+            info.name = name;
+            info.isHardware = isHw;
+            out.push_back(info);
+        }
+    }
+    return out;
+}
+
+std::string ScrcpyBridge::pickBestHardwareH264Encoder(const std::vector<VideoEncoderInfo>& encoders) {
+    int bestRank = -1;
+    std::string bestName;
+    for (size_t i = 0; i < encoders.size(); ++i) {
+        if (!encoders[i].isHardware || encoders[i].name.empty()) continue;
+        int rank = 1;
+        if (encoders[i].name.find("c2.qti.") == 0 ||
+            encoders[i].name.find("c2.exynos.") == 0 ||
+            encoders[i].name.find("c2.mtk.") == 0) {
+            rank = 3;
+        } else if (encoders[i].name.find("c2.") == 0) {
+            rank = 2;
+        }
+        if (rank > bestRank) {
+            bestRank = rank;
+            bestName = encoders[i].name;
+        }
+    }
+    return bestName;
+}
+
+PhoneThermalInfo ScrcpyBridge::parseThermalTelemetry(const std::string& combinedRaw) {
+    PhoneThermalInfo info;
+    std::istringstream iss(combinedRaw);
+    std::string line;
+    bool inThermal = false;
+    bool gotLevel = false;
+    bool gotTemp = false;
+
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.find("---THERMAL---") != std::string::npos ||
+            line.find("Thermal Status:") != std::string::npos ||
+            line.find("IsStatusOverride:") != std::string::npos) {
+            inThermal = true;
+        }
+        if (!inThermal) {
+            if (line.find("ACTION_BATTERY_CHANGED") != std::string::npos) continue;
+            size_t lp = line.find("level:");
+            if (!gotLevel && lp != std::string::npos && line.find("Capacity") == std::string::npos) {
+                info.batteryLevel = std::atoi(line.c_str() + lp + 6);
+                gotLevel = true;
+            }
+            size_t tp = line.find("temperature:");
+            if (!gotTemp && tp != std::string::npos) {
+                int tenths = std::atoi(line.c_str() + tp + 12);
+                info.batteryTempC = static_cast<float>(tenths) * 0.1f;
+                gotTemp = true;
+            }
+        } else {
+            size_t sp = line.find("Thermal Status:");
+            if (sp != std::string::npos) {
+                info.thermalStatus = std::atoi(line.c_str() + sp + 15);
+                if (info.thermalStatus < 0) info.thermalStatus = 0;
+                if (info.thermalStatus > 6) info.thermalStatus = 6;
+            }
+        }
+    }
+
+    static const char* kLabels[7] = {
+        "OK", "LIGHT", "MODERATE", "SEVERE", "CRITICAL", "EMERGENCY", "SHUTDOWN"
+    };
+    info.thermalLabel = kLabels[info.thermalStatus];
+    info.valid = (gotTemp || gotLevel);
+    return info;
+}
+
+bool ScrcpyBridge::listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial,
+                                      std::vector<VideoEncoderInfo>& outEncoders) {
+    outEncoders.clear();
+    if (tools.scrcpyExe.empty()) return false;
+    std::string cmd = "\"" + tools.scrcpyExe + "\"";
+    if (!deviceSerial.empty()) {
+        cmd += " -s \"" + deviceSerial + "\"";
+    }
+    cmd += " --list-encoders";
+    std::string raw;
+    DWORD ec = 0;
+    runCommandCapture(cmd, raw, ec, 8000);
+    outEncoders = parseH264Encoders(raw);
+    return !outEncoders.empty();
+}
+
+bool ScrcpyBridge::queryThermalTelemetry(PhoneThermalInfo& outInfo) {
+    std::string raw;
+    if (!runAdbShell("dumpsys battery | head -n 25; echo ---THERMAL---; dumpsys thermalservice | head -n 25",
+                     raw, 4000)) {
+        return false;
+    }
+    outInfo = parseThermalTelemetry(raw);
+    return outInfo.valid;
+}
+
 bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
     std::string exeDir = getExeDir();
     std::vector<std::string> dirs;
@@ -552,6 +697,7 @@ bool ScrcpyBridge::locateTools(ToolPaths& outPaths, std::string& outError) {
                    "Re-run setup_scrcpy.ps1 to install the pinned official scrcpy release.";
         return false;
     }
+    adbExe_ = outPaths.adbExe;
     return true;
 }
 
@@ -851,6 +997,18 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
         char szBuf[32];
         std::snprintf(szBuf, sizeof(szBuf), " max_size=%d", cfg.maxSize);
         srvCmd += szBuf;
+    }
+    if (!cfg.metadataOnly && !cfg.videoEncoder.empty()) {
+        std::string safeEnc = sanitizeServerOption(cfg.videoEncoder);
+        if (!safeEnc.empty()) {
+            srvCmd += " video_encoder=" + safeEnc;
+        }
+    }
+    if (!cfg.metadataOnly && !cfg.videoCodecOptions.empty()) {
+        std::string safeOpts = sanitizeServerOption(cfg.videoCodecOptions);
+        if (!safeOpts.empty()) {
+            srvCmd += " video_codec_options=" + safeOpts;
+        }
     }
     if (cfg.virtualDisplay) {
         // Stage 3 "Second Phone" Virtual Display Mode (keeps physical phone screen free!)

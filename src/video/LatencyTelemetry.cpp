@@ -103,9 +103,13 @@ void LatencyTelemetry::recordSkipped(const FrameTiming& ft) {
 
 TelemetrySummary LatencyTelemetry::getSummary() const {
     std::vector<double> rxToPres;
+    std::vector<double> rxToDec;
     std::vector<double> decodeMs;
     std::vector<double> presMs;
     TelemetrySummary sum;
+    int64_t minDecQpc = 0;
+    int64_t maxDecQpc = 0;
+    size_t decQpcCount = 0;
 
     EnterCriticalSection(&impl_->lock);
     sum.decodedCount = impl_->decodedCount;
@@ -113,12 +117,21 @@ TelemetrySummary LatencyTelemetry::getSummary() const {
     sum.skippedCount = impl_->skippedCount;
     const size_t n = impl_->ringCount;
     rxToPres.reserve(n);
+    rxToDec.reserve(n);
     decodeMs.reserve(n);
     presMs.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         const FrameTiming& ft = impl_->ring[i];
         if (ft.qpcPktRecv > 0 && ft.qpcPresentRet >= ft.qpcPktRecv) {
             rxToPres.push_back(qpcToMs(ft.qpcPresentRet - ft.qpcPktRecv));
+        }
+        if (ft.qpcPktRecv > 0 && ft.qpcDecoded >= ft.qpcPktRecv) {
+            rxToDec.push_back(qpcToMs(ft.qpcDecoded - ft.qpcPktRecv));
+        }
+        if (ft.qpcDecoded > 0) {
+            if (decQpcCount == 0 || ft.qpcDecoded < minDecQpc) minDecQpc = ft.qpcDecoded;
+            if (decQpcCount == 0 || ft.qpcDecoded > maxDecQpc) maxDecQpc = ft.qpcDecoded;
+            ++decQpcCount;
         }
         if (ft.qpcProcIn > 0 && ft.qpcDecoded >= ft.qpcProcIn) {
             decodeMs.push_back(qpcToMs(ft.qpcDecoded - ft.qpcProcIn));
@@ -132,8 +145,17 @@ TelemetrySummary LatencyTelemetry::getSummary() const {
     sum.sampleCount = static_cast<uint32_t>(rxToPres.size());
     sum.rxToPresentP50Ms = computePercentile(rxToPres, 0.50);
     sum.rxToPresentP95Ms = computePercentile(rxToPres, 0.95);
+    sum.rxToDecodeP50Ms = computePercentile(rxToDec, 0.50);
+    sum.rxToDecodeP95Ms = computePercentile(rxToDec, 0.95);
     sum.decodeP50Ms = computePercentile(decodeMs, 0.50);
+    sum.decodeP95Ms = computePercentile(decodeMs, 0.95);
     sum.presentP50Ms = computePercentile(presMs, 0.50);
+    if (decQpcCount >= 2 && maxDecQpc > minDecQpc) {
+        double spanSec = qpcToMs(maxDecQpc - minDecQpc) / 1000.0;
+        if (spanSec > 0.01) {
+            sum.measuredFps = static_cast<double>(decQpcCount - 1) / spanSec;
+        }
+    }
     return sum;
 }
 

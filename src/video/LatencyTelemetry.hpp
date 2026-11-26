@@ -16,8 +16,12 @@ struct FrameTiming {
 struct TelemetrySummary {
     double rxToPresentP50Ms = 0.0;
     double rxToPresentP95Ms = 0.0;
+    double rxToDecodeP50Ms = 0.0;
+    double rxToDecodeP95Ms = 0.0;
     double decodeP50Ms = 0.0;
+    double decodeP95Ms = 0.0;
     double presentP50Ms = 0.0;
+    double measuredFps = 0.0;
     uint64_t decodedCount = 0;
     uint64_t presentedCount = 0;
     uint64_t skippedCount = 0;

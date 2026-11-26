@@ -1090,6 +1090,89 @@ static void testSprint1LatencyAndAsync() {
     std::printf("[Test] Sprint 1 (0.1/1.1/1.2/1.3/1.4/1.5/1.6/1.7) OK!\n");
 }
 
+static void testSprint1bPhase2PresetsAndTelemetry() {
+    // 1. 2.3: Parse real S21 FE --list-encoders output and prefer HW encoder (never SW!)
+    const std::string encRaw =
+        "[server] INFO: List of video encoders:\n"
+        "    --video-codec=h264 --video-encoder=c2.exynos.h264.encoder         (hw) [vendor]\n"
+        "    --video-codec=h264 --video-encoder=OMX.Exynos.AVC.Encoder         (hw) [vendor]\n"
+        "    --video-codec=h264 --video-encoder=c2.android.avc.encoder         (sw)\n"
+        "    --video-codec=h264 --video-encoder=OMX.google.h264.encoder        (sw)\n"
+        "    --video-codec=h265 --video-encoder=c2.exynos.hevc.encoder         (hw) [vendor]\n";
+    std::vector<VideoEncoderInfo> encs = ScrcpyBridge::parseH264Encoders(encRaw);
+    assert(encs.size() == 4);
+    assert(encs[0].name == "c2.exynos.h264.encoder" && encs[0].isHardware);
+    assert(encs[1].name == "OMX.Exynos.AVC.Encoder" && encs[1].isHardware);
+    assert(encs[2].name == "c2.android.avc.encoder" && !encs[2].isHardware);
+    assert(ScrcpyBridge::pickBestHardwareH264Encoder(encs) == "c2.exynos.h264.encoder");
+
+    std::vector<VideoEncoderInfo> swOnly(encs.begin() + 2, encs.end());
+    assert(ScrcpyBridge::pickBestHardwareH264Encoder(swOnly).empty());
+
+    // 2. 2.2: Option sanitization strips shell metacharacters
+    assert(ScrcpyBridge::sanitizeServerOption("intra-refresh-period=60,bitrate-mode=2,max-bframes=0; rm -rf /") ==
+           "intra-refresh-period=60,bitrate-mode=2,max-bframes=0rm-rf");
+
+    // 3. 2.5: Thermal telemetry parser (Samsung S21 FE healthy fixture + hot throttling fixture)
+    const std::string thOk =
+        "  status: 5\n"
+        "  level: 100\n"
+        "  temperature: 280\n"
+        "11-26 18:23:03 Sending ACTION_BATTERY_CHANGED: level:99, temperature:450\n"
+        "---THERMAL---\n"
+        "Thermal Status: 0\n";
+    PhoneThermalInfo tiOk = ScrcpyBridge::parseThermalTelemetry(thOk);
+    assert(tiOk.valid && tiOk.batteryLevel == 100);
+    assert(std::fabs(tiOk.batteryTempC - 28.0f) < 0.05f);
+    assert(tiOk.thermalStatus == 0 && tiOk.thermalLabel == "OK");
+
+    const std::string thHot = "  level: 42\n  temperature: 435\n---THERMAL---\nThermal Status: 3\n";
+    PhoneThermalInfo tiHot = ScrcpyBridge::parseThermalTelemetry(thHot);
+    assert(tiHot.valid && tiHot.batteryLevel == 42);
+    assert(std::fabs(tiHot.batteryTempC - 43.5f) < 0.05f);
+    assert(tiHot.thermalStatus == 3 && tiHot.thermalLabel == "SEVERE");
+
+    // 4. 2.1/2.2/2.3/2.4: Stream presets, detectStreamPreset, per-device encoder persistence, and legacy cfg compat
+    AppSettings ps;
+    ps.applyStreamPreset(PRESET_COMPETITIVE);
+    assert(ps.mirrorMaxSize == 1280 && ps.mirrorFps == 0 && ps.mirrorBitrateMbps == 16);
+    assert(ps.videoCodecOptions == "bitrate-mode=2,max-bframes=0" && ps.audioRawCodec);
+    assert(ps.detectStreamPreset() == PRESET_COMPETITIVE);
+
+    ps.applyStreamPreset(PRESET_WIFI);
+    assert(ps.mirrorFps == 60 && ps.mirrorBitrateMbps == 8);
+    assert(ps.videoCodecOptions == "intra-refresh-period=60,bitrate-mode=2,max-bframes=0");
+    assert(ps.detectStreamPreset() == PRESET_WIFI);
+    assert(ps.buildScrcpyArgs().find("--video-codec-options=intra-refresh-period=60,bitrate-mode=2,max-bframes=0") != std::string::npos);
+
+    ps.setEncoderForDevice("R5CRC0RS88Y", "c2.exynos.h264.encoder");
+    const std::string tmp1b = "profiles\\_test_sprint1b_settings.cfg";
+    assert(AppSettingsStore::save(tmp1b, ps));
+    AppSettings loaded1b;
+    assert(AppSettingsStore::load(tmp1b, loaded1b));
+    std::remove(tmp1b.c_str());
+    assert(loaded1b.detectStreamPreset() == PRESET_WIFI);
+    assert(loaded1b.encoderForDevice("R5CRC0RS88Y") == "c2.exynos.h264.encoder");
+
+    // 5. Phase 2 telemetry: rxToDecodeP50Ms / rxToDecodeP95Ms and measuredFps
+    LatencyTelemetry tel2;
+    for (int i = 0; i < 61; ++i) {
+        FrameTiming ft;
+        ft.qpcPktRecv = 1000000LL + static_cast<int64_t>(i) * 100000LL;
+        ft.qpcProcIn  = ft.qpcPktRecv + 1000LL;
+        ft.qpcDecoded = ft.qpcPktRecv + 25000LL;
+        ft.qpcPresentCall = 0;
+        ft.qpcPresentRet  = 0;
+        ft.present = true;
+        tel2.recordPresented(ft);
+    }
+    TelemetrySummary sum2 = tel2.getSummary();
+    assert(sum2.rxToDecodeP50Ms > 0.0 && sum2.rxToDecodeP95Ms >= sum2.rxToDecodeP50Ms);
+    assert(sum2.measuredFps > 1.0);
+
+    std::printf("[Test] Sprint 1b (2.1/2.2/2.3/2.4/2.5/2.6 presets, encoders & thermal) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1104,6 +1187,7 @@ int main() {
     testStage3EmulatorFeatures();
     testSprint0Fixes();
     testSprint1LatencyAndAsync();
-    std::printf("ALL SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    testSprint1bPhase2PresetsAndTelemetry();
+    std::printf("ALL SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

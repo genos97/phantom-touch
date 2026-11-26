@@ -62,9 +62,12 @@ enum DrawerActionId {
     DA_CALIBRATE_ASPECT,
 
     // Device & Stream tab
-    DA_STREAM_FPS,      // extra = 60/90/120
+    DA_STREAM_PRESET,   // extra = StreamPresetId
+    DA_STREAM_FPS,      // extra = 0/60/90/120
     DA_STREAM_BITRATE,  // extra = 8/12/16/24
-    DA_STREAM_MAXSIZE,  // extra = 0/1600/1280
+    DA_STREAM_MAXSIZE,  // extra = 0/1920/1600/1280
+    DA_CODEC_OPTS,      // extra = 0 (default), 1 (CBR+NoB), 2 (WiFi intra)
+    DA_CYCLE_ENCODER,
     DA_TOGGLE_NATIVE_VIDEO,
     DA_TOGGLE_VSYNC,
     DA_TOGGLE_VIRTUAL_DISPLAY,
@@ -745,7 +748,22 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     GdiPlusDraw::textLeft(g, "Stream: " + s.buildScrcpyArgs(), static_cast<float>(x + 12), static_cast<float>(y + 52), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 24));
     y += 76;
 
-    // 2. Stream Quality Controls
+    // 2. Stream Presets (LATENCY 2.1-2.4) & Quality Controls
+    GdiPlusDraw::textLeft(g, "STREAM PRESET (PHASE 2)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    y += 18;
+    const char* spLbls[4] = { "Comp", "Bal", "Qual", "WiFi" };
+    const StreamPresetId spIds[4] = { PRESET_COMPETITIVE, PRESET_BALANCED, PRESET_QUALITY, PRESET_WIFI };
+    StreamPresetId curPreset = s.detectStreamPreset();
+    int spw = (w - 12) / 4;
+    for (int i = 0; i < 4; ++i) {
+        RECT r = { x + i * (spw + 4), y, x + i * (spw + 4) + spw, y + 26 };
+        bool on = (curPreset == spIds[i]);
+        GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_GREEN_BG : Theme::BG_CARD, on ? Theme::ACCENT_GREEN : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
+        GdiPlusDraw::textCenter(g, spLbls[i], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.5f, true, on ? Theme::ACCENT_GREEN : Theme::TEXT_SECONDARY);
+        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_STREAM_PRESET, static_cast<int>(spIds[i]) });
+    }
+    y += 34;
+
     auto drawSeg3 = [&](const char* title, const char* l0, const char* l1, const char* l2,
                         int v0, int v1, int v2, int curV, int actId) {
         GdiPlusDraw::textLeft(g, title, static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
@@ -793,7 +811,35 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    drawSeg3("VIDEO RESOLUTION", "Native", "1600px", "1280px", 0, 1600, 1280, s.mirrorMaxSize, DA_STREAM_MAXSIZE);
+    // Resolution 4-way (2.1)
+    GdiPlusDraw::textLeft(g, "VIDEO RESOLUTION (2.1)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    y += 18;
+    const char* rLbls[4] = { "Native", "1920", "1600", "1280" };
+    const int rVals[4] = { 0, 1920, 1600, 1280 };
+    for (int i = 0; i < 4; ++i) {
+        RECT r = { x + i * (bw + 4), y, x + i * (bw + 4) + bw, y + 26 };
+        bool on = (s.mirrorMaxSize == rVals[i]);
+        GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD, on ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
+        GdiPlusDraw::textCenter(g, rLbls[i], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.5f, true, on ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+        if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_STREAM_MAXSIZE, rVals[i] });
+    }
+    y += 34;
+
+    int curOpts = 0;
+    if (s.videoCodecOptions == "bitrate-mode=2,max-bframes=0") curOpts = 1;
+    else if (s.videoCodecOptions == "intra-refresh-period=60,bitrate-mode=2,max-bframes=0") curOpts = 2;
+    drawSeg3("ENCODER LOW-LATENCY KEYS (2.2)", "Default", "CBR+NoB", "WiFi Intra", 0, 1, 2, curOpts, DA_CODEC_OPTS);
+
+    std::string encShown = s.encoderForDevice(activeDeviceSerial_);
+    if (encShown.empty()) encShown = activeEncoder_;
+    std::string encLabel = encShown.empty() ? "Auto (Hardware)" : encShown;
+    RECT rEnc = { x, y, x + w, y + 30 };
+    bool hovEnc = ptIn(rEnc, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rEnc, 7.0f, hovEnc ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textLeft(g, "Encoder (2.3): " + encLabel, static_cast<float>(x + 10), static_cast<float>(y + 15), 11.0f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 72));
+    GdiPlusDraw::textRight(g, "Cycle", static_cast<float>(x + w - 10), static_cast<float>(y + 15), 10.5f, true, Theme::ACCENT_CYAN);
+    if (rEnc.bottom > bodyClip_.top && rEnc.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ rEnc, DA_CYCLE_ENCODER, 0 });
+    y += 36;
 
     // Stage 2 & Stage 3 Renderer + Second-Phone Virtual Display controls
     drawToggleRow(g, x, y, w, "Native D3D11 Single-Stream Video", s.useNativeVideo, Theme::ACCENT_CYAN, DA_TOGGLE_NATIVE_VIDEO, hoverX, hoverY); y += 36;
@@ -805,6 +851,8 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         if (s.virtualDisplaySpec == "1280x720/240") curVd = 1;
         else if (s.virtualDisplaySpec == "auto") curVd = 2;
         drawSeg3("VIRTUAL DISPLAY SIZE", "1080p PC", "720p Fast", "Auto", 0, 1, 2, curVd, DA_VD_PRESET);
+        GdiPlusDraw::textLeft(g, "Note: Android virtual displays may cap games at 60 fps (2.6).", static_cast<float>(x + 4), static_cast<float>(y - 2), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
+        y += 14;
     }
 
     drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 36;
@@ -834,34 +882,48 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 42;
 
-    // Latency Probe & Telemetry Card (0.1, 0.2, 0.3)
-    GdiPlusDraw::textLeft(g, "LATENCY BENCHMARK (Ctrl+Shift+L)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    // Latency Probe & Telemetry Card (0.1, 0.2, 0.3, 2.5)
+    GdiPlusDraw::textLeft(g, "LATENCY & THERMAL TELEMETRY (Ctrl+Shift+L)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
     y += 20;
-    RECT rLatCard = { x, y, x + w, y + 72 };
+    RECT rLatCard = { x, y, x + w, y + 90 };
     GdiPlusDraw::roundedCard(g, rLatCard, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
-    char modeLine[96];
-    std::snprintf(modeLine, sizeof(modeLine), "Present: %s | Dec %llu Skp %llu",
+    char modeLine[112];
+    std::snprintf(modeLine, sizeof(modeLine), "Present: %s | %.0ffps | rx->dec %.1f/%.1fms",
                   presentModeLabel_.empty() ? "Idle" : presentModeLabel_.c_str(),
-                  static_cast<unsigned long long>(vidTelemetry_.decodedCount),
-                  static_cast<unsigned long long>(vidTelemetry_.skippedCount));
+                  vidTelemetry_.measuredFps,
+                  vidTelemetry_.rxToDecodeP50Ms,
+                  vidTelemetry_.rxToDecodeP95Ms);
     GdiPlusDraw::textLeft(g, modeLine, static_cast<float>(x + 10), static_cast<float>(y + 12), 10.0f, false, Theme::TEXT_SECONDARY, static_cast<float>(w - 20));
+    if (thermalInfo_.valid) {
+        char thBuf[112];
+        bool warm = (thermalInfo_.batteryTempC >= 40.0f || thermalInfo_.thermalStatus >= 2);
+        std::snprintf(thBuf, sizeof(thBuf), "Bat: %.1fC (%d%%) | Thermal: %s%s",
+                      thermalInfo_.batteryTempC,
+                      thermalInfo_.batteryLevel,
+                      thermalInfo_.thermalLabel.c_str(),
+                      warm ? " (Use Screen-Off!)" : "");
+        GdiPlusDraw::textLeft(g, thBuf, static_cast<float>(x + 10), static_cast<float>(y + 27), 10.0f, warm,
+                              warm ? Theme::ACCENT_AMBER : Theme::ACCENT_GREEN, static_cast<float>(w - 20));
+    } else {
+        GdiPlusDraw::textLeft(g, "Bat/Thermal: querying connected phone...", static_cast<float>(x + 10), static_cast<float>(y + 27), 10.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 20));
+    }
     std::string probeTxt = probeResult_.running
         ? probeResult_.summaryLine
         : (probeResult_.valid ? probeResult_.summaryLine : "No round-trip probe run yet");
-    GdiPlusDraw::textLeft(g, probeTxt, static_cast<float>(x + 10), static_cast<float>(y + 28), 10.5f, true,
+    GdiPlusDraw::textLeft(g, probeTxt, static_cast<float>(x + 10), static_cast<float>(y + 43), 10.5f, true,
                           probeResult_.valid ? Theme::ACCENT_GREEN : Theme::TEXT_MUTED, static_cast<float>(w - 20));
-    RECT rProbeBtn = { x + 10, y + 42, x + w - 10, y + 66 };
+    RECT rProbeBtn = { x + 10, y + 58, x + w - 10, y + 82 };
     bool hovPr = ptIn(rProbeBtn, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, rProbeBtn, 6.0f,
                              probeResult_.running ? Theme::ACCENT_AMBER_BG : (hovPr ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG),
                              probeResult_.running ? Theme::ACCENT_AMBER : Theme::ACCENT_CYAN, 1.0f);
     GdiPlusDraw::textCenter(g, probeResult_.running ? "PROBING ROUND-TRIP LATENCY..." : "LATENCY TEST (50-100x Round-Trip)",
-                            static_cast<float>(rProbeBtn.left + rProbeBtn.right) * 0.5f, static_cast<float>(y + 54), 10.5f, true,
+                            static_cast<float>(rProbeBtn.left + rProbeBtn.right) * 0.5f, static_cast<float>(y + 70), 10.5f, true,
                             hovPr && !probeResult_.running ? 0xFF08121Au : Theme::TEXT_PRIMARY);
     if (rProbeBtn.bottom > bodyClip_.top && rProbeBtn.top < bodyClip_.bottom && !probeResult_.running) {
         hotspots_.push_back(Hotspot{ rProbeBtn, DA_RUN_LATENCY_PROBE, 0 });
     }
-    y += 80;
+    y += 98;
 
     // Wireless ADB quick connect
     GdiPlusDraw::textLeft(g, "WIRELESS ADB", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
@@ -1114,9 +1176,42 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 out.requestCalibrateAspect = true;
                 return true;
 
+            case DA_STREAM_PRESET: {
+                StreamPresetId pid = static_cast<StreamPresetId>(hs.extra);
+                settings.applyStreamPreset(pid);
+                out.settingsModified = true;
+                out.vsyncToggled = true;
+                out.toastMessage = std::string("Preset: ") + AppSettings::streamPresetName(pid) + " (click Apply & Reconnect)";
+                return true;
+            }
             case DA_STREAM_FPS:     settings.mirrorFps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_BITRATE: settings.mirrorBitrateMbps = hs.extra; out.settingsModified = true; return true;
             case DA_STREAM_MAXSIZE: settings.mirrorMaxSize = hs.extra; out.settingsModified = true; return true;
+            case DA_CODEC_OPTS:
+                settings.videoCodecOptions = (hs.extra == 1) ? "bitrate-mode=2,max-bframes=0"
+                                           : (hs.extra == 2) ? "intra-refresh-period=60,bitrate-mode=2,max-bframes=0"
+                                                             : "";
+                out.settingsModified = true;
+                out.toastMessage = "Encoder options updated (click Apply & Reconnect)";
+                return true;
+            case DA_CYCLE_ENCODER: {
+                if (!activeDeviceSerial_.empty()) {
+                    std::vector<std::string> opts;
+                    opts.push_back(""); // Auto (HW)
+                    for (size_t ei = 0; ei < deviceEncoders_.size(); ++ei) {
+                        if (deviceEncoders_[ei].isHardware) opts.push_back(deviceEncoders_[ei].name);
+                    }
+                    std::string cur = settings.encoderForDevice(activeDeviceSerial_);
+                    size_t nextIdx = 0;
+                    for (size_t oi = 0; oi < opts.size(); ++oi) {
+                        if (opts[oi] == cur) { nextIdx = (oi + 1) % opts.size(); break; }
+                    }
+                    settings.setEncoderForDevice(activeDeviceSerial_, opts[nextIdx]);
+                    out.settingsModified = true;
+                    out.toastMessage = "Encoder: " + (opts[nextIdx].empty() ? std::string("Auto (HW)") : opts[nextIdx]) + " (Apply & Reconnect)";
+                }
+                return true;
+            }
             case DA_TOGGLE_NATIVE_VIDEO:
                 settings.useNativeVideo = !settings.useNativeVideo;
                 if (!settings.useNativeVideo) settings.virtualDisplayMode = false;

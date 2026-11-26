@@ -156,6 +156,11 @@ private:
     InputHookThread hookThread_;
     LatencyTelemetry telemetry_;
     ProbeResult probeResult_;
+    PhoneThermalInfo thermalInfo_;
+    std::vector<VideoEncoderInfo> deviceEncoders_;
+    std::string activeEncoderName_;
+    std::string pendingDiscoveredSerial_;
+    std::string pendingDiscoveredEncoder_;
 
     ToolPaths tools_;
     bool toolsReady_ = false;
