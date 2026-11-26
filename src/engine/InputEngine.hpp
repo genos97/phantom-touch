@@ -100,7 +100,7 @@ private:
                                      int32_t px, int32_t py, bool clampToScreen);
 
     void runLoop();
-    bool processTick(double nowMs);
+    bool processTick(double nowMs, bool runPeriodic = true);
     void rebuildKeyRouteCacheLocked();
     void syncFpsViewConfigLocked(uint32_t w, uint32_t h);
     bool classifyKeyInputLocked(int vk, bool down, bool isAim, bool& outRequestToggleAim);
@@ -151,6 +151,8 @@ private:
     std::vector<KeyRouteEntry> routeButtons_;
     double accumRawDx_ = 0.0;
     double accumRawDy_ = 0.0;
+    bool hasPendingAimDelta_ = false;
+    double lastAimSendMs_ = 0.0;
 
     // Worker-thread state (protected by lock_)
     bool heldKeys_[512];

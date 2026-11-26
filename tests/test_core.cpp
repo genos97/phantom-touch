@@ -10,11 +10,14 @@
 #include "engine/FpsViewController.hpp"
 #include "engine/GamepadController.hpp"
 #include "engine/InputEngine.hpp"
+#include "engine/InputHookThread.hpp"
 #include "engine/JoystickController.hpp"
+#include "engine/ThreadScheduling.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/GdiPlusDraw.hpp"
 #include "video/D3D11Renderer.hpp"
 #include "video/H264Decoder.hpp"
+#include "video/LatencyTelemetry.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -1001,6 +1004,92 @@ static void testSprint0Fixes() {
     std::printf("[Test] Sprint 0 (V4/V5/V10/V12/B3/B6/E1/E2/E3/E4/P2/N12/N28) OK!\n");
 }
 
+static void testSprint1LatencyAndAsync() {
+    // 1. 0.1 & 1.1: LatencyTelemetry ring buffer, percentiles, and skipped frame accounting
+    LatencyTelemetry tel;
+    for (int i = 0; i < 650; ++i) {
+        FrameTiming ft;
+        ft.qpcPktRecv = 1000;
+        ft.qpcProcIn = 1200;
+        ft.qpcDecoded = 1200 + 10000;
+        ft.qpcPresentCall = 1200 + 10500;
+        ft.qpcPresentRet = 1200 + 11000 + (i % 20) * 500;
+        ft.present = true;
+        tel.recordPresented(ft);
+    }
+    FrameTiming skp;
+    skp.present = false;
+    tel.recordSkipped(skp);
+    tel.recordSkipped(skp);
+    TelemetrySummary sum = tel.getSummary();
+    assert(sum.decodedCount == 652);
+    assert(sum.presentedCount == 650);
+    assert(sum.skippedCount == 2);
+    assert(sum.sampleCount == LatencyTelemetry::kRingCapacity);
+    assert(sum.rxToPresentP95Ms >= sum.rxToPresentP50Ms && sum.rxToPresentP50Ms > 0.0);
+
+    std::vector<double> pvals = { 10.0, 2.0, 6.0, 4.0, 8.0 };
+    assert(std::fabs(LatencyTelemetry::computePercentile(pvals, 0.50) - 6.0) < 0.001);
+    assert(std::fabs(LatencyTelemetry::computePercentile(pvals, 0.0) - 2.0) < 0.001);
+    assert(std::fabs(LatencyTelemetry::computePercentile(pvals, 1.0) - 10.0) < 0.001);
+
+    // 2. 1.7: ControlPacketQueue always drains touch/key ahead of clipboard, and caps UTF-8 safely
+    ControlPacketQueue cq;
+    std::vector<uint8_t> clipPkt = { 9, 1, 2, 3 };
+    std::vector<uint8_t> touchPkt = { 2, 0, 1, 2 };
+    std::vector<uint8_t> keyPkt = { 0, 0, 1, 2 };
+    cq.push(clipPkt, false);
+    cq.push(touchPkt, true);
+    cq.push(keyPkt, true);
+    assert(cq.highSize() == 2 && cq.lowSize() == 1);
+    std::vector<uint8_t> out;
+    assert(cq.popNext(out) && out[0] == 2);
+    assert(cq.popNext(out) && out[0] == 0);
+    assert(cq.popNext(out) && out[0] == 9);
+    assert(!cq.popNext(out));
+
+    const std::string euro = "abc\xE2\x82\xACxyz"; // "abc€xyz"
+    std::string capped = ControlPacketQueue::truncateUtf8Cap(euro, 5);
+    assert(capped == "abc"); // Must not split 3-byte € sequence
+    assert(ControlPacketQueue::kMaxClipboardBytes == 32768);
+
+    // 3. 1.4 & 1.6: AppSettings round-trip for VSync & audio relay tuning
+    AppSettings as;
+    as.vsyncEnabled = true;
+    as.audioBufferMs = 20;
+    as.audioRawCodec = true;
+    const std::string tmpSet = "profiles\\_test_sprint1_settings.cfg";
+    assert(AppSettingsStore::save(tmpSet, as));
+    AppSettings loadedAs;
+    assert(AppSettingsStore::load(tmpSet, loadedAs));
+    std::remove(tmpSet.c_str());
+    assert(loadedAs.vsyncEnabled == true);
+    assert(loadedAs.audioBufferMs == 20);
+    assert(loadedAs.audioRawCodec == true);
+
+    // 4. 1.3: ThreadScheduling EcoQoS & MMCSS smoke test
+    ThreadScheduling::disableProcessEcoQoS();
+    DWORD taskIdx = 0;
+    HANDLE avrt = ThreadScheduling::enableMmcssGames(taskIdx);
+    ThreadScheduling::disableMmcss(avrt);
+
+    // 5. 1.2: InputHookThread start, snapshot update, and clean shutdown
+    {
+        ScrcpyBridge b;
+        InputEngine eng(&b);
+        InputHookThread ht;
+        InputHookSnapshot snap;
+        assert(ht.start(GetModuleHandleW(NULL), &eng, snap));
+        assert(ht.isRunning());
+        snap.aimMode = true;
+        ht.updateSnapshot(snap);
+        ht.stop();
+        assert(!ht.isRunning());
+    }
+
+    std::printf("[Test] Sprint 1 (0.1/1.1/1.2/1.3/1.4/1.5/1.6/1.7) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -1014,6 +1103,7 @@ int main() {
     testStage2VideoPipeline();
     testStage3EmulatorFeatures();
     testSprint0Fixes();
-    std::printf("ALL SPRINT 0 + STAGE 1-3 REAL-PHONE EMULATOR TESTS PASSED!\n");
+    testSprint1LatencyAndAsync();
+    std::printf("ALL SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

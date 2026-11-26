@@ -14,8 +14,26 @@
 #include "bridge/TouchTypes.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
+
+class ControlPacketQueue {
+public:
+    static const size_t kMaxClipboardBytes = 32768;
+    static std::string truncateUtf8Cap(const std::string& utf8, size_t maxBytes);
+
+    void push(const std::vector<uint8_t>& pkt, bool highPrio);
+    void push(std::vector<uint8_t>&& pkt, bool highPrio);
+    bool popNext(std::vector<uint8_t>& outPkt);
+    void clear();
+    size_t highSize() const { return hi_.size(); }
+    size_t lowSize() const { return lo_.size(); }
+
+private:
+    std::deque<std::vector<uint8_t>> hi_;
+    std::deque<std::vector<uint8_t>> lo_;
+};
 
 struct ToolPaths {
     std::string adbExe;
@@ -39,7 +57,8 @@ struct MdnsServiceInfo {
 
 typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
 typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
-                              uint64_t ptsUs, bool isConfig, bool isKeyFrame);
+                              uint64_t ptsUs, bool isConfig, bool isKeyFrame,
+                              bool present, int64_t qpcPktRecv);
 
 struct BridgeStreamConfig {
     int maxSize = 0;            // 0 = native phone resolution
@@ -74,8 +93,11 @@ public:
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
                             const std::string& windowTitle, std::string& outError,
                             bool borderless = false, const std::string& deviceSerial = "");
-    bool launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial, std::string& outError);
+    bool launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial,
+                              int audioBufferMs, bool rawCodec, std::string& outError);
     void stopMirrorWindow();
+    void triggerVideoStallTest() { InterlockedExchange(&injectVideoStall_, 1); }
+    bool runAdbShell(const std::string& shellArgs, std::string& outText, DWORD timeoutMs = 5000);
 
     bool connectControl(const ToolPaths& tools, int controlMaxSize, std::string& outError,
                         const std::string& deviceSerial = "", bool stayAwake = true);
@@ -123,8 +145,11 @@ public:
 private:
     static DWORD WINAPI videoReaderProc(LPVOID param);
     static DWORD WINAPI controlReaderProc(LPVOID param);
+    static DWORD WINAPI controlSenderProc(LPVOID param);
     void runVideoReader();
     void runControlReader();
+    void runControlSender();
+    bool enqueueControlPacket(std::vector<uint8_t>&& pkt, bool highPrio);
 
     std::string adbPrefix() const;
     bool sendAll(SOCKET s, const uint8_t* data, int len);
@@ -135,12 +160,15 @@ private:
     bool wsaInit_ = false;
     volatile LONG connected_ = 0;
     volatile LONG stopThreads_ = 0;
+    volatile LONG injectVideoStall_ = 0;
 
     SOCKET videoSock_ = INVALID_SOCKET;
     SOCKET controlSock_ = INVALID_SOCKET;
 
     HANDLE videoThread_ = NULL;
     HANDLE controlThread_ = NULL;
+    HANDLE controlSenderThread_ = NULL;
+    HANDLE controlSendEvent_ = NULL;
     HANDLE serverProc_ = NULL;
     HANDLE mirrorProc_ = NULL;
     DWORD mirrorPid_ = 0;
@@ -148,6 +176,7 @@ private:
     mutable CRITICAL_SECTION sendLock_;
     mutable CRITICAL_SECTION metaLock_;
     mutable CRITICAL_SECTION procSpawnLock_;
+    ControlPacketQueue controlQueue_;
 
     std::string adbExe_;
     std::string activeSerial_;

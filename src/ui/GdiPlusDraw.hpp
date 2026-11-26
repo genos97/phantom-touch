@@ -81,6 +81,10 @@ public:
     static void textRight(Gdiplus::Graphics& g, const std::string& text,
                           float rightX, float cy, float sizePx, bool bold, uint32_t colorArgb);
 
+    // Pre-warm and tear down cached GDI+ fonts/formats inside GdiPlusSession lifetime
+    static void warmCache();
+    static void clearCache();
+
     static void drawToggleSwitch(Gdiplus::Graphics& g, const RECT& rc, bool on, uint32_t accentArgb);
     static void drawSlider(Gdiplus::Graphics& g, const RECT& trackRc, float norm01, uint32_t accentArgb, bool hovered);
     static void drawIcon(Gdiplus::Graphics& g, UiIcon icon, float cx, float cy, float sz, uint32_t colorArgb);

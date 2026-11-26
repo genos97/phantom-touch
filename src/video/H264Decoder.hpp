@@ -1,5 +1,7 @@
 #pragma once
 
+#include "video/LatencyTelemetry.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -21,10 +23,11 @@ struct IMFDXGIDeviceManager;
 
 typedef void (*DecodedFrameFn)(void* ctx, const DecodedNV12Frame& frame);
 typedef void (*DecodedGpuFrameFn)(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
-                                  uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH);
+                                  uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                                  const FrameTiming& timing);
 typedef void (*DecodedCpuViewFn)(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
                                  uint32_t stride, uint32_t cropX, uint32_t cropY,
-                                 uint32_t outW, uint32_t outH);
+                                 uint32_t outW, uint32_t outH, const FrameTiming& timing);
 
 // Hardware-accelerated (DXVA / D3D11 Media Foundation) Annex-B H.264 decoder -> NV12.
 // Uses Windows built-in CMSH264DecoderMFT with zero external codec DLLs.
@@ -49,7 +52,8 @@ public:
     // Invokes the configured frame callback synchronously for each decoded frame produced.
     // Returns true if at least one frame was decoded.
     bool decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
-                      bool isConfig, bool isKeyFrame);
+                      bool isConfig, bool isKeyFrame,
+                      bool present = true, int64_t qpcPktRecv = 0);
 
     void flush();
 
@@ -81,6 +85,7 @@ private:
     bool sawFirstKeyFrame_ = false;
 
     DecodedNV12Frame workFrame_;
+    FrameTiming curTiming_;
     DecodedFrameFn frameCb_ = nullptr;
     void* frameCbCtx_ = nullptr;
     DecodedGpuFrameFn gpuFrameCb_ = nullptr;

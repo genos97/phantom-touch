@@ -14,7 +14,8 @@ bool ptIn(const RECT& r, int x, int y) {
 void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
                    const std::string& deviceLabel, bool connected, bool demoMode,
                    const Profile& profile, const EngineTelemetry& tel,
-                   bool alwaysOnTop, bool maximized, int hoverX, int hoverY) {
+                   bool alwaysOnTop, bool maximized, int hoverX, int hoverY,
+                   const TelemetrySummary& videoTel) {
     buttons_.clear();
 
     const int x0 = bounds.left;
@@ -88,9 +89,22 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
     buttons_.push_back(Btn{ rMax, TB_MAXIMIZE });
     buttons_.push_back(Btn{ rClose, TB_CLOSE });
 
-    // 5. Live Telemetry Pill (if space permits between profile pill and pin button)
+    // 5. Live Telemetry Pill + Video Pipeline Latency Pill (0.1)
     int availRight = rPin.left - 12;
-    if (availRight - curX >= 220) {
+    if (connected && videoTel.presentedCount > 0 && (availRight - curX) >= 400) {
+        char latBuf[80];
+        std::snprintf(latBuf, sizeof(latBuf), "p50 %.1f / p95 %.1fms | %llu/%llu/%llu",
+                      videoTel.rxToPresentP50Ms, videoTel.rxToPresentP95Ms,
+                      static_cast<unsigned long long>(videoTel.decodedCount),
+                      static_cast<unsigned long long>(videoTel.presentedCount),
+                      static_cast<unsigned long long>(videoTel.skippedCount));
+        RECT rLat = { curX, y0 + 7, curX + 196, y1 - 7 };
+        GdiPlusDraw::roundedCard(g, rLat, 12.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, latBuf, static_cast<float>(rLat.left + rLat.right) * 0.5f, cy,
+                                10.0f, false, Theme::TEXT_SECONDARY);
+        curX = rLat.right + 8;
+    }
+    if (availRight - curX >= 216) {
         char telBuf[96];
         uint32_t bg = Theme::ACCENT_AMBER_BG;
         uint32_t bd = Theme::ACCENT_AMBER;

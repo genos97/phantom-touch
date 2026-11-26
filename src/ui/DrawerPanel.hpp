@@ -4,6 +4,7 @@
 #include "config/AppSettings.hpp"
 #include "config/Profile.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "video/LatencyTelemetry.hpp"
 
 #include <string>
 #include <vector>
@@ -28,6 +29,8 @@ struct DrawerActionResult {
     bool requestLinkCurrentApp = false;
     bool requestUnlinkApp = false;
     bool requestCalibrateAspect = false;
+    bool requestRunLatencyProbe = false;
+    bool vsyncToggled = false;
     std::string toastMessage;
 };
 
@@ -46,6 +49,11 @@ public:
 
     void setActiveTab(int tab);
     int activeTab() const { return activeTab_; }
+    void setLatencyDiagnostics(const TelemetrySummary& vidTel, const ProbeResult& probe, const std::string& presentMode) {
+        vidTelemetry_ = vidTel;
+        probeResult_ = probe;
+        presentModeLabel_ = presentMode;
+    }
 
     bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_; }
     bool isWaitingSpecialRebind() const { return rebindingToggleAim_ || rebindingHoldUnlock_; }
@@ -147,4 +155,8 @@ private:
     bool editingWireless_ = false;
     bool rebindingToggleAim_ = false;
     bool rebindingHoldUnlock_ = false;
+
+    TelemetrySummary vidTelemetry_;
+    ProbeResult probeResult_;
+    std::string presentModeLabel_;
 };

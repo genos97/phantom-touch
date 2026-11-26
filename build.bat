@@ -41,14 +41,17 @@ if %ERRORLEVEL% NEQ 0 (
     src\bridge\ScrcpyBridge.cpp ^
     src\video\H264Decoder.cpp ^
     src\video\D3D11Renderer.cpp ^
+    src\video\LatencyTelemetry.cpp ^
     src\config\KeyCodes.cpp ^
     src\config\Profile.cpp ^
     src\config\ProfileStore.cpp ^
     src\config\AppSettings.cpp ^
+    src\engine\ThreadScheduling.cpp ^
     src\engine\FpsViewController.cpp ^
     src\engine\JoystickController.cpp ^
     src\engine\GamepadController.cpp ^
     src\engine\ActionDispatcher.cpp ^
+    src\engine\InputHookThread.cpp ^
     src\engine\InputEngine.cpp ^
     src\ui\GdiPlusDraw.cpp ^
     src\ui\HudRenderer.cpp ^

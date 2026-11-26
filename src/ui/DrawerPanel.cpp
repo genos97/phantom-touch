@@ -66,16 +66,20 @@ enum DrawerActionId {
     DA_STREAM_BITRATE,  // extra = 8/12/16/24
     DA_STREAM_MAXSIZE,  // extra = 0/1600/1280
     DA_TOGGLE_NATIVE_VIDEO,
+    DA_TOGGLE_VSYNC,
     DA_TOGGLE_VIRTUAL_DISPLAY,
     DA_VD_PRESET,       // extra = 0 (1080p), 1 (720p), 2 (auto)
     DA_TOGGLE_GAMEPAD,
     DA_TOGGLE_AUDIO,
+    DA_AUDIO_BUFFER,    // extra = 20 / 25 / 30
+    DA_TOGGLE_AUDIO_RAW,
     DA_TOGGLE_SCREEN_OFF,
     DA_TOGGLE_STAY_AWAKE,
     DA_TOGGLE_AUTO_SWITCH,
     DA_TOGGLE_RCLICK_BACK,
     DA_APPLY_RECONNECT,
     DA_DISCONNECT,
+    DA_RUN_LATENCY_PROBE,
     DA_FOCUS_WIRELESS,
     DA_CONNECT_WIRELESS
 };
@@ -793,6 +797,7 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
 
     // Stage 2 & Stage 3 Renderer + Second-Phone Virtual Display controls
     drawToggleRow(g, x, y, w, "Native D3D11 Single-Stream Video", s.useNativeVideo, Theme::ACCENT_CYAN, DA_TOGGLE_NATIVE_VIDEO, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, "VSync (Waitable, No Tearing)", s.vsyncEnabled, Theme::ACCENT_CYAN, DA_TOGGLE_VSYNC, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Second-Phone Virtual Display", s.virtualDisplayMode, Theme::ACCENT_PURPLE, DA_TOGGLE_VIRTUAL_DISPLAY, hoverX, hoverY); y += 34;
 
     if (s.virtualDisplayMode) {
@@ -804,6 +809,10 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
 
     drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Forward Phone Audio (scrcpy 5.0)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
+    if (s.mirrorAudio) {
+        drawSeg3("AUDIO RELAY BUFFER (1.6)", "20ms", "25ms", "30ms", 20, 25, 30, s.audioBufferMs, DA_AUDIO_BUFFER);
+        drawToggleRow(g, x, y, w, "Raw PCM Audio (USB Low-Latency)", s.audioRawCodec, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO_RAW, hoverX, hoverY); y += 36;
+    }
     drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, "Auto-Switch Profile by Open App", s.autoSwitchProfiles, Theme::ACCENT_GREEN, DA_TOGGLE_AUTO_SWITCH, hoverX, hoverY); y += 36;
@@ -824,6 +833,35 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         hotspots_.push_back(Hotspot{ rDis, DA_DISCONNECT, 0 });
     }
     y += 42;
+
+    // Latency Probe & Telemetry Card (0.1, 0.2, 0.3)
+    GdiPlusDraw::textLeft(g, "LATENCY BENCHMARK (Ctrl+Shift+L)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+    y += 20;
+    RECT rLatCard = { x, y, x + w, y + 72 };
+    GdiPlusDraw::roundedCard(g, rLatCard, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+    char modeLine[96];
+    std::snprintf(modeLine, sizeof(modeLine), "Present: %s | Dec %llu Skp %llu",
+                  presentModeLabel_.empty() ? "Idle" : presentModeLabel_.c_str(),
+                  static_cast<unsigned long long>(vidTelemetry_.decodedCount),
+                  static_cast<unsigned long long>(vidTelemetry_.skippedCount));
+    GdiPlusDraw::textLeft(g, modeLine, static_cast<float>(x + 10), static_cast<float>(y + 12), 10.0f, false, Theme::TEXT_SECONDARY, static_cast<float>(w - 20));
+    std::string probeTxt = probeResult_.running
+        ? probeResult_.summaryLine
+        : (probeResult_.valid ? probeResult_.summaryLine : "No round-trip probe run yet");
+    GdiPlusDraw::textLeft(g, probeTxt, static_cast<float>(x + 10), static_cast<float>(y + 28), 10.5f, true,
+                          probeResult_.valid ? Theme::ACCENT_GREEN : Theme::TEXT_MUTED, static_cast<float>(w - 20));
+    RECT rProbeBtn = { x + 10, y + 42, x + w - 10, y + 66 };
+    bool hovPr = ptIn(rProbeBtn, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rProbeBtn, 6.0f,
+                             probeResult_.running ? Theme::ACCENT_AMBER_BG : (hovPr ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG),
+                             probeResult_.running ? Theme::ACCENT_AMBER : Theme::ACCENT_CYAN, 1.0f);
+    GdiPlusDraw::textCenter(g, probeResult_.running ? "PROBING ROUND-TRIP LATENCY..." : "LATENCY TEST (50-100x Round-Trip)",
+                            static_cast<float>(rProbeBtn.left + rProbeBtn.right) * 0.5f, static_cast<float>(y + 54), 10.5f, true,
+                            hovPr && !probeResult_.running ? 0xFF08121Au : Theme::TEXT_PRIMARY);
+    if (rProbeBtn.bottom > bodyClip_.top && rProbeBtn.top < bodyClip_.bottom && !probeResult_.running) {
+        hotspots_.push_back(Hotspot{ rProbeBtn, DA_RUN_LATENCY_PROBE, 0 });
+    }
+    y += 80;
 
     // Wireless ADB quick connect
     GdiPlusDraw::textLeft(g, "WIRELESS ADB", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
@@ -1087,6 +1125,14 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                     ? "Native D3D11 Single-Stream ON (click Apply & Reconnect)"
                     : "Legacy scrcpy.exe Fallback ON (click Apply & Reconnect)";
                 return true;
+            case DA_TOGGLE_VSYNC:
+                settings.vsyncEnabled = !settings.vsyncEnabled;
+                out.settingsModified = true;
+                out.vsyncToggled = true;
+                out.toastMessage = settings.vsyncEnabled
+                    ? "VSync ON (Waitable 1-frame, No Tearing)"
+                    : "VSync OFF (Flip + Immediate Tearing)";
+                return true;
             case DA_TOGGLE_VIRTUAL_DISPLAY:
                 settings.virtualDisplayMode = !settings.virtualDisplayMode;
                 if (settings.virtualDisplayMode) settings.useNativeVideo = true;
@@ -1106,6 +1152,8 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 out.toastMessage = settings.gamepadEnabled ? "XInput Gamepad: ON" : "XInput Gamepad: OFF";
                 return true;
             case DA_TOGGLE_AUDIO:      settings.mirrorAudio = !settings.mirrorAudio; out.settingsModified = true; return true;
+            case DA_AUDIO_BUFFER:      settings.audioBufferMs = hs.extra; out.settingsModified = true; return true;
+            case DA_TOGGLE_AUDIO_RAW:  settings.audioRawCodec = !settings.audioRawCodec; out.settingsModified = true; return true;
             case DA_TOGGLE_SCREEN_OFF: settings.turnScreenOff = !settings.turnScreenOff; out.settingsModified = true; return true;
             case DA_TOGGLE_STAY_AWAKE: settings.stayAwake = !settings.stayAwake; out.settingsModified = true; return true;
             case DA_TOGGLE_AUTO_SWITCH:
@@ -1120,6 +1168,7 @@ bool DrawerPanel::onMouseDown(int x, int y, Profile& profile, AppSettings& setti
                 return true;
             case DA_APPLY_RECONNECT:   out.requestReconnectStream = true; return true;
             case DA_DISCONNECT:        out.requestDisconnectDevice = true; return true;
+            case DA_RUN_LATENCY_PROBE: out.requestRunLatencyProbe = true; return true;
             case DA_FOCUS_WIRELESS:    editingWireless_ = true; return true;
             case DA_CONNECT_WIRELESS:
                 out.requestConnectWireless = true;

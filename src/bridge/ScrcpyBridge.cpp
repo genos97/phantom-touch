@@ -1,5 +1,7 @@
 #include "bridge/ScrcpyBridge.hpp"
 #include "bridge/SpsParser.hpp"
+#include "engine/ThreadScheduling.hpp"
+#include "video/LatencyTelemetry.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -7,7 +9,47 @@
 #include <ctime>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <vector>
+
+std::string ControlPacketQueue::truncateUtf8Cap(const std::string& utf8, size_t maxBytes) {
+    if (utf8.size() <= maxBytes) return utf8;
+    if (maxBytes == 0) return "";
+    size_t cut = maxBytes;
+    while (cut > 0 && (static_cast<unsigned char>(utf8[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    return utf8.substr(0, cut);
+}
+
+void ControlPacketQueue::push(const std::vector<uint8_t>& pkt, bool highPrio) {
+    if (highPrio) hi_.push_back(pkt);
+    else          lo_.push_back(pkt);
+}
+
+void ControlPacketQueue::push(std::vector<uint8_t>&& pkt, bool highPrio) {
+    if (highPrio) hi_.push_back(std::move(pkt));
+    else          lo_.push_back(std::move(pkt));
+}
+
+bool ControlPacketQueue::popNext(std::vector<uint8_t>& outPkt) {
+    if (!hi_.empty()) {
+        outPkt = std::move(hi_.front());
+        hi_.pop_front();
+        return true;
+    }
+    if (!lo_.empty()) {
+        outPkt = std::move(lo_.front());
+        lo_.pop_front();
+        return true;
+    }
+    return false;
+}
+
+void ControlPacketQueue::clear() {
+    hi_.clear();
+    lo_.clear();
+}
 
 namespace {
 
@@ -215,6 +257,7 @@ ScrcpyBridge::ScrcpyBridge() {
     InitializeCriticalSection(&sendLock_);
     InitializeCriticalSection(&metaLock_);
     InitializeCriticalSection(&procSpawnLock_);
+    controlSendEvent_ = CreateEventW(NULL, FALSE, FALSE, NULL);
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
         wsaInit_ = true;
@@ -223,6 +266,10 @@ ScrcpyBridge::ScrcpyBridge() {
 
 ScrcpyBridge::~ScrcpyBridge() {
     disconnect();
+    if (controlSendEvent_) {
+        CloseHandle(controlSendEvent_);
+        controlSendEvent_ = NULL;
+    }
     if (wsaInit_) {
         WSACleanup();
     }
@@ -316,10 +363,24 @@ std::vector<std::string> ScrcpyBridge::getRecentLogs() const {
 }
 
 std::string ScrcpyBridge::adbPrefix() const {
-    if (activeSerial_.empty()) {
-        return "\"" + adbExe_ + "\"";
+    EnterCriticalSection(&metaLock_);
+    std::string exe = adbExe_;
+    std::string ser = activeSerial_;
+    LeaveCriticalSection(&metaLock_);
+    if (ser.empty()) {
+        return "\"" + exe + "\"";
     }
-    return "\"" + adbExe_ + "\" -s \"" + activeSerial_ + "\"";
+    return "\"" + exe + "\" -s \"" + ser + "\"";
+}
+
+bool ScrcpyBridge::runAdbShell(const std::string& shellArgs, std::string& outText, DWORD timeoutMs) {
+    outText.clear();
+    EnterCriticalSection(&metaLock_);
+    std::string exe = adbExe_;
+    LeaveCriticalSection(&metaLock_);
+    if (exe.empty() || shellArgs.empty()) return false;
+    DWORD ec = 0;
+    return runCommandCapture(adbPrefix() + " shell " + shellArgs, outText, ec, timeoutMs) && ec == 0;
 }
 
 std::vector<AdbDeviceInfo> ScrcpyBridge::parseAdbDevicesOutput(const std::string& raw) {
@@ -539,9 +600,18 @@ bool ScrcpyBridge::launchMirrorWindow(const ToolPaths& tools, const std::string&
     return true;
 }
 
-bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial, std::string& outError) {
+bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::string& deviceSerial,
+                                        int audioBufferMs, bool rawCodec, std::string& outError) {
     if (mirrorProc_ != NULL) return true;
-    std::string cmd = "\"" + tools.scrcpyExe + "\" --no-window --no-video --no-control";
+    if (audioBufferMs < 15) audioBufferMs = 15;
+    if (audioBufferMs > 100) audioBufferMs = 100;
+    char abuf[48];
+    std::snprintf(abuf, sizeof(abuf), " --audio-buffer=%d", audioBufferMs);
+    std::string cmd = "\"" + tools.scrcpyExe + "\" --no-window --no-video --no-control" + abuf;
+    const bool isUsb = (!deviceSerial.empty() && deviceSerial.find(':') == std::string::npos);
+    if (rawCodec && isUsb) {
+        cmd += " --audio-codec=raw";
+    }
     if (!deviceSerial.empty()) {
         cmd += " -s \"" + deviceSerial + "\"";
     }
@@ -564,7 +634,8 @@ bool ScrcpyBridge::launchAudioOnlyRelay(const ToolPaths& tools, const std::strin
     mirrorProc_ = pi.hProcess;
     mirrorPid_ = pi.dwProcessId;
     CloseHandle(pi.hThread);
-    appendLog("[Audio] Launched scrcpy audio-only relay (--no-window --no-video)");
+    appendLog(std::string("[Audio] Launched scrcpy audio relay (--no-window --no-video") + abuf +
+              ((rawCodec && isUsb) ? " --audio-codec=raw)" : ")"));
     return true;
 }
 
@@ -909,10 +980,16 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
     screenH_ = initH;
     LeaveCriticalSection(&metaLock_);
 
-    // 8. Spawn background reader threads (rotation tracking + drain control acks)
+    // 8. Spawn background reader & priority control-sender threads
+    EnterCriticalSection(&sendLock_);
+    controlQueue_.clear();
+    LeaveCriticalSection(&sendLock_);
+    InterlockedExchange(&injectVideoStall_, 0);
     InterlockedExchange(&stopThreads_, 0);
     InterlockedExchange(&connected_, 1);
 
+    controlSenderThread_ = CreateThread(NULL, 0, controlSenderProc, this, 0, NULL);
+    if (controlSenderThread_) SetThreadPriority(controlSenderThread_, THREAD_PRIORITY_HIGHEST);
     videoThread_ = CreateThread(NULL, 0, videoReaderProc, this, 0, NULL);
     controlThread_ = CreateThread(NULL, 0, controlReaderProc, this, 0, NULL);
 
@@ -926,6 +1003,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
 void ScrcpyBridge::disconnect() {
     InterlockedExchange(&connected_, 0);
     InterlockedExchange(&stopThreads_, 1);
+    if (controlSendEvent_) SetEvent(controlSendEvent_);
 
     if (videoSock_ != INVALID_SOCKET) {
         shutdown(videoSock_, SD_BOTH);
@@ -938,6 +1016,11 @@ void ScrcpyBridge::disconnect() {
         controlSock_ = INVALID_SOCKET;
     }
 
+    if (controlSenderThread_) {
+        WaitForSingleObject(controlSenderThread_, 1000);
+        CloseHandle(controlSenderThread_);
+        controlSenderThread_ = NULL;
+    }
     if (videoThread_) {
         WaitForSingleObject(videoThread_, 1000);
         CloseHandle(videoThread_);
@@ -948,6 +1031,10 @@ void ScrcpyBridge::disconnect() {
         CloseHandle(controlThread_);
         controlThread_ = NULL;
     }
+
+    EnterCriticalSection(&sendLock_);
+    controlQueue_.clear();
+    LeaveCriticalSection(&sendLock_);
 
     if (serverProc_) {
         TerminateProcess(serverProc_, 0);
@@ -1002,6 +1089,20 @@ bool ScrcpyBridge::recvAll(SOCKET s, uint8_t* data, int len) {
     return true;
 }
 
+bool ScrcpyBridge::enqueueControlPacket(std::vector<uint8_t>&& pkt, bool highPrio) {
+    if (!connected_ || pkt.empty()) return false;
+    EnterCriticalSection(&sendLock_);
+    bool ok = (controlSock_ != INVALID_SOCKET);
+    if (ok) {
+        controlQueue_.push(std::move(pkt), highPrio);
+    }
+    LeaveCriticalSection(&sendLock_);
+    if (ok && controlSendEvent_) {
+        SetEvent(controlSendEvent_);
+    }
+    return ok;
+}
+
 bool ScrcpyBridge::sendTouchPixels(TouchAction action, uint64_t pointerId, int32_t px, int32_t py, bool clampToScreen) {
     if (!connected_) return false;
 
@@ -1022,27 +1123,20 @@ bool ScrcpyBridge::sendTouchPixels(TouchAction action, uint64_t pointerId, int32
         if (py >  1000000) py =  1000000;
     }
 
-    uint8_t msg[32];
+    std::vector<uint8_t> msg(32);
     msg[0] = 2; // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
     msg[1] = static_cast<uint8_t>(action);
-    writeU64BE(msg + 2, pointerId);
-    writeU32BE(msg + 10, static_cast<uint32_t>(px));
-    writeU32BE(msg + 14, static_cast<uint32_t>(py));
-    writeU16BE(msg + 18, static_cast<uint16_t>(w));
-    writeU16BE(msg + 20, static_cast<uint16_t>(h));
+    writeU64BE(msg.data() + 2, pointerId);
+    writeU32BE(msg.data() + 10, static_cast<uint32_t>(px));
+    writeU32BE(msg.data() + 14, static_cast<uint32_t>(py));
+    writeU16BE(msg.data() + 18, static_cast<uint16_t>(w));
+    writeU16BE(msg.data() + 20, static_cast<uint16_t>(h));
     uint16_t pressure = (action == TOUCH_UP) ? 0x0000u : 0xFFFFu;
-    writeU16BE(msg + 22, pressure);
-    writeU32BE(msg + 24, 0u); // action_button = 0 (multi-touch finger)
-    writeU32BE(msg + 28, 0u); // buttons = 0
+    writeU16BE(msg.data() + 22, pressure);
+    writeU32BE(msg.data() + 24, 0u); // action_button = 0 (multi-touch finger)
+    writeU32BE(msg.data() + 28, 0u); // buttons = 0
 
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
-    LeaveCriticalSection(&sendLock_);
-
-    if (!ok) {
-        InterlockedExchange(&connected_, 0);
-    }
-    return ok;
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 bool ScrcpyBridge::sendTouchNorm(TouchAction action, uint64_t pointerId, float nx, float ny) {
@@ -1057,17 +1151,13 @@ bool ScrcpyBridge::sendKeycode(uint8_t action, uint32_t androidKeycode, uint32_t
     if (!connected_) return false;
     // SC_CONTROL_MSG_TYPE_INJECT_KEYCODE (14 bytes):
     // [0] type=0, [1] action, [2..5] keycode, [6..9] repeat, [10..13] metastate
-    uint8_t msg[14] = {0};
+    std::vector<uint8_t> msg(14, 0);
     msg[0] = 0;
     msg[1] = action;
-    writeU32BE(msg + 2, androidKeycode);
-    writeU32BE(msg + 6, 0);
-    writeU32BE(msg + 10, metastate);
-
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    writeU32BE(msg.data() + 2, androidKeycode);
+    writeU32BE(msg.data() + 6, 0);
+    writeU32BE(msg.data() + 10, metastate);
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 bool ScrcpyBridge::sendText(const std::string& utf8Text) {
@@ -1076,7 +1166,7 @@ bool ScrcpyBridge::sendText(const std::string& utf8Text) {
     if (!isPureAscii(utf8Text)) {
         return sendSetClipboard(utf8Text, true);
     }
-    // SC_CONTROL_MSG_TYPE_INJECT_TEXT (type=1): [1:1][len:4 BE][utf8 bytes] (max 300B per scrcpy packet)
+    // SC_CONTROL_MSG_TYPE_INJECT_TEXT (type=1): [1:1][len:4 BE][utf8 bytes] (low priority behind touch/key)
     std::vector<std::string> chunks = splitUtf8Chunks(utf8Text, 250);
     for (size_t i = 0; i < chunks.size(); ++i) {
         const std::string& chunk = chunks[i];
@@ -1084,43 +1174,40 @@ bool ScrcpyBridge::sendText(const std::string& utf8Text) {
         msg[0] = 1;
         writeU32BE(msg.data() + 1, static_cast<uint32_t>(chunk.size()));
         std::memcpy(msg.data() + 5, chunk.data(), chunk.size());
-
-        EnterCriticalSection(&sendLock_);
-        bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
-        LeaveCriticalSection(&sendLock_);
-        if (!ok) return false;
+        if (!enqueueControlPacket(std::move(msg), false)) return false;
     }
     return true;
 }
 
 bool ScrcpyBridge::sendSetClipboard(const std::string& utf8Text, bool paste) {
     if (!connected_) return false;
-    // SC_CONTROL_MSG_TYPE_SET_CLIPBOARD (type=9): [9:1][seq:8 BE][paste:1][len:4 BE][utf8 bytes]
-    size_t len = utf8Text.size();
-    if (len > 262100) len = 262100;
+    // 1.7: cap clipboard payload to 32 KB on a UTF-8 code-point boundary & enqueue at low priority
+    std::string capped = ControlPacketQueue::truncateUtf8Cap(utf8Text, ControlPacketQueue::kMaxClipboardBytes);
+    const size_t len = capped.size();
     std::vector<uint8_t> msg(14 + len);
     msg[0] = 9;
     EnterCriticalSection(&sendLock_);
-    uint64_t seq = ++clipSeq_;
-    writeU64BE(msg.data() + 1, seq);
-    msg[9] = paste ? 1u : 0u;
-    writeU32BE(msg.data() + 10, static_cast<uint32_t>(len));
-    if (len > 0) std::memcpy(msg.data() + 14, utf8Text.data(), len);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
+    bool ok = (controlSock_ != INVALID_SOCKET);
+    if (ok) {
+        uint64_t seq = ++clipSeq_;
+        writeU64BE(msg.data() + 1, seq);
+        msg[9] = paste ? 1u : 0u;
+        writeU32BE(msg.data() + 10, static_cast<uint32_t>(len));
+        if (len > 0) std::memcpy(msg.data() + 14, capped.data(), len);
+        controlQueue_.push(std::move(msg), false);
+    }
     LeaveCriticalSection(&sendLock_);
+    if (ok && controlSendEvent_) SetEvent(controlSendEvent_);
     return ok;
 }
 
 bool ScrcpyBridge::sendGetClipboard(uint8_t copyKey) {
     if (!connected_) return false;
     // SC_CONTROL_MSG_TYPE_GET_CLIPBOARD (type=8): [8:1][copy_key:1] (0=NONE, 1=COPY, 2=CUT)
-    uint8_t msg[2];
+    std::vector<uint8_t> msg(2);
     msg[0] = 8;
     msg[1] = copyKey;
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    return enqueueControlPacket(std::move(msg), false);
 }
 
 void ScrcpyBridge::setClipboardCallback(DeviceClipboardFn fn, void* ctx) {
@@ -1146,29 +1233,21 @@ bool ScrcpyBridge::sendStartApp(const std::string& appName) {
     msg[0] = 16;
     msg[1] = static_cast<uint8_t>(len);
     std::memcpy(msg.data() + 2, appName.data(), len);
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg.data(), static_cast<int>(msg.size()));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 bool ScrcpyBridge::sendResetVideo() {
     if (!connected_) return false;
-    uint8_t msg[1] = { 17 }; // SC_CONTROL_MSG_TYPE_RESET_VIDEO
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    std::vector<uint8_t> msg(1, 17); // SC_CONTROL_MSG_TYPE_RESET_VIDEO
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 bool ScrcpyBridge::sendResizeDisplay(uint16_t width, uint16_t height) {
     if (!connected_) return false;
-    uint8_t msg[5];
-    size_t len = serializeResizeDisplay(msg, width, height);
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, static_cast<int>(len));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    std::vector<uint8_t> msg(5);
+    size_t len = serializeResizeDisplay(msg.data(), width, height);
+    msg.resize(len);
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 std::string ScrcpyBridge::parseForegroundPackage(const std::string& raw) {
@@ -1285,13 +1364,10 @@ void ScrcpyBridge::sendAndroidNav(uint32_t androidKeycode) {
 bool ScrcpyBridge::setDisplayPower(bool on) {
     if (!connected_) return false;
     // SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER (type=10, 2 bytes: [10, on ? 1 : 0])
-    uint8_t msg[2];
+    std::vector<uint8_t> msg(2);
     msg[0] = 10;
     msg[1] = on ? 1u : 0u;
-    EnterCriticalSection(&sendLock_);
-    bool ok = (controlSock_ != INVALID_SOCKET) && sendAll(controlSock_, msg, sizeof(msg));
-    LeaveCriticalSection(&sendLock_);
-    return ok;
+    return enqueueControlPacket(std::move(msg), true);
 }
 
 bool ScrcpyBridge::captureScreenshot(const std::string& savePath, std::string& outError) {
@@ -1331,11 +1407,61 @@ DWORD WINAPI ScrcpyBridge::controlReaderProc(LPVOID param) {
     return 0;
 }
 
+DWORD WINAPI ScrcpyBridge::controlSenderProc(LPVOID param) {
+    static_cast<ScrcpyBridge*>(param)->runControlSender();
+    return 0;
+}
+
+void ScrcpyBridge::runControlSender() {
+    DWORD taskIdx = 0;
+    HANDLE avrt = ThreadScheduling::enableMmcssGames(taskIdx);
+
+    std::vector<uint8_t> pkt;
+    while (!stopThreads_) {
+        bool hasPkt = false;
+        SOCKET sock = INVALID_SOCKET;
+        EnterCriticalSection(&sendLock_);
+        sock = controlSock_;
+        if (sock != INVALID_SOCKET) {
+            hasPkt = controlQueue_.popNext(pkt);
+        }
+        LeaveCriticalSection(&sendLock_);
+
+        if (!hasPkt) {
+            if (controlSendEvent_) {
+                WaitForSingleObject(controlSendEvent_, 20);
+            } else {
+                Sleep(1);
+            }
+            continue;
+        }
+
+        if (!sendAll(sock, pkt.data(), static_cast<int>(pkt.size()))) {
+            InterlockedExchange(&connected_, 0);
+            break;
+        }
+    }
+
+    ThreadScheduling::disableMmcss(avrt);
+}
+
 void ScrcpyBridge::runVideoReader() {
+    DWORD taskIdx = 0;
+    HANDLE avrt = ThreadScheduling::enableMmcssGames(taskIdx);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
     std::vector<uint8_t> payload;
+    int consecutiveSkips = 0;
     while (!stopThreads_) {
         uint8_t hdr[12];
         if (!recvAll(videoSock_, hdr, 12)) break;
+        const int64_t qpcPktRecv = LatencyTelemetry::nowQpc();
+
+        // 1.1 debug stall test: simulate a 300ms decoder/network stall on Ctrl+Shift+T
+        if (InterlockedCompareExchange(&injectVideoStall_, 0, 1) == 1) {
+            appendLog("[Video] Injecting 300ms stall test...");
+            Sleep(300);
+        }
 
         // scrcpy v4/v5+ emits a 12-byte session header (top bit set!) on rotation or client-requested resize
         if (isV4Proto_ && (hdr[0] & 0x80u) != 0) {
@@ -1389,6 +1515,21 @@ void ScrcpyBridge::runVideoReader() {
             }
         }
 
+        // 1.1: Decode every packet for H.264 P-frame reference integrity, but only present
+        // when no newer packet is queued in the socket (with a 3-skip safety valve).
+        bool wantPresent = true;
+        if (!isConfig && pktSize > 0) {
+            u_long avail = 0;
+            ioctlsocket(videoSock_, FIONREAD, &avail);
+            wantPresent = (avail < 12);
+            if (!wantPresent && consecutiveSkips < 3) {
+                ++consecutiveSkips;
+            } else {
+                wantPresent = true;
+                consecutiveSkips = 0;
+            }
+        }
+
         VideoPacketFn vcb = nullptr;
         void* vctx = nullptr;
         EnterCriticalSection(&metaLock_);
@@ -1396,9 +1537,10 @@ void ScrcpyBridge::runVideoReader() {
         vctx = videoCbCtx_;
         LeaveCriticalSection(&metaLock_);
         if (vcb && pktSize > 0) {
-            vcb(vctx, payload.data(), pktSize, ptsUs, isConfig, isKeyFrame);
+            vcb(vctx, payload.data(), pktSize, ptsUs, isConfig, isKeyFrame, wantPresent, qpcPktRecv);
         }
     }
+    ThreadScheduling::disableMmcss(avrt);
     InterlockedExchange(&connected_, 0);
 }
 

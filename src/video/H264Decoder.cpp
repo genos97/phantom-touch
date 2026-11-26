@@ -120,12 +120,16 @@ bool H264Decoder::init(uint32_t initialW, uint32_t initialH, std::string& outErr
         codecApi->Release();
     }
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
     // Attach DXVA / D3D11 GPU Hardware Video Decoder BEFORE negotiating media types!
     // Keeps H.264 decode on NVDEC / Intel QuickSync ASIC (<1% CPU, zero VRAM->RAM copies).
     dxvaActive_ = false;
     if (d3dDevice && d3d11Aware) {
-        HMODULE hMfPlat = GetModuleHandleA("mfplat.dll");
-        if (!hMfPlat) hMfPlat = LoadLibraryA("mfplat.dll");
+        HMODULE hMfPlat = GetModuleHandleW(L"mfplat.dll");
+        if (!hMfPlat) hMfPlat = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!hMfPlat) hMfPlat = LoadLibraryW(L"mfplat.dll");
         if (hMfPlat) {
             PFN_MFCreateDXGIDeviceManager fnCreateMgr = reinterpret_cast<PFN_MFCreateDXGIDeviceManager>(
                 reinterpret_cast<void*>(GetProcAddress(hMfPlat, "MFCreateDXGIDeviceManager")));
@@ -317,7 +321,8 @@ void H264Decoder::flush() {
 }
 
 bool H264Decoder::decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
-                               bool isConfig, bool isKeyFrame) {
+                               bool isConfig, bool isKeyFrame,
+                               bool present, int64_t qpcPktRecv) {
     if (!mft_ || !data || size == 0) return false;
 
     if (isConfig) {
@@ -344,6 +349,10 @@ bool H264Decoder::decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
         }
         sawFirstKeyFrame_ = true;
     }
+
+    curTiming_ = FrameTiming{};
+    curTiming_.qpcPktRecv = qpcPktRecv;
+    curTiming_.present = present;
 
     const bool prepend = (pendingConfigPrepend_ || isKeyFrame) && !spsPps_.empty();
     const size_t totalSize = (prepend ? spsPps_.size() : 0) + size;
@@ -377,6 +386,7 @@ bool H264Decoder::decodePacket(const uint8_t* data, size_t size, uint64_t ptsUs,
     }
 
     bool decodedAny = false;
+    curTiming_.qpcProcIn = LatencyTelemetry::nowQpc();
     HRESULT hr = mft_->ProcessInput(0, inSample, 0);
     if (hr == MF_E_NOTACCEPTING) {
         drainOutputs(decodedAny);
@@ -452,7 +462,8 @@ bool H264Decoder::drainOutputs(bool& decodedAny) {
                             if (outW >= 16 && outH >= 16) {
                                 decodedAny = true;
                                 deliveredGpu = true;
-                                gpuFrameCb_(gpuFrameCbCtx_, nv12Tex, subIdx, cropXEven, cropYEven, outW, outH);
+                                curTiming_.qpcDecoded = LatencyTelemetry::nowQpc();
+                                gpuFrameCb_(gpuFrameCbCtx_, nv12Tex, subIdx, cropXEven, cropYEven, outW, outH, curTiming_);
                             }
                             nv12Tex->Release();
                         }
@@ -501,8 +512,9 @@ bool H264Decoder::drainOutputs(bool& decodedAny) {
                         decodedAny = true;
                         if (cpuViewCb_) {
                             // Zero-intermediate-copy direct upload straight into D3D11 dynamic texture!
+                            curTiming_.qpcDecoded = LatencyTelemetry::nowQpc();
                             cpuViewCb_(cpuViewCbCtx_, srcPtr, srcUVBase, srcStride,
-                                       cropXEven, cropYEven, outW, outH);
+                                       cropXEven, cropYEven, outW, outH, curTiming_);
                         }
                         if (frameCb_) {
                             workFrame_.width = outW;

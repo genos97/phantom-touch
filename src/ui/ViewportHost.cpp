@@ -167,7 +167,7 @@ bool ViewportHost::rebuildNativeDevice(std::string& outError) {
     return true;
 }
 
-bool ViewportHost::ensureNativeDeviceInitialized(std::string& outError) {
+bool ViewportHost::ensureNativeDeviceInitialized(std::string& outError, bool vsyncEnabled) {
     if (!hwnd_) {
         outError = "ViewportHost HWND not created.";
         return false;
@@ -178,17 +178,18 @@ bool ViewportHost::ensureNativeDeviceInitialized(std::string& outError) {
     if (h < 64) h = 360;
 
     if (!d3d_.isInitialized()) {
-        if (!d3d_.init(hwnd_, w, h, outError)) {
+        if (!d3d_.init(hwnd_, w, h, outError, vsyncEnabled)) {
             return false;
         }
     } else {
+        d3d_.setVsync(vsyncEnabled);
         d3d_.resize(w, h);
     }
     return true;
 }
 
-bool ViewportHost::enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError) {
-    if (!ensureNativeDeviceInitialized(outError)) {
+bool ViewportHost::enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError, bool vsyncEnabled) {
+    if (!ensureNativeDeviceInitialized(outError, vsyncEnabled)) {
         InterlockedExchange(&nativeVideoActive_, 0);
         return false;
     }
@@ -198,14 +199,46 @@ bool ViewportHost::enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::stri
     if (h < 64) h = 360;
 
     InterlockedExchange(&nativeVideoActive_, 1);
-    ShowWindow(hwnd_, SW_SHOW);
-    SetWindowPos(hwnd_, HWND_BOTTOM, hostBounds_.left, hostBounds_.top, w, h, SWP_NOACTIVATE);
+    d3d_.clearOccluded();
+    if (!fullscreenTarget_) {
+        ShowWindow(hwnd_, SW_SHOW);
+        SetWindowPos(hwnd_, HWND_BOTTOM, hostBounds_.left, hostBounds_.top, w, h, SWP_NOACTIVATE);
+    }
     updateVideoLayout(phoneW, phoneH);
     renderNativeFrame(true);
     return true;
 }
 
+bool ViewportHost::setFullscreenTarget(HWND topLevelHwnd, bool enterFullscreen, int monW, int monH) {
+    if (!d3d_.isInitialized()) {
+        fullscreenTarget_ = false;
+        return false;
+    }
+    if (enterFullscreen) {
+        if (!topLevelHwnd || !IsWindow(topLevelHwnd)) return false;
+        fullscreenTarget_ = true;
+        if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+        bool ok = d3d_.rebindSwapChainTarget(topLevelHwnd, monW, monH);
+        updateVideoLayout(lastPhoneW_, lastPhoneH_);
+        return ok;
+    } else {
+        fullscreenTarget_ = false;
+        int w = hostBounds_.right - hostBounds_.left;
+        int h = hostBounds_.bottom - hostBounds_.top;
+        if (w < 8) w = 640;
+        if (h < 8) h = 360;
+        bool ok = (hwnd_ && IsWindow(hwnd_)) ? d3d_.rebindSwapChainTarget(hwnd_, w, h) : false;
+        if (hwnd_ && isNativeVideoActive()) {
+            ShowWindow(hwnd_, SW_SHOW);
+            SetWindowPos(hwnd_, HWND_BOTTOM, hostBounds_.left, hostBounds_.top, w, h, SWP_NOACTIVATE);
+        }
+        updateVideoLayout(lastPhoneW_, lastPhoneH_);
+        return ok;
+    }
+}
+
 void ViewportHost::disableNativeVideo() {
+    fullscreenTarget_ = false;
     InterlockedExchange(&nativeVideoActive_, 0);
     d3d_.clearVideoFrame();
     d3d_.clearHudBitmap();
@@ -216,24 +249,24 @@ void ViewportHost::disableNativeVideo() {
 
 bool ViewportHost::presentGpuNV12Frame(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
                                        uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                       bool drawHudOverlay) {
-    if (!d3d_.isInitialized()) return false;
+                                       bool drawHudOverlay, FrameTiming* ioTiming) {
+    if (!isNativeVideoActive()) return false;
     ViewportRect vr;
     EnterCriticalSection(&rectLock_);
     vr = videoRect_;
     LeaveCriticalSection(&rectLock_);
-    return d3d_.submitAndRenderGpuNV12(srcTex, subresourceIdx, cropX, cropY, outW, outH, vr, drawHudOverlay);
+    return d3d_.submitAndRenderGpuNV12(srcTex, subresourceIdx, cropX, cropY, outW, outH, vr, drawHudOverlay, ioTiming);
 }
 
 void ViewportHost::presentCpuNV12Frame(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
                                        uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                       bool drawHudOverlay) {
-    if (!d3d_.isInitialized()) return;
+                                       bool drawHudOverlay, FrameTiming* ioTiming) {
+    if (!isNativeVideoActive()) return;
     ViewportRect vr;
     EnterCriticalSection(&rectLock_);
     vr = videoRect_;
     LeaveCriticalSection(&rectLock_);
-    d3d_.submitAndRenderCpuNV12(yPlane, uvPlane, stride, cropX, cropY, outW, outH, vr, drawHudOverlay);
+    d3d_.submitAndRenderCpuNV12(yPlane, uvPlane, stride, cropX, cropY, outW, outH, vr, drawHudOverlay, ioTiming);
 }
 
 void ViewportHost::submitDecodedFrame(const DecodedNV12Frame& frame) {
@@ -244,13 +277,13 @@ void ViewportHost::updateEmbeddedHud(const void* bgraPremulPixels, int width, in
     d3d_.updateHudBitmap(bgraPremulPixels, width, height);
 }
 
-void ViewportHost::renderNativeFrame(bool drawHudOverlay) {
+void ViewportHost::renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming) {
     if (isNativeVideoActive()) {
         ViewportRect vr;
         EnterCriticalSection(&rectLock_);
         vr = videoRect_;
         LeaveCriticalSection(&rectLock_);
-        d3d_.render(vr, drawHudOverlay);
+        d3d_.render(vr, drawHudOverlay, ioTiming);
     }
 }
 
@@ -270,7 +303,10 @@ void ViewportHost::setBounds(const RECT& boundsInParent) {
     if (h < 1) h = 1;
 
     if (hwnd_) {
-        if (isMirrorEmbedded() || isNativeVideoActive()) {
+        if (fullscreenTarget_ && isNativeVideoActive()) {
+            ShowWindow(hwnd_, SW_HIDE);
+            d3d_.resize(w, h);
+        } else if (isMirrorEmbedded() || isNativeVideoActive()) {
             ShowWindow(hwnd_, SW_SHOW);
             SetWindowPos(hwnd_, HWND_BOTTOM, boundsInParent.left, boundsInParent.top, w, h,
                          SWP_NOACTIVATE);
@@ -339,7 +375,7 @@ void ViewportHost::updateVideoLayout(uint32_t phoneW, uint32_t phoneH) {
     }
     int hostW = hostBounds_.right - hostBounds_.left;
     int hostH = hostBounds_.bottom - hostBounds_.top;
-    int pad = (isMirrorEmbedded() || isNativeVideoActive()) ? 4 : 16;
+    int pad = fullscreenTarget_ ? 0 : ((isMirrorEmbedded() || isNativeVideoActive()) ? 4 : 16);
     ViewportRect vr = GdiPlusDraw::computeAspectFit(hostW, hostH, lastPhoneW_, lastPhoneH_, pad);
     EnterCriticalSection(&rectLock_);
     videoRect_ = vr;

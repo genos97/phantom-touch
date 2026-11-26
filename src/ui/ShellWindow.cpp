@@ -8,34 +8,11 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 
 namespace {
 
-static ShellWindow* g_shellInstance = NULL;
 static const UINT_PTR TIMER_TICK = 1;
-
-// Custom WM_APP messages for safe cross-thread / hook-to-UI transitions
-static const UINT MSG_TOGGLE_AIM         = WM_APP + 1;
-static const UINT MSG_UNLOCK_AIM         = WM_APP + 2;
-static const UINT MSG_TOGGLE_STUDIO      = WM_APP + 3;
-static const UINT MSG_CYCLE_FIRE         = WM_APP + 4;
-static const UINT MSG_TOGGLE_HUD         = WM_APP + 5;
-static const UINT MSG_RESET_TOUCH        = WM_APP + 6;
-static const UINT MSG_LOCK_AIM           = WM_APP + 7;
-static const UINT MSG_TOGGLE_FULLSCREEN  = WM_APP + 8;
-static const UINT MSG_CONNECT_DONE       = WM_APP + 9;
-static const UINT MSG_SENS_X_DOWN        = WM_APP + 10;
-static const UINT MSG_SENS_X_UP          = WM_APP + 11;
-static const UINT MSG_SENS_Y_DOWN        = WM_APP + 12;
-static const UINT MSG_SENS_Y_UP          = WM_APP + 13;
-static const UINT MSG_WIRELESS_DONE      = WM_APP + 14;
-static const UINT MSG_DEVICE_CLIPBOARD   = WM_APP + 15;
-static const UINT MSG_FOREGROUND_APP     = WM_APP + 16;
-static const UINT MSG_DROP_TOAST         = WM_APP + 17;
-static const UINT MSG_ANDROID_BACK       = WM_APP + 18;
-static const UINT MSG_QR_PAIR_UPDATE     = WM_APP + 20;
-static const UINT MSG_DEVICE_LOST        = WM_APP + 21;
-static const UINT MSG_VIDEO_FALLBACK     = WM_APP + 22;
 
 struct ProfileSaveJob {
     std::string path;
@@ -43,15 +20,11 @@ struct ProfileSaveJob {
     Profile profile;
 };
 
-LRESULT CALLBACK shellMouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (g_shellInstance) return g_shellInstance->handleLowLevelMouse(nCode, wParam, lParam);
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
-}
-
-LRESULT CALLBACK shellKeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (g_shellInstance) return g_shellInstance->handleLowLevelKeyboard(nCode, wParam, lParam);
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
-}
+struct SettingsSaveJob {
+    std::string path;
+    AppSettings settings;
+    volatile LONG* inFlightFlag;
+};
 
 float clamp01(float v) {
     if (v < 0.01f) return 0.01f;
@@ -82,16 +55,18 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
       profilePath_(profilePath),
       settingsPath_(settingsPath),
       noMirror_(noMirror),
+      asyncCtx_(new AsyncContext()),
       hudOverlay_(this),
       demoMode_(startDemo) {
     InitializeCriticalSection(&auxLock_);
+    probeEvent_ = CreateEventW(NULL, FALSE, FALSE, NULL);
+    viewportHost_.setProbeFrameEvent(probeEvent_);
     ZeroMemory(&topBarRc_, sizeof(topBarRc_));
     ZeroMemory(&railRc_, sizeof(railRc_));
     ZeroMemory(&drawerRc_, sizeof(drawerRc_));
     ZeroMemory(&viewportRc_, sizeof(viewportRc_));
     ZeroMemory(&preFullscreenRect_, sizeof(preFullscreenRect_));
     ZeroMemory(&lastUnlockedCursorPt_, sizeof(lastUnlockedCursorPt_));
-    std::memset(hookKeyDown_, 0, sizeof(hookKeyDown_));
 
     char tbuf[64];
     std::snprintf(tbuf, sizeof(tbuf), "PhantomTouch-Video-%lu", static_cast<unsigned long>(GetCurrentProcessId()));
@@ -139,31 +114,29 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
 
 ShellWindow::~ShellWindow() {
     InterlockedExchange(&stopAuxThreads_, 1);
+    InterlockedExchange(&stopProbe_, 1);
     stopQrWirelessPairing();
+    if (asyncCtx_) {
+        EnterCriticalSection(&asyncCtx_->lock);
+        InterlockedExchange(&asyncCtx_->alive, 0);
+        asyncCtx_->hwnd = NULL;
+        LeaveCriticalSection(&asyncCtx_->lock);
+    }
     bridge_->setClipboardCallback(nullptr, nullptr);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
+    viewportHost_.setProbeFrameEvent(NULL);
+    viewportHost_.setProbeSampleRect(false, 0.5f, 0.5f);
     flushOnExit();
     setAimMode(false);
-    removeHooks();
-    if (appWatcherThread_) {
-        WaitForSingleObject(appWatcherThread_, 1500);
-        CloseHandle(appWatcherThread_);
-        appWatcherThread_ = NULL;
-    }
-    if (dropThread_) {
-        WaitForSingleObject(dropThread_, 2000);
-        CloseHandle(dropThread_);
-        dropThread_ = NULL;
-    }
-    if (connectThread_) {
-        WaitForSingleObject(connectThread_, 1500);
-        CloseHandle(connectThread_);
-        connectThread_ = NULL;
-    }
+    hookThread_.stop();
     bridge_->disconnect();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     hudOverlay_.destroy();
+    if (probeEvent_) {
+        CloseHandle(probeEvent_);
+        probeEvent_ = NULL;
+    }
     if (cacheDC_) {
         if (cacheOldBmp_) SelectObject(cacheDC_, cacheOldBmp_);
         if (cacheBmp_) DeleteObject(cacheBmp_);
@@ -172,13 +145,15 @@ ShellWindow::~ShellWindow() {
         cacheBmp_ = NULL;
         cacheOldBmp_ = NULL;
     }
+    if (asyncCtx_) {
+        asyncCtx_->release();
+        asyncCtx_ = nullptr;
+    }
     DeleteCriticalSection(&auxLock_);
-    if (g_shellInstance == this) g_shellInstance = NULL;
 }
 
 bool ShellWindow::create(HINSTANCE hInst) {
     hInst_ = hInst;
-    g_shellInstance = this;
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -217,51 +192,68 @@ bool ShellWindow::create(HINSTANCE hInst) {
                             style, x, y, w, h, NULL, NULL, hInst_, this);
     if (!hwnd_) return false;
 
+    EnterCriticalSection(&asyncCtx_->lock);
+    asyncCtx_->hwnd = hwnd_;
+    InterlockedExchange(&asyncCtx_->alive, 1);
+    LeaveCriticalSection(&asyncCtx_->lock);
+
     GdiPlusDraw::enableDarkDwmFrame(hwnd_);
     DragAcceptFiles(hwnd_, TRUE);
     viewportHost_.create(hwnd_, hInst_);
     hudOverlay_.create(hwnd_, hInst_);
 
-    registerRawInput();
-    installHooks();
+    InputHookSnapshot initSnap;
+    initSnap.shellHwnd = hwnd_;
+    initSnap.hudHwnd = hudOverlay_.hwnd();
+    initSnap.viewportHwnd = viewportHost_.hwnd();
+    hookThread_.start(hInst_, engine_, initSnap);
+
     SetTimer(hwnd_, TIMER_TICK, 50, NULL);
     InterlockedExchange(&stopAuxThreads_, 0);
-    appWatcherThread_ = CreateThread(NULL, 0, appWatcherThreadProc, this, 0, NULL);
+    asyncCtx_->addRef();
+    HANDLE hWatcher = CreateThread(NULL, 0, appWatcherThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hWatcher) CloseHandle(hWatcher);
 
-    // Locate official scrcpy + adb tools
-    std::string toolErr;
-    toolsReady_ = bridge_->locateTools(tools_, toolErr);
-    if (!toolsReady_) {
-        hubStatusMsg_ = toolErr;
-        bridge_->appendLog("[Tools] " + toolErr);
+    if (autoFullscreen_) {
+        if (demoMode_) {
+            drawerOpen_ = true;
+            drawerPanel_.setActiveTab(0);
+            setEditMode(true);
+            layoutChildren();
+            hudOverlay_.showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
+        } else {
+            hubStatusMsg_ = "Locating scrcpy / ADB tools...";
+            layoutChildren();
+            // N36: run scrcpy --version and initial ADB device discovery off the UI thread!
+            asyncCtx_->addRef();
+            HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+            if (hTools) CloseHandle(hTools);
+        }
+        toggleFullscreen();
     } else {
-        bridge_->appendLog("[Tools] scrcpy " + tools_.scrcpyVersion + " ready");
-    }
+        if (settings_.maximized) {
+            ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
+        } else {
+            ShowWindow(hwnd_, SW_SHOW);
+        }
+        UpdateWindow(hwnd_);
 
-    if (settings_.maximized) {
-        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
-    } else {
-        ShowWindow(hwnd_, SW_SHOW);
-    }
-    UpdateWindow(hwnd_);
-
-    if (demoMode_) {
-        drawerOpen_ = true;
-        drawerPanel_.setActiveTab(0);
-        setEditMode(true);
-        layoutChildren();
-        hudOverlay_.showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
-    } else {
-        layoutChildren();
-        refreshAdbDevices();
-        // Auto-connect immediately if a ready phone is already plugged in!
-        for (size_t i = 0; i < adbDevices_.size(); ++i) {
-            if (adbDevices_[i].state == "device") {
-                startAsyncConnect(adbDevices_[i].serial);
-                break;
-            }
+        if (demoMode_) {
+            drawerOpen_ = true;
+            drawerPanel_.setActiveTab(0);
+            setEditMode(true);
+            layoutChildren();
+            hudOverlay_.showToast("Offline Keymap Studio ready! Edit keys on canvas or in the Right Drawer.", 4000);
+        } else {
+            hubStatusMsg_ = "Locating scrcpy / ADB tools...";
+            layoutChildren();
+            // N36: run scrcpy --version and initial ADB device discovery off the UI thread!
+            asyncCtx_->addRef();
+            HANDLE hTools = CreateThread(NULL, 0, startupToolsThreadProc, new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+            if (hTools) CloseHandle(hTools);
         }
     }
+    syncInputHookSnapshot();
     return true;
 }
 
@@ -274,23 +266,28 @@ int ShellWindow::runMessageLoop() {
     return static_cast<int>(msg.wParam);
 }
 
-void ShellWindow::registerRawInput() {
-    RAWINPUTDEVICE rid;
-    rid.usUsagePage = 0x01;
-    rid.usUsage     = 0x02;
-    rid.dwFlags     = RIDEV_INPUTSINK;
-    rid.hwndTarget  = hwnd_;
-    RegisterRawInputDevices(&rid, 1, sizeof(rid));
-}
-
-void ShellWindow::installHooks() {
-    mouseHook_ = SetWindowsHookExA(WH_MOUSE_LL, shellMouseHookProc, hInst_, 0);
-    keyHook_   = SetWindowsHookExA(WH_KEYBOARD_LL, shellKeyHookProc, hInst_, 0);
-}
-
-void ShellWindow::removeHooks() {
-    if (mouseHook_) { UnhookWindowsHookEx(mouseHook_); mouseHook_ = NULL; }
-    if (keyHook_)   { UnhookWindowsHookEx(keyHook_);   keyHook_ = NULL; }
+void ShellWindow::syncInputHookSnapshot() {
+    InputHookSnapshot s;
+    s.shellHwnd = hwnd_;
+    s.hudHwnd = hudOverlay_.hwnd();
+    s.viewportHwnd = viewportHost_.hwnd();
+    s.embeddedHwnd = viewportHost_.embeddedHwnd();
+    s.videoScreenRect = viewportHost_.activeVideoScreenRect();
+    s.connected = bridge_->isConnected();
+    s.demoMode = demoMode_;
+    s.aimMode = aimMode_;
+    s.editMode = editMode_;
+    s.nativeVideoActive = viewportHost_.isNativeVideoActive();
+    s.uiCapturingText = editingHubWireless_ ||
+                        (drawerOpen_ && (drawerPanel_.isTypingText() || drawerPanel_.isWaitingSpecialRebind())) ||
+                        (hudOverlay_.rebindTarget() != HUD_REBIND_NONE);
+    s.waitingSpecialRebind = (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind());
+    s.keymapEnabled = profile_.keymapEnabled;
+    s.rightClickBack = settings_.rightClickBack;
+    s.toggleAimVk = profile_.toggleAimVk;
+    s.holdUnlockVk = profile_.holdUnlockVk;
+    s.resetTouchVk = profile_.resetTouchVk;
+    hookThread_.updateSnapshot(s);
 }
 
 void ShellWindow::invalidateShell() {
@@ -311,8 +308,25 @@ void ShellWindow::saveWindowPlacement() {
     }
 }
 
-void ShellWindow::saveSettings() {
+DWORD WINAPI ShellWindow::settingsSaveWorkerProc(LPVOID param) {
+    SettingsSaveJob* job = static_cast<SettingsSaveJob*>(param);
+    if (job) {
+        AppSettingsStore::save(job->path, job->settings);
+        if (job->inFlightFlag) InterlockedExchange(job->inFlightFlag, 0);
+        delete job;
+    }
+    return 0;
+}
+
+void ShellWindow::scheduleSettingsSave() {
     saveWindowPlacement();
+    settingsSaveDueTick_ = GetTickCount() + 450;
+    hasPendingSettingsSave_ = true;
+}
+
+void ShellWindow::saveSettingsNow() {
+    saveWindowPlacement();
+    hasPendingSettingsSave_ = false;
     AppSettingsStore::save(settingsPath_, settings_);
 }
 
@@ -375,7 +389,7 @@ void ShellWindow::flushOnExit() {
         if (profileDirty_) saveCurrentProfile(true);
         else ProfileStore::saveLastActive(profilesDir_, profilePath_);
     }
-    saveSettings();
+    saveSettingsNow();
 }
 
 void ShellWindow::layoutChildren() {
@@ -456,6 +470,7 @@ void ShellWindow::syncHudAndVideo() {
             updateClipCursor();
         }
     }
+    syncInputHookSnapshot();
 }
 
 void ShellWindow::updateClipCursor() {
@@ -494,19 +509,62 @@ bool ShellWindow::isPointInVideoScreen(POINT screenPt, float& outNormX, float& o
 }
 
 void ShellWindow::refreshAdbDevices() {
-    adbDevices_.clear();
-    if (!toolsReady_) return;
-    bridge_->listDevices(tools_, adbDevices_);
-    if (adbDevices_.empty()) {
-        hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
-    } else {
-        hubStatusMsg_.clear();
+    if (!toolsReady_ || InterlockedCompareExchange(&refreshingDevices_, 1, 0) != 0) return;
+    asyncCtx_->addRef();
+    HANDLE hRef = CreateThread(NULL, 0, refreshDevicesThreadProc,
+                               new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hRef) CloseHandle(hRef);
+    else {
+        InterlockedExchange(&refreshingDevices_, 0);
+        asyncCtx_->release();
     }
-    invalidateShell();
+}
+
+DWORD WINAPI ShellWindow::startupToolsThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (job && job->ctx) {
+        ShellWindow* self = job->shell;
+        ToolPaths tools;
+        std::string err;
+        bool ok = self->bridge_->locateTools(tools, err);
+        std::vector<AdbDeviceInfo> devs;
+        if (ok) {
+            self->bridge_->listDevices(tools, devs);
+        }
+        EnterCriticalSection(&self->auxLock_);
+        self->pendingTools_ = tools;
+        self->pendingToolsErr_ = err;
+        self->pendingToolsOk_ = ok;
+        self->pendingAdbDevices_ = devs;
+        LeaveCriticalSection(&self->auxLock_);
+        job->ctx->postMsg(MSG_TOOLS_READY, 0, 0);
+        job->ctx->release();
+    }
+    delete job;
+    return 0;
+}
+
+DWORD WINAPI ShellWindow::refreshDevicesThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (job && job->ctx) {
+        ShellWindow* self = job->shell;
+        std::vector<AdbDeviceInfo> devs;
+        bool ok = self->bridge_->listDevices(self->tools_, devs);
+        EnterCriticalSection(&self->auxLock_);
+        self->pendingAdbDevices_ = devs;
+        self->pendingDevicesRefreshOk_ = ok;
+        LeaveCriticalSection(&self->auxLock_);
+        InterlockedExchange(&self->refreshingDevices_, 0);
+        job->ctx->postMsg(MSG_DEVICES_REFRESHED, 0, 0);
+        job->ctx->release();
+    }
+    delete job;
+    return 0;
 }
 
 void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
-                                uint64_t ptsUs, bool isConfig, bool isKeyFrame) {
+                                uint64_t ptsUs, bool isConfig, bool isKeyFrame,
+                                bool present, int64_t qpcPktRecv) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->nativeVideoSession_ || !data || size == 0) return;
 
@@ -541,15 +599,23 @@ void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
             ? "[Video] DXVA GPU hardware H.264 decoder active (zero-copy VRAM -> D3D11)"
             : "[Video] Software H.264 decoder active (direct upload -> D3D11)");
     }
-    self->h264Decoder_.decodePacket(data, size, ptsUs, isConfig, isKeyFrame);
+    self->h264Decoder_.decodePacket(data, size, ptsUs, isConfig, isKeyFrame, present, qpcPktRecv);
 }
 
 void ShellWindow::onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx,
-                                    uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH) {
+                                    uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
+                                    const FrameTiming& timing) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->nativeVideoSession_) return;
+    if (!timing.present) {
+        self->telemetry_.recordSkipped(timing);
+        return;
+    }
+    FrameTiming ft = timing;
     // Present directly from video thread so the Win32 UI / input-hook thread stays <1% CPU!
-    self->viewportHost_.presentGpuNV12Frame(nv12Tex, subresourceIdx, cropX, cropY, outW, outH, true);
+    if (self->viewportHost_.presentGpuNV12Frame(nv12Tex, subresourceIdx, cropX, cropY, outW, outH, true, &ft)) {
+        self->telemetry_.recordPresented(ft);
+    }
     if (self->viewportHost_.isNativeDeviceLost() && self->hwnd_ &&
         InterlockedCompareExchange(&self->deviceResetPending_, 1, 0) == 0) {
         PostMessageW(self->hwnd_, MSG_DEVICE_LOST, 0, 0);
@@ -558,11 +624,17 @@ void ShellWindow::onDecodedGpuFrame(void* ctx, ID3D11Texture2D* nv12Tex, uint32_
 
 void ShellWindow::onDecodedCpuView(void* ctx, const uint8_t* yPlane, const uint8_t* uvPlane,
                                    uint32_t stride, uint32_t cropX, uint32_t cropY,
-                                   uint32_t outW, uint32_t outH) {
+                                   uint32_t outW, uint32_t outH, const FrameTiming& timing) {
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->nativeVideoSession_) return;
+    if (!timing.present) {
+        self->telemetry_.recordSkipped(timing);
+        return;
+    }
+    FrameTiming ft = timing;
     // Direct upload + Present on video thread (0 intermediate copies, 0 UI-thread stall!)
-    self->viewportHost_.presentCpuNV12Frame(yPlane, uvPlane, stride, cropX, cropY, outW, outH, true);
+    self->viewportHost_.presentCpuNV12Frame(yPlane, uvPlane, stride, cropX, cropY, outW, outH, true, &ft);
+    self->telemetry_.recordPresented(ft);
     if (self->viewportHost_.isNativeDeviceLost() && self->hwnd_ &&
         InterlockedCompareExchange(&self->deviceResetPending_, 1, 0) == 0) {
         PostMessageW(self->hwnd_, MSG_DEVICE_LOST, 0, 0);
@@ -611,11 +683,21 @@ bool ShellWindow::mapShellClientToVideoNorm(int mx, int my, float& outNx, float&
 }
 
 DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    ShellWindow* self = job->shell;
     std::string err;
     bool ok = false;
 
+    // S1: always tear down any previous session off the UI thread!
+    self->bridge_->setVideoPacketCallback(nullptr, nullptr);
+    self->bridge_->disconnect();
+    self->telemetry_.reset();
+
     if (self->settings_.useNativeVideo && !self->noMirror_) {
+        std::string d3dInitErr;
+        if (!self->viewportHost_.ensureNativeDeviceInitialized(d3dInitErr, self->settings_.vsyncEnabled)) {
+            self->bridge_->appendLog("[D3D11] Pre-init skipped: " + d3dInitErr);
+        }
         // Stage 2 Single-Connection Mode: ONE scrcpy-server on phone delivers full FPS H.264 + touch/keyboard/clipboard!
         self->nativeVideoSession_ = true;
         self->bridge_->setVideoPacketCallback(ShellWindow::onVideoPacket, self);
@@ -628,10 +710,9 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.virtualDisplay = self->settings_.virtualDisplayMode;
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
 
-        ok = self->bridge_->connectSession(self->tools_, cfg, err, self->pendingSerial_);
+        ok = self->bridge_->connectSession(self->tools_, cfg, err, job->arg);
         if (ok) {
             if (cfg.virtualDisplay) {
-                // B2: launch target app (first linked package or Settings) onto the virtual display!
                 std::string appToLaunch = "com.android.settings";
                 if (self->profile_.keymapEnabled && !self->profile_.appPackage.empty()) {
                     size_t comma = self->profile_.appPackage.find(',');
@@ -647,7 +728,9 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
             }
             if (self->settings_.mirrorAudio) {
                 std::string aErr;
-                if (!self->bridge_->launchAudioOnlyRelay(self->tools_, self->bridge_->activeSerial(), aErr)) {
+                if (!self->bridge_->launchAudioOnlyRelay(self->tools_, self->bridge_->activeSerial(),
+                                                         self->settings_.audioBufferMs,
+                                                         self->settings_.audioRawCodec, aErr)) {
                     self->bridge_->appendLog("[Audio] " + aErr);
                 }
             }
@@ -656,11 +739,10 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
             self->bridge_->setVideoPacketCallback(nullptr, nullptr);
         }
     } else {
-        // Legacy fallback: 1 FPS control bridge + separate scrcpy.exe embedded window
         self->nativeVideoSession_ = false;
         self->bridge_->setVideoPacketCallback(nullptr, nullptr);
         ok = self->bridge_->connectControl(self->tools_, self->profile_.controlMaxSize, err,
-                                           self->pendingSerial_, self->settings_.stayAwake);
+                                           job->arg, self->settings_.stayAwake);
         if (ok) {
             if (self->settings_.turnScreenOff) {
                 self->bridge_->setDisplayPower(false);
@@ -675,15 +757,37 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         }
     }
 
+    EnterCriticalSection(&self->auxLock_);
     self->asyncResultOk_ = ok;
     self->asyncResultMsg_ = ok ? ("Connected to " + self->bridge_->deviceName()) : err;
+    LeaveCriticalSection(&self->auxLock_);
     InterlockedExchange(&self->connecting_, 0);
-    if (self->hwnd_) PostMessageW(self->hwnd_, MSG_CONNECT_DONE, 0, 0);
+    job->ctx->postMsg(MSG_CONNECT_DONE, 0, 0);
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+DWORD WINAPI ShellWindow::disconnectThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    ShellWindow* self = job->shell;
+    self->bridge_->disconnect();
+    std::vector<AdbDeviceInfo> devs;
+    if (job->intArg != 0 && self->toolsReady_) {
+        self->bridge_->listDevices(self->tools_, devs);
+    }
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingAdbDevices_ = devs;
+    LeaveCriticalSection(&self->auxLock_);
+    job->ctx->postMsg(MSG_DISCONNECT_DONE, static_cast<WPARAM>(job->intArg), 0);
+    job->ctx->release();
+    delete job;
     return 0;
 }
 
 DWORD WINAPI ShellWindow::legacyFallbackThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    ShellWindow* self = job->shell;
     std::string serial = self->bridge_->activeSerial();
     self->bridge_->setVideoPacketCallback(nullptr, nullptr);
     self->bridge_->disconnect();
@@ -704,22 +808,20 @@ DWORD WINAPI ShellWindow::legacyFallbackThreadProc(LPVOID param) {
             }
         }
     }
+    EnterCriticalSection(&self->auxLock_);
     self->asyncResultOk_ = ok;
     self->asyncResultMsg_ = ok ? self->pendingFallbackReason_ : err;
+    LeaveCriticalSection(&self->auxLock_);
     InterlockedExchange(&self->connecting_, 0);
     InterlockedExchange(&self->fallbackPending_, 0);
-    if (self->hwnd_) PostMessageW(self->hwnd_, MSG_CONNECT_DONE, 0, 0);
+    job->ctx->postMsg(MSG_CONNECT_DONE, 0, 0);
+    job->ctx->release();
+    delete job;
     return 0;
 }
 
 void ShellWindow::startAsyncLegacyFallback(const std::string& reason) {
-    // N4: Shut down native video stream BEFORE launching legacy scrcpy.exe (never run two encoders!)
-    if (connecting_) return;
-    if (connectThread_) {
-        WaitForSingleObject(connectThread_, 1000);
-        CloseHandle(connectThread_);
-        connectThread_ = NULL;
-    }
+    if (InterlockedCompareExchange(&connecting_, 1, 0) != 0) return;
     setAimMode(false);
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
@@ -728,23 +830,24 @@ void ShellWindow::startAsyncLegacyFallback(const std::string& reason) {
     nativeVideoSession_ = false;
     pendingFallbackReason_ = reason;
     hubStatusMsg_ = reason + " Switching to scrcpy fallback...";
-    InterlockedExchange(&connecting_, 1);
-    connectThread_ = CreateThread(NULL, 0, legacyFallbackThreadProc, this, 0, NULL);
+    asyncCtx_->addRef();
+    HANDLE hTh = CreateThread(NULL, 0, legacyFallbackThreadProc,
+                              new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hTh) CloseHandle(hTh);
+    else {
+        InterlockedExchange(&connecting_, 0);
+        asyncCtx_->release();
+    }
+    syncInputHookSnapshot();
     invalidateShell();
 }
 
 void ShellWindow::startAsyncConnect(const std::string& serial) {
-    if (!toolsReady_ || connecting_) return;
+    if (!toolsReady_ || InterlockedCompareExchange(&connecting_, 1, 0) != 0) return;
     stopQrWirelessPairing();
-    if (connectThread_) {
-        WaitForSingleObject(connectThread_, 1000);
-        CloseHandle(connectThread_);
-        connectThread_ = NULL;
-    }
     setAimMode(false);
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
-    bridge_->disconnect();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     demoMode_ = false;
@@ -752,71 +855,77 @@ void ShellWindow::startAsyncConnect(const std::string& serial) {
     nativeVideoSession_ = false;
     pendingSerial_ = serial;
 
-    // Pre-initialize D3D11 GPU device BEFORE connectThreadProc starts video streaming so
-    // H264Decoder receives the shared video-capable ID3D11Device on the very first frame!
-    if (settings_.useNativeVideo && !noMirror_) {
-        std::string d3dInitErr;
-        if (!viewportHost_.ensureNativeDeviceInitialized(d3dInitErr)) {
-            bridge_->appendLog("[D3D11] Pre-init skipped: " + d3dInitErr);
-        }
-    }
     hubStatusMsg_ = settings_.virtualDisplayMode
         ? "Launching Second-Phone Virtual Display stream..."
         : "Connecting single-stream D3D11 phone viewport...";
-    InterlockedExchange(&connecting_, 1);
-    connectThread_ = CreateThread(NULL, 0, connectThreadProc, this, 0, NULL);
+    asyncCtx_->addRef();
+    HANDLE hConn = CreateThread(NULL, 0, connectThreadProc,
+                                new SimpleAsyncJob{ this, asyncCtx_, serial, 0 }, 0, NULL);
+    if (hConn) CloseHandle(hConn);
+    else {
+        InterlockedExchange(&connecting_, 0);
+        asyncCtx_->release();
+    }
+    syncInputHookSnapshot();
     invalidateShell();
 }
 
 DWORD WINAPI ShellWindow::wirelessThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    ShellWindow* self = job->shell;
     std::string msg;
-    bool ok = self->bridge_->connectWireless(self->tools_, self->pendingWirelessIp_, msg);
+    bool ok = self->bridge_->connectWireless(self->tools_, job->arg, msg);
+    EnterCriticalSection(&self->auxLock_);
     self->asyncResultOk_ = ok;
     self->asyncResultMsg_ = msg;
+    LeaveCriticalSection(&self->auxLock_);
     InterlockedExchange(&self->connecting_, 0);
-    if (self->hwnd_) PostMessageA(self->hwnd_, MSG_WIRELESS_DONE, 0, 0);
+    job->ctx->postMsg(MSG_WIRELESS_DONE, 0, 0);
+    job->ctx->release();
+    delete job;
     return 0;
 }
 
 void ShellWindow::startAsyncWirelessConnect(const std::string& ipPort) {
-    if (!toolsReady_ || connecting_ || ipPort.empty()) return;
+    if (!toolsReady_ || ipPort.empty() || InterlockedCompareExchange(&connecting_, 1, 0) != 0) return;
     stopQrWirelessPairing();
-    if (connectThread_) {
-        WaitForSingleObject(connectThread_, 1000);
-        CloseHandle(connectThread_);
-        connectThread_ = NULL;
-    }
     settings_.lastWirelessAddr = ipPort;
-    saveSettings();
+    scheduleSettingsSave();
     pendingWirelessIp_ = ipPort;
     hubStatusMsg_ = "Connecting Wireless ADB to " + ipPort + "...";
-    InterlockedExchange(&connecting_, 1);
-    connectThread_ = CreateThread(NULL, 0, wirelessThreadProc, this, 0, NULL);
+    asyncCtx_->addRef();
+    HANDLE hW = CreateThread(NULL, 0, wirelessThreadProc,
+                             new SimpleAsyncJob{ this, asyncCtx_, ipPort, 0 }, 0, NULL);
+    if (hW) CloseHandle(hW);
+    else {
+        InterlockedExchange(&connecting_, 0);
+        asyncCtx_->release();
+    }
     invalidateShell();
 }
 
 DWORD WINAPI ShellWindow::qrPairThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    QrPairJob* job = static_cast<QrPairJob*>(param);
     auto setStatus = [&](const std::string& st, const std::string& autoAddr = "") {
-        EnterCriticalSection(&self->auxLock_);
-        self->qrPairStatus_ = st;
-        if (!autoAddr.empty()) self->qrAutoConnectAddr_ = autoAddr;
-        LeaveCriticalSection(&self->auxLock_);
-        if (self->hwnd_) PostMessageA(self->hwnd_, MSG_QR_PAIR_UPDATE, 0, 0);
+        if (job->cancelled || !job->ctx || !job->ctx->alive) return;
+        EnterCriticalSection(job->auxLock);
+        *job->statusTarget = st;
+        if (!autoAddr.empty()) *job->autoConnectTarget = autoAddr;
+        LeaveCriticalSection(job->auxLock);
+        job->ctx->postMsg(MSG_QR_PAIR_UPDATE, 0, 0);
     };
 
     bool paired = false;
-    while (!self->stopQrPair_ && !self->stopAuxThreads_) {
+    while (!job->cancelled && job->ctx && job->ctx->alive) {
         std::vector<MdnsServiceInfo> svcs;
-        if (self->bridge_->listMdnsServices(self->tools_, svcs)) {
-            if (!paired) {
+        if (job->bridge->listMdnsServices(job->tools, svcs)) {
+            if (!paired && !job->cancelled) {
                 for (size_t i = 0; i < svcs.size(); ++i) {
                     if (svcs[i].type.find("_adb-tls-pairing") != std::string::npos &&
-                        (svcs[i].name == self->qrServiceName_ || svcs[i].name.find(self->qrServiceName_) != std::string::npos)) {
+                        (svcs[i].name == job->serviceName || svcs[i].name.find(job->serviceName) != std::string::npos)) {
                         setStatus("Phone scanned QR! Pairing " + svcs[i].addr + "...");
                         std::string pairMsg;
-                        if (self->bridge_->pairWireless(self->tools_, svcs[i].addr, self->qrPairPassword_, pairMsg)) {
+                        if (job->bridge->pairWireless(job->tools, svcs[i].addr, job->password, pairMsg)) {
                             paired = true;
                             setStatus("Paired! Looking for Wireless ADB connect port...");
                         } else {
@@ -826,19 +935,23 @@ DWORD WINAPI ShellWindow::qrPairThreadProc(LPVOID param) {
                     }
                 }
             }
-            if (paired) {
+            if (paired && !job->cancelled) {
                 for (size_t i = 0; i < svcs.size(); ++i) {
                     if (svcs[i].type.find("_adb-tls-connect") != std::string::npos) {
                         setStatus("Connecting wirelessly to " + svcs[i].addr + "...", svcs[i].addr);
-                        return 0;
+                        break;
                     }
                 }
+                if (!svcs.empty()) break;
             }
         }
-        for (int i = 0; i < 10 && !self->stopQrPair_ && !self->stopAuxThreads_; ++i) {
+        for (int i = 0; i < 10 && !job->cancelled && job->ctx && job->ctx->alive; ++i) {
             Sleep(100);
         }
     }
+
+    if (job->ctx) job->ctx->release();
+    delete job;
     return 0;
 }
 
@@ -863,27 +976,44 @@ void ShellWindow::startQrWirelessPairing() {
     LeaveCriticalSection(&auxLock_);
 
     showingQrPair_ = true;
-    InterlockedExchange(&stopQrPair_, 0);
-    qrPairThread_ = CreateThread(NULL, 0, qrPairThreadProc, this, 0, NULL);
+    QrPairJob* job = new QrPairJob();
+    asyncCtx_->addRef();
+    job->ctx = asyncCtx_;
+    job->bridge = bridge_;
+    job->tools = tools_;
+    job->serviceName = qrServiceName_;
+    job->password = qrPairPassword_;
+    job->statusTarget = &qrPairStatus_;
+    job->autoConnectTarget = &qrAutoConnectAddr_;
+    job->auxLock = &auxLock_;
+    job->cancelled = 0;
+    activeQrJob_ = job;
+
+    HANDLE hQr = CreateThread(NULL, 0, qrPairThreadProc, job, 0, NULL);
+    if (hQr) CloseHandle(hQr);
+    else {
+        activeQrJob_ = nullptr;
+        asyncCtx_->release();
+        delete job;
+    }
     invalidateShell();
 }
 
 void ShellWindow::stopQrWirelessPairing() {
-    InterlockedExchange(&stopQrPair_, 1);
-    if (qrPairThread_) {
-        WaitForSingleObject(qrPairThread_, 1500);
-        CloseHandle(qrPairThread_);
-        qrPairThread_ = NULL;
+    // S1 / E9: cancel asynchronously with ZERO WaitForSingleObject on UI thread!
+    if (activeQrJob_) {
+        InterlockedExchange(&activeQrJob_->cancelled, 1);
+        activeQrJob_ = nullptr;
     }
     showingQrPair_ = false;
 }
 
 void ShellWindow::disconnectDevice(bool returnToHub) {
+    InterlockedExchange(&stopProbe_, 1);
     setAimMode(false);
     engine_->releaseAllTouches();
     hudOverlay_.setEmbeddedD3DMode(false);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
-    bridge_->disconnect();
     h264Decoder_.shutdown();
     viewportHost_.detachMirror();
     sawEmbeddedMirror_ = false;
@@ -892,10 +1022,45 @@ void ShellWindow::disconnectDevice(bool returnToHub) {
     if (returnToHub) {
         demoMode_ = false;
         setEditMode(false);
-        refreshAdbDevices();
+        hubStatusMsg_ = "Disconnecting...";
     }
     layoutChildren();
+    syncInputHookSnapshot();
     invalidateShell();
+
+    // S1: run adb forward cleanup / device refresh off UI thread!
+    asyncCtx_->addRef();
+    HANDLE hDis = CreateThread(NULL, 0, disconnectThreadProc,
+                               new SimpleAsyncJob{ this, asyncCtx_, "", returnToHub ? 1 : 0 }, 0, NULL);
+    if (hDis) CloseHandle(hDis);
+    else asyncCtx_->release();
+}
+
+DWORD WINAPI ShellWindow::screenshotThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (job && job->ctx) {
+        ShellWindow* self = job->shell;
+        std::string fullPath = job->arg;
+        size_t sl = fullPath.find_last_of("\\/");
+        std::string fname = (sl == std::string::npos) ? fullPath : fullPath.substr(sl + 1);
+        std::string err;
+        bool ok = false;
+        if (self->viewportHost_.isNativeVideoActive() && self->viewportHost_.hasNativeVideoFrame()) {
+            ok = self->viewportHost_.captureNativeScreenshot(fullPath, err);
+        }
+        if (!ok) {
+            ok = self->bridge_->captureScreenshot(fullPath, err);
+        }
+        EnterCriticalSection(&self->auxLock_);
+        self->pendingScreenshotToast_ = ok
+            ? (std::string("Screenshot saved -> screenshots\\") + fname)
+            : ("Screenshot failed: " + err);
+        LeaveCriticalSection(&self->auxLock_);
+        job->ctx->postMsg(MSG_SCREENSHOT_DONE, 0, 0);
+        job->ctx->release();
+    }
+    delete job;
+    return 0;
 }
 
 void ShellWindow::takeScreenshot() {
@@ -909,20 +1074,220 @@ void ShellWindow::takeScreenshot() {
                   tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
                   tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
     std::string fullPath = dir + "\\" + fname;
-    std::string err;
-    bool ok = false;
-    if (viewportHost_.isNativeVideoActive() && viewportHost_.hasNativeVideoFrame()) {
-        // Zero-latency screenshot straight from our own decoded D3D11 frame (works in Virtual Display mode too!)
-        ok = viewportHost_.captureNativeScreenshot(fullPath, err);
+
+    // N36: offload GPU readback + PNG encoding / adb screencap to worker thread!
+    hudOverlay_.showToast("Saving screenshot...", 1200);
+    asyncCtx_->addRef();
+    HANDLE hShot = CreateThread(NULL, 0, screenshotThreadProc,
+                                new SimpleAsyncJob{ this, asyncCtx_, fullPath, 0 }, 0, NULL);
+    if (hShot) CloseHandle(hShot);
+    else asyncCtx_->release();
+}
+
+DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
     }
-    if (!ok) {
-        ok = bridge_->captureScreenshot(fullPath, err);
+    ShellWindow* self = job->shell;
+    int trials = (job->intArg >= 5) ? job->intArg : 60;
+
+    auto publishProgress = [&](const ProbeResult& pr) {
+        EnterCriticalSection(&self->auxLock_);
+        self->probeResult_ = pr;
+        LeaveCriticalSection(&self->auxLock_);
+        job->ctx->postMsg(MSG_PROBE_UPDATE, 0, 0);
+    };
+
+    ProbeResult res;
+    res.running = true;
+    res.total = trials;
+    res.summaryLine = "Preparing show_touches probe...";
+    publishProgress(res);
+
+    // 1. Save & enable show_touches on device
+    std::string origVal;
+    self->bridge_->runAdbShell("settings get system show_touches", origVal, 4000);
+    while (!origVal.empty() && (origVal.back() == '\r' || origVal.back() == '\n' || origVal.back() == ' ')) {
+        origVal.pop_back();
     }
-    if (ok) {
-        hudOverlay_.showToast(std::string("Screenshot saved -> screenshots\\") + fname, 2400);
+    std::string restoreVal = (origVal == "1") ? "1" : "0";
+    self->bridge_->runAdbShell("settings put system show_touches 1", origVal, 4000);
+    Sleep(150);
+
+    // 2. Pick darkest point on screen from 3x3 sample grid so the white touch indicator has high contrast
+    float gx = 0.50f, gy = 0.50f;
+    float gridY[9] = {0};
+    if (self->viewportHost_.sampleGridBrightness(gridY)) {
+        const float coords[3] = { 0.25f, 0.50f, 0.75f };
+        int bestIdx = 4;
+        for (int i = 0; i < 9; ++i) {
+            if (gridY[i] < gridY[bestIdx]) bestIdx = i;
+        }
+        gx = coords[bestIdx % 3];
+        gy = coords[bestIdx / 3];
+    }
+
+    self->viewportHost_.setProbeSampleRect(true, gx, gy);
+    ResetEvent(self->probeEvent_);
+    WaitForSingleObject(self->probeEvent_, 300);
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(trials));
+    const uint64_t ptrId = 98; // Dedicated probe finger ID
+    float diagPreY = 0.0f;
+    float diagPeakY = 0.0f;
+
+    for (int t = 0; t < trials && !self->stopProbe_ && !self->stopAuxThreads_ && self->bridge_->isConnected(); ++t) {
+        float preY = 0.0f;
+        int64_t dummyQpc = 0;
+        uint64_t preSeq = 0;
+        self->viewportHost_.getLastProbeSample(preY, dummyQpc, preSeq);
+        if (t == 0) { diagPreY = preY; diagPeakY = preY; }
+
+        ResetEvent(self->probeEvent_);
+        const int64_t t0 = LatencyTelemetry::nowQpc();
+        self->bridge_->sendTouchNorm(TOUCH_DOWN, ptrId, gx, gy);
+
+        double hitMs = -1.0;
+        const ULONGLONG deadline = GetTickCount64() + 450;
+        while (GetTickCount64() < deadline && !self->stopProbe_ && !self->stopAuxThreads_) {
+            WaitForSingleObject(self->probeEvent_, 40);
+            float curY = 0.0f;
+            int64_t presQpc = 0;
+            uint64_t curSeq = 0;
+            if (self->viewportHost_.getLastProbeSample(curY, presQpc, curSeq) && curSeq > preSeq) {
+                if (curY > diagPeakY) diagPeakY = curY;
+                if (curY >= preY + 8.0f) {
+                    hitMs = LatencyTelemetry::qpcToMs(presQpc - t0);
+                    break;
+                }
+            }
+        }
+
+        self->bridge_->sendTouchNorm(TOUCH_UP, ptrId, gx, gy);
+        if (hitMs > 0.0) {
+            samples.push_back(hitMs);
+        }
+
+        // Wait for touch indicator to clear before next trial
+        const ULONGLONG coolDeadline = GetTickCount64() + 260;
+        while (GetTickCount64() < coolDeadline && !self->stopProbe_ && !self->stopAuxThreads_) {
+            WaitForSingleObject(self->probeEvent_, 40);
+            float curY = 0.0f;
+            int64_t presQpc = 0;
+            uint64_t curSeq = 0;
+            if (self->viewportHost_.getLastProbeSample(curY, presQpc, curSeq) && curY <= preY + 5.0f) {
+                break;
+            }
+        }
+        Sleep(80);
+
+        res.completed = t + 1;
+        if ((t + 1) % 5 == 0 || t + 1 == trials) {
+            char pbuf[96];
+            std::snprintf(pbuf, sizeof(pbuf), "Probing %d/%d (%zu hits)...", t + 1, trials, samples.size());
+            res.summaryLine = pbuf;
+            publishProgress(res);
+        }
+    }
+
+    self->viewportHost_.setProbeSampleRect(false, 0.5f, 0.5f);
+    std::string tmpOut;
+    self->bridge_->runAdbShell("settings put system show_touches " + restoreVal, tmpOut, 4000);
+
+    res.running = false;
+    TelemetrySummary vsum = self->telemetry_.getSummary();
+    if (!samples.empty()) {
+        std::vector<double> sorted = samples;
+        res.valid = true;
+        res.p50Ms = LatencyTelemetry::computePercentile(sorted, 0.50);
+        res.p95Ms = LatencyTelemetry::computePercentile(sorted, 0.95);
+        res.p99Ms = LatencyTelemetry::computePercentile(sorted, 0.99);
+        res.minMs = sorted.front();
+        res.maxMs = sorted.back();
+        std::string ser = self->bridge_->activeSerial();
+        const char* transport = (ser.find(':') != std::string::npos) ? "WiFi" : "USB";
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "Probe(%s n=%zu/%d pt=%.2f,%.2f baseY=%.1f peakY=%.1f): p50=%.1fms p95=%.1fms p99=%.1fms min=%.1f max=%.1f | rx->pres p50=%.1f p95=%.1f (samp=%u dec=%llu prs=%llu skp=%llu) | UI max=%.2fms stalls=%u | pres=%s",
+                      transport, samples.size(), trials, gx, gy, diagPreY, diagPeakY,
+                      res.p50Ms, res.p95Ms, res.p99Ms, res.minMs, res.maxMs,
+                      vsum.rxToPresentP50Ms, vsum.rxToPresentP95Ms,
+                      vsum.sampleCount,
+                      static_cast<unsigned long long>(vsum.decodedCount),
+                      static_cast<unsigned long long>(vsum.presentedCount),
+                      static_cast<unsigned long long>(vsum.skippedCount),
+                      self->maxUiMsgMs_, self->uiStallCount_,
+                      self->viewportHost_.presentationModeLabel().c_str());
+        res.summaryLine = line;
     } else {
-        hudOverlay_.showToast("Screenshot failed: " + err, 2400);
+        char line[400];
+        FrameTiming lastFt;
+        bool hasLastFt = self->telemetry_.getLastTiming(lastFt);
+        std::snprintf(line, sizeof(line),
+                      "Probe saw 0 hits (pt=%.2f,%.2f baseY=%.1f peakY=%.1f | rx->pres p50=%.1f p95=%.1f samp=%u dec=%llu prs=%llu skp=%llu | lastFt(%d):rx=%lld,in=%lld,dec=%lld,pc=%lld,pr=%lld | occ=%d rtv=%d bw=%d hr=0x%08lX | UI max=%.2fms stalls=%u | pres=%s)",
+                      gx, gy, diagPreY, diagPeakY,
+                      vsum.rxToPresentP50Ms, vsum.rxToPresentP95Ms,
+                      vsum.sampleCount,
+                      static_cast<unsigned long long>(vsum.decodedCount),
+                      static_cast<unsigned long long>(vsum.presentedCount),
+                      static_cast<unsigned long long>(vsum.skippedCount),
+                      hasLastFt ? 1 : 0,
+                      static_cast<long long>(lastFt.qpcPktRecv),
+                      static_cast<long long>(lastFt.qpcProcIn),
+                      static_cast<long long>(lastFt.qpcDecoded),
+                      static_cast<long long>(lastFt.qpcPresentCall),
+                      static_cast<long long>(lastFt.qpcPresentRet),
+                      self->viewportHost_.isOccluded() ? 1 : 0,
+                      self->viewportHost_.hasRtv() ? 1 : 0,
+                      self->viewportHost_.backbufW(),
+                      static_cast<unsigned long>(self->viewportHost_.lastPresentHResult()),
+                      self->maxUiMsgMs_, self->uiStallCount_,
+                      self->viewportHost_.presentationModeLabel().c_str());
+        res.valid = false;
+        res.summaryLine = line;
     }
+    self->bridge_->appendLog("[Probe] " + res.summaryLine);
+    {
+        std::string logPath = self->exeDir_ + "\\latency_probe.log";
+        std::ofstream lf(logPath.c_str(), std::ios::app);
+        if (lf.is_open()) {
+            std::vector<std::string> rlogs = self->bridge_->getRecentLogs();
+            for (size_t li = 0; li < rlogs.size(); ++li) {
+                lf << rlogs[li] << "\n";
+            }
+            lf << res.summaryLine << "\n";
+        }
+    }
+
+    publishProgress(res);
+    InterlockedExchange(&self->probing_, 0);
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+void ShellWindow::startRoundTripProbe(int numTrials) {
+    if (!bridge_->isConnected() || !viewportHost_.isNativeVideoActive()) {
+        hudOverlay_.showToast("Connect phone in Native D3D11 mode before running Latency Probe", 2400);
+        return;
+    }
+    if (InterlockedCompareExchange(&probing_, 1, 0) != 0) {
+        hudOverlay_.showToast("Latency Probe already running...", 1500);
+        return;
+    }
+    InterlockedExchange(&stopProbe_, 0);
+    asyncCtx_->addRef();
+    HANDLE hPr = CreateThread(NULL, 0, probeThreadProc,
+                              new SimpleAsyncJob{ this, asyncCtx_, "", numTrials }, 0, NULL);
+    if (hPr) CloseHandle(hPr);
+    else {
+        InterlockedExchange(&probing_, 0);
+        asyncCtx_->release();
+    }
+    invalidateShell();
 }
 
 void ShellWindow::onDeviceClipboard(void* ctx, const std::string& utf8Text) {
@@ -982,32 +1347,37 @@ void ShellWindow::writeWindowsClipboardUtf8(const std::string& utf8Text) {
 }
 
 DWORD WINAPI ShellWindow::appWatcherThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
     std::string lastPkg;
-    while (!self->stopAuxThreads_) {
+    while (!self->stopAuxThreads_ && job->ctx->alive) {
         bool connected = self->bridge_->isConnected();
         bool autoSw = (self->autoSwitchAtomic_ != 0);
         bool inAim = (self->aimModeAtomic_ != 0);
         if (connected && autoSw && !inAim) {
             std::string pkg = self->bridge_->queryForegroundPackage();
-            if (!pkg.empty() && pkg != lastPkg) {
+            if (!pkg.empty() && pkg != lastPkg && !self->stopAuxThreads_ && job->ctx->alive) {
                 lastPkg = pkg;
                 EnterCriticalSection(&self->auxLock_);
                 self->pendingForegroundPkg_ = pkg;
                 LeaveCriticalSection(&self->auxLock_);
-                if (self->hwnd_) {
-                    PostMessageA(self->hwnd_, MSG_FOREGROUND_APP, 0, 0);
-                }
+                job->ctx->postMsg(MSG_FOREGROUND_APP, 0, 0);
             }
         } else if (!connected) {
             lastPkg.clear();
         }
         // Poll less often while in a game profile (4.0s vs 2.0s) so adb dumpsys never stutters Android system_server!
-        int ticks = (self->gameProfileAtomic_ != 0) ? 40 : 20;
-        for (int i = 0; i < ticks && !self->stopAuxThreads_; ++i) {
-            Sleep(100);
+        int ticks = (self->gameProfileAtomic_ != 0) ? 80 : 40;
+        for (int i = 0; i < ticks && !self->stopAuxThreads_ && job->ctx->alive; ++i) {
+            Sleep(50);
         }
     }
+    job->ctx->release();
+    delete job;
     return 0;
 }
 
@@ -1138,20 +1508,26 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
 }
 
 DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
-    ShellWindow* self = static_cast<ShellWindow*>(param);
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
     std::vector<std::string> files;
     EnterCriticalSection(&self->auxLock_);
     files.swap(self->pendingDropFiles_);
     LeaveCriticalSection(&self->auxLock_);
 
     auto notifyToast = [&](const std::string& msg) {
+        if (!job->ctx->alive) return;
         EnterCriticalSection(&self->auxLock_);
         self->pendingDropToast_ = msg;
         LeaveCriticalSection(&self->auxLock_);
-        if (self->hwnd_) PostMessageA(self->hwnd_, MSG_DROP_TOAST, 0, 0);
+        job->ctx->postMsg(MSG_DROP_TOAST, 0, 0);
     };
 
-    for (size_t i = 0; i < files.size() && !self->stopAuxThreads_; ++i) {
+    for (size_t i = 0; i < files.size() && !self->stopAuxThreads_ && job->ctx->alive; ++i) {
         const std::string& path = files[i];
         size_t slash = path.find_last_of("\\/");
         std::string fname = (slash == std::string::npos) ? path : path.substr(slash + 1);
@@ -1171,6 +1547,8 @@ DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
     }
 
     InterlockedExchange(&self->dropping_, 0);
+    job->ctx->release();
+    delete job;
     return 0;
 }
 
@@ -1183,15 +1561,17 @@ void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) 
         hudOverlay_.showToast("Another file transfer is already in progress...", 1800);
         return;
     }
-    if (dropThread_) {
-        WaitForSingleObject(dropThread_, 500);
-        CloseHandle(dropThread_);
-        dropThread_ = NULL;
-    }
     EnterCriticalSection(&auxLock_);
     pendingDropFiles_ = files;
     LeaveCriticalSection(&auxLock_);
-    dropThread_ = CreateThread(NULL, 0, dropWorkerThreadProc, this, 0, NULL);
+    asyncCtx_->addRef();
+    HANDLE hDrop = CreateThread(NULL, 0, dropWorkerThreadProc,
+                                new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hDrop) CloseHandle(hDrop);
+    else {
+        InterlockedExchange(&dropping_, 0);
+        asyncCtx_->release();
+    }
 }
 
 bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
@@ -1318,6 +1698,7 @@ void ShellWindow::setAimMode(bool enabled) {
         SetCursor(LoadCursor(NULL, IDC_ARROW));
         hudOverlay_.showToast("CURSOR MODE  (KB & WASD stay active!)", 1200);
     }
+    syncInputHookSnapshot();
     hudOverlay_.invalidate();
     invalidateShell();
 }
@@ -1354,6 +1735,7 @@ void ShellWindow::setEditMode(bool enabled) {
         if (profileDirty_) saveCurrentProfile(true);
     }
     hudOverlay_.setInteractiveEdit(editMode_, profile_.hudOpacity);
+    syncInputHookSnapshot();
     invalidateShell();
 }
 
@@ -1371,14 +1753,24 @@ void ShellWindow::toggleFullscreen() {
         GetMonitorInfoA(mon, &mi);
 
         fullscreen_ = true;
+        DWORD st = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE));
+        st &= ~(WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+        SetWindowLongPtrW(hwnd_, GWL_STYLE, static_cast<LONG_PTR>(st));
+        const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+        const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
         SetWindowPos(hwnd_, HWND_TOPMOST,
-                     mi.rcMonitor.left, mi.rcMonitor.top,
-                     mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     mi.rcMonitor.left, mi.rcMonitor.top, monW, monH,
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        if (viewportHost_.isNativeVideoActive()) {
+            // 1.4(b): present straight onto top-level window for Hardware Independent Flip!
+            viewportHost_.setFullscreenTarget(hwnd_, true, monW, monH);
+        }
         hudOverlay_.showToast("Fullscreen Mode (Press F11 to exit)", 1800);
     } else {
         fullscreen_ = false;
+        DWORD st = static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE));
+        st |= (WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+        SetWindowLongPtrW(hwnd_, GWL_STYLE, static_cast<LONG_PTR>(st));
         HWND zOrder = settings_.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
         if (preFullscreenMax_) {
             SetWindowPos(hwnd_, zOrder, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
@@ -1390,13 +1782,16 @@ void ShellWindow::toggleFullscreen() {
                          preFullscreenRect_.bottom - preFullscreenRect_.top,
                          SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
+        if (viewportHost_.isNativeVideoActive()) {
+            viewportHost_.setFullscreenTarget(hwnd_, false, 0, 0);
+        }
     }
     layoutChildren();
 }
 
 void ShellWindow::toggleAlwaysOnTop() {
     settings_.alwaysOnTop = !settings_.alwaysOnTop;
-    saveSettings();
+    scheduleSettingsSave();
     if (hwnd_ && !fullscreen_) {
         SetWindowPos(hwnd_, settings_.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -1475,9 +1870,12 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         applyProfileToEngine(!drawerPanel_.isDraggingSlider());
     }
     if (res.settingsModified) {
-        saveSettings();
+        scheduleSettingsSave();
         InterlockedExchange(&autoSwitchAtomic_, settings_.autoSwitchProfiles ? 1 : 0);
         engine_->setGamepadEnabled(settings_.gamepadEnabled);
+        if (res.vsyncToggled) {
+            viewportHost_.setVsync(settings_.vsyncEnabled);
+        }
         // Apply Turn Phone Screen Off only when that toggle actually changed (never spam on bitrate/FPS edits!)
         if (settings_.turnScreenOff != lastAppliedScreenOff_) {
             lastAppliedScreenOff_ = settings_.turnScreenOff;
@@ -1485,6 +1883,9 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
                 bridge_->setDisplayPower(!settings_.turnScreenOff);
             }
         }
+    }
+    if (res.requestRunLatencyProbe) {
+        startRoundTripProbe(60);
     }
     if (res.requestSave) {
         saveCurrentProfile(false);
@@ -1555,7 +1956,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         setDrawerState(false, drawerPanel_.activeTab());
     }
     if (res.requestReconnectStream) {
-        saveSettings();
+        scheduleSettingsSave();
         std::string ser = bridge_->activeSerial();
         startAsyncConnect(ser);
     }
@@ -1572,6 +1973,7 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         setEditMode(wantEdit);
     }
 
+    syncInputHookSnapshot();
     hudOverlay_.invalidate();
     invalidateShell();
 }
@@ -1620,249 +2022,7 @@ void ShellWindow::handleSideRailAction(SideRailAction act) {
     }
 }
 
-// --- Low-level Hooks (identical non-blocking low-latency path to InputEngine!) ---
-
-LRESULT ShellWindow::handleLowLevelMouse(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode != HC_ACTION || !lParam) {
-        return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
-    }
-
-    const MSLLHOOKSTRUCT* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-    if (editMode_ || (drawerOpen_ && drawerPanel_.isWaitingSpecialRebind())) {
-        return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
-    }
-
-    int mouseVk = 0;
-    bool mouseDown = false;
-    bool mouseUp = false;
-    switch (wParam) {
-        case WM_LBUTTONDOWN: mouseVk = VK_LBUTTON; mouseDown = true; break;
-        case WM_LBUTTONUP:   mouseVk = VK_LBUTTON; mouseUp = true; break;
-        case WM_RBUTTONDOWN: mouseVk = VK_RBUTTON; mouseDown = true; break;
-        case WM_RBUTTONUP:   mouseVk = VK_RBUTTON; mouseUp = true; break;
-        case WM_MBUTTONDOWN: mouseVk = VK_MBUTTON; mouseDown = true; break;
-        case WM_MBUTTONUP:   mouseVk = VK_MBUTTON; mouseUp = true; break;
-        case WM_XBUTTONDOWN: mouseVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; mouseDown = true; break;
-        case WM_XBUTTONUP:   mouseVk = (HIWORD(ms->mouseData) == XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; mouseUp = true; break;
-        case WM_MOUSEWHEEL: {
-            short delta = static_cast<short>(HIWORD(ms->mouseData));
-            mouseVk = (delta > 0) ? VK_CUSTOM_MWHEEL_UP : VK_CUSTOM_MWHEEL_DOWN;
-            mouseDown = true;
-            break;
-        }
-        default: break;
-    }
-
-    if (mouseVk != 0 && (aimMode_ || holdUnlockedAim_ || isAppForeground())) {
-        if (profile_.holdUnlockVk != 0 && mouseVk == profile_.holdUnlockVk) {
-            if (mouseDown && aimMode_ && !holdUnlockedAim_) {
-                holdUnlockedAim_ = true;
-                PostMessageA(hwnd_, MSG_UNLOCK_AIM, 0, 0);
-                return 1;
-            }
-            if (mouseUp && holdUnlockedAim_) {
-                holdUnlockedAim_ = false;
-                PostMessageA(hwnd_, MSG_LOCK_AIM, 0, 0);
-                return 1;
-            }
-        }
-        if (mouseVk == profile_.toggleAimVk && (bridge_->isConnected() || demoMode_)) {
-            if (mouseDown) { PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0); return 1; }
-            if (mouseUp) return 1;
-        }
-    }
-
-    if (aimMode_) {
-        if (!isAppForeground()) return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
-        if (mouseVk != 0) {
-            bool reqToggle = false;
-            engine_->onKeyEvent(mouseVk, mouseDown, reqToggle);
-            if (reqToggle) PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
-            return 1;
-        }
-    } else if (bridge_->isConnected()) {
-        float nx = 0.0f, ny = 0.0f;
-        bool inVideo = isPointInVideoScreen(ms->pt, nx, ny);
-
-        // Mouse-bound CURSOR_TOGGLE only fires inside video rect (never blocks sidebar/drawer clicks)
-        if (inVideo && mouseVk != 0 && mouseVk != VK_LBUTTON && mouseDown && isAppForeground()) {
-            bool reqToggle = false;
-            bool consumed = engine_->onKeyEvent(mouseVk, true, reqToggle);
-            if (reqToggle) PostMessageA(hwnd_, MSG_TOGGLE_AIM, 0, 0);
-            if (consumed) return 1;
-        }
-
-        // In Stage 2 Native D3D11 Mode, ViewportHost is our own native Win32 window:
-        // let WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP / WM_RBUTTONDOWN / WM_MOUSEWHEEL flow
-        // straight to ShellWindow::handleMessage() so first-click activation, DPI coords, and keyboard focus NEVER fail!
-        if (!viewportHost_.isNativeVideoActive()) {
-            if (wParam == WM_LBUTTONDOWN && inVideo && isAppForeground()) {
-                cursorDirectDragging_ = true;
-                engine_->onDirectCursorTouch(TOUCH_DOWN, nx, ny);
-                return 1;
-            } else if (wParam == WM_MOUSEMOVE && cursorDirectDragging_) {
-                if (inVideo) engine_->onDirectCursorTouch(TOUCH_MOVE, nx, ny);
-            } else if (wParam == WM_LBUTTONUP && cursorDirectDragging_) {
-                cursorDirectDragging_ = false;
-                engine_->onDirectCursorTouch(TOUCH_UP, clamp01(nx), clamp01(ny));
-                return 1;
-            } else if (wParam == WM_RBUTTONDOWN && settings_.rightClickBack && inVideo && isAppForeground()) {
-                rightClickBackSwallowUp_ = true;
-                PostMessageA(hwnd_, MSG_ANDROID_BACK, 0, 0);
-                return 1;
-            } else if (wParam == WM_RBUTTONUP && rightClickBackSwallowUp_) {
-                rightClickBackSwallowUp_ = false;
-                return 1;
-            } else if (wParam == WM_MOUSEWHEEL && inVideo && isAppForeground()) {
-                short rawDelta = static_cast<short>(HIWORD(ms->mouseData));
-                int notches = rawDelta / WHEEL_DELTA;
-                if (notches == 0 && rawDelta != 0) notches = (rawDelta > 0) ? 1 : -1;
-                if (notches != 0) {
-                    bool ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                    if (ctrlHeld) {
-                        engine_->onDirectCursorPinch(nx, ny, notches);
-                    } else {
-                        engine_->onDirectCursorScroll(nx, ny, notches);
-                    }
-                    return 1;
-                }
-            }
-        }
-    }
-
-    return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
-}
-
-LRESULT ShellWindow::handleLowLevelKeyboard(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode != HC_ACTION || !lParam) {
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-    int vk = static_cast<int>(kb->vkCode);
-    bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-    bool up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
-    if (!down && !up) return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-
-    bool isRepeat = false;
-    if (vk >= 0 && vk < 256) {
-        if (down) { isRepeat = hookKeyDown_[vk]; hookKeyDown_[vk] = true; }
-        else if (up) { hookKeyDown_[vk] = false; }
-    }
-
-    if (up && (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1)) {
-        bool wasDown = toggleAimKeyDown_;
-        toggleAimKeyDown_ = false;
-        if (wasDown && !editMode_ && (aimMode_ || vk == VK_F1 || (profile_.keymapEnabled && isAppForeground()))) return 1;
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-    if (up && holdUnlockedAim_ && KeyCodes::matches(vk, profile_.holdUnlockVk)) {
-        holdUnlockedAim_ = false;
-        if (!editMode_ && isAppForeground()) {
-            PostMessageA(hwnd_, MSG_LOCK_AIM, 0, 0);
-            return 1;
-        }
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-    if (down && (vk == VK_LWIN || vk == VK_RWIN)) {
-        if (aimMode_) PostMessageA(hwnd_, MSG_UNLOCK_AIM, 0, 0);
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    if (!aimMode_ && !isAppForeground()) {
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    // While typing in any input box (Drawer or Hub) or rebinding a key -> pass straight to Win32 UI!
-    bool uiCapturingText = editingHubWireless_ ||
-                           (drawerOpen_ && (drawerPanel_.isTypingText() || drawerPanel_.isWaitingSpecialRebind())) ||
-                           (hudOverlay_.rebindTarget() != HUD_REBIND_NONE);
-    if (editMode_ || uiCapturingText) {
-        if (down && !isRepeat && vk == VK_F2 && !uiCapturingText) {
-            PostMessageA(hwnd_, MSG_TOGGLE_STUDIO, 0, 0);
-            return 1;
-        }
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    bool altDown = ((kb->flags & LLKHF_ALTDOWN) != 0) || ((GetKeyState(VK_MENU) & 0x8000) != 0);
-    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-
-    if (!bridge_->isConnected() && !demoMode_) {
-        if (down && !isRepeat && !altDown && vk == VK_F11) { PostMessageW(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    if (profile_.keymapEnabled || aimMode_) {
-        if (KeyCodes::matches(vk, profile_.holdUnlockVk)) {
-            if (down) {
-                if (!isRepeat && aimMode_ && !holdUnlockedAim_) {
-                    holdUnlockedAim_ = true;
-                    PostMessageW(hwnd_, MSG_UNLOCK_AIM, 0, 0);
-                }
-                if (holdUnlockedAim_) return 1;
-            }
-        }
-
-        if (!altDown && (KeyCodes::matches(vk, profile_.toggleAimVk) || vk == VK_F1)) {
-            if (down) {
-                if (!isRepeat && !toggleAimKeyDown_) {
-                    toggleAimKeyDown_ = true;
-                    PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
-                }
-                return 1;
-            }
-        }
-    } else if (!altDown && vk == VK_F1 && down) {
-        // Quick 1-key recovery from Desktop Typing Mode back to last Game Profile
-        if (!isRepeat && !toggleAimKeyDown_) {
-            toggleAimKeyDown_ = true;
-            PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
-        }
-        return 1;
-    }
-
-    if (down && isRepeat) {
-        if (!altDown && (aimMode_ || engine_->isKeyMapped(vk, false))) return 1;
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    // E1: In unlocked Cursor Mode, allow pure Ctrl+C/V/X/A/Z (never match AltGr as Ctrl!)
-    if (!aimMode_ && KeyCodes::isPureCtrlShortcut(ctrlDown, altDown)) {
-        if (vk == 'C' || vk == 'V' || vk == 'X' || vk == 'A' || vk == 'Z') {
-            return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-        }
-    }
-
-    // N31: Do NOT intercept fixed hotkeys while Alt is held (so Alt+F4 closes cleanly!)
-    if (down && !altDown) {
-        if (vk == VK_F2)  { PostMessageW(hwnd_, MSG_TOGGLE_STUDIO, 0, 0); return 1; }
-        if (vk == VK_F3)  { PostMessageW(hwnd_, MSG_CYCLE_FIRE, 0, 0); return 1; }
-        if (vk == VK_F4)  { PostMessageW(hwnd_, MSG_TOGGLE_HUD, 0, 0); return 1; }
-        if (vk == VK_F11) { PostMessageW(hwnd_, MSG_TOGGLE_FULLSCREEN, 0, 0); return 1; }
-        if (vk == profile_.resetTouchVk) { PostMessageW(hwnd_, MSG_RESET_TOUCH, 0, 0); return 1; }
-        if (profile_.keymapEnabled) {
-            if (vk == VK_OEM_4)     { PostMessageW(hwnd_, MSG_SENS_X_DOWN, 0, 0); return 1; }
-            if (vk == VK_OEM_6)     { PostMessageW(hwnd_, MSG_SENS_X_UP, 0, 0); return 1; }
-            if (vk == VK_OEM_MINUS) { PostMessageW(hwnd_, MSG_SENS_Y_DOWN, 0, 0); return 1; }
-            if (vk == VK_OEM_PLUS)  { PostMessageW(hwnd_, MSG_SENS_Y_UP, 0, 0); return 1; }
-        }
-    }
-
-    if (altDown && !aimMode_) {
-        // Never swallow AltGr or Alt+shortcut keys outside Aim Lock
-        return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-    }
-
-    bool reqToggle = false;
-    bool consumed = engine_->onKeyEvent(vk, down, reqToggle);
-    if (reqToggle) PostMessageW(hwnd_, MSG_TOGGLE_AIM, 0, 0);
-    if (consumed) return 1;
-
-    return CallNextHookEx(keyHook_, nCode, wParam, lParam);
-}
-
-// --- Win32 Window Procedure ---
+// --- Win32 Window Procedure (hooks & WM_INPUT live on InputHookThread) ---
 
 LRESULT CALLBACK ShellWindow::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     ShellWindow* self = NULL;
@@ -1878,6 +2038,26 @@ LRESULT CALLBACK ShellWindow::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 }
 
 LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const int64_t t0 = LatencyTelemetry::nowQpc();
+    LRESULT res = dispatchMessage(hwnd, msg, wParam, lParam);
+    const double ms = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - t0);
+    const bool modalOsMsg = (msg == WM_CREATE || msg == WM_NCCREATE || msg == WM_DESTROY ||
+                             msg == WM_NCDESTROY || msg == WM_SYSCOMMAND ||
+                             msg == WM_NCLBUTTONDOWN || msg == WM_ENTERSIZEMOVE || msg == WM_EXITSIZEMOVE);
+    if (!modalOsMsg) {
+        if (ms > maxUiMsgMs_) maxUiMsgMs_ = ms;
+        if (ms > 16.0) {
+            ++uiStallCount_;
+            char sbuf[128];
+            std::snprintf(sbuf, sizeof(sbuf), "[S6-UI] SLOW msg=0x%04X took %.2f ms (stalls=%u)",
+                          msg, ms, uiStallCount_);
+            bridge_->appendLog(sbuf);
+        }
+    }
+    return res;
+}
+
+LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_NCCALCSIZE: {
             if (wParam == TRUE) {
@@ -1946,27 +2126,6 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             layoutChildren();
             return 0;
 
-        case WM_INPUT: {
-            if (!aimMode_) break;
-            UINT dwSize = 0;
-            GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER));
-            if (dwSize > 0 && dwSize <= 256) {
-                BYTE rawBuf[256];
-                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawBuf, &dwSize, sizeof(RAWINPUTHEADER)) == dwSize) {
-                    const RAWINPUT* raw = reinterpret_cast<const RAWINPUT*>(rawBuf);
-                    if (raw->header.dwType == RIM_TYPEMOUSE &&
-                        (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-                        LONG dx = raw->data.mouse.lLastX;
-                        LONG dy = raw->data.mouse.lLastY;
-                        if (dx != 0 || dy != 0) {
-                            engine_->onRawMouseDelta(static_cast<int>(dx), static_cast<int>(dy));
-                        }
-                    }
-                }
-            }
-            return 0;
-        }
-
         case MSG_TOGGLE_AIM:        setAimMode(!aimMode_); return 0;
         case MSG_UNLOCK_AIM:        setAimMode(false); return 0;
         case MSG_LOCK_AIM:          setAimMode(true); return 0;
@@ -1978,6 +2137,103 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case MSG_TOGGLE_HUD:        toggleHud(); return 0;
         case MSG_RESET_TOUCH:       triggerQuickReset(); return 0;
         case MSG_TOGGLE_FULLSCREEN: toggleFullscreen(); return 0;
+        case MSG_TOGGLE_DEBUG_HUD:
+            debugOverlayVisible_ = !debugOverlayVisible_;
+            lastTopBarSig_.valid = false;
+            invalidateShell();
+            hudOverlay_.showToast(debugOverlayVisible_ ? "Latency/UI Debug Overlay: ON" : "Debug Overlay: OFF", 1200);
+            return 0;
+        case MSG_RUN_LATENCY_PROBE:
+            startRoundTripProbe(autoProbeSamples_);
+            return 0;
+        case MSG_INJECT_VIDEO_STALL:
+            bridge_->triggerVideoStallTest();
+            hudOverlay_.showToast("Injected 300ms video stall test", 1400);
+            return 0;
+
+        case MSG_TOOLS_READY: {
+            EnterCriticalSection(&auxLock_);
+            toolsReady_ = pendingToolsOk_;
+            if (toolsReady_) {
+                tools_ = pendingTools_;
+                adbDevices_ = pendingAdbDevices_;
+            } else {
+                hubStatusMsg_ = pendingToolsErr_;
+            }
+            LeaveCriticalSection(&auxLock_);
+            if (!toolsReady_) {
+                bridge_->appendLog("[Tools] " + hubStatusMsg_);
+            } else {
+                bridge_->appendLog("[Tools] scrcpy " + tools_.scrcpyVersion + " ready");
+                if (adbDevices_.empty()) {
+                    hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
+                } else {
+                    hubStatusMsg_.clear();
+                    for (size_t i = 0; i < adbDevices_.size(); ++i) {
+                        if (adbDevices_[i].state == "device") {
+                            startAsyncConnect(adbDevices_[i].serial);
+                            break;
+                        }
+                    }
+                }
+            }
+            invalidateShell();
+            return 0;
+        }
+        case MSG_DEVICES_REFRESHED: {
+            EnterCriticalSection(&auxLock_);
+            adbDevices_ = pendingAdbDevices_;
+            LeaveCriticalSection(&auxLock_);
+            if (!bridge_->isConnected() && !connecting_) {
+                if (adbDevices_.empty()) {
+                    hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
+                } else {
+                    hubStatusMsg_.clear();
+                }
+            }
+            invalidateShell();
+            return 0;
+        }
+        case MSG_DISCONNECT_DONE: {
+            EnterCriticalSection(&auxLock_);
+            adbDevices_ = pendingAdbDevices_;
+            LeaveCriticalSection(&auxLock_);
+            if (wParam != 0) {
+                if (adbDevices_.empty()) {
+                    hubStatusMsg_ = "Plug in your Android phone (USB Debugging ON) or use Wireless ADB below.";
+                } else {
+                    hubStatusMsg_.clear();
+                }
+            }
+            syncInputHookSnapshot();
+            invalidateShell();
+            return 0;
+        }
+        case MSG_SCREENSHOT_DONE: {
+            std::string toast;
+            EnterCriticalSection(&auxLock_);
+            toast = pendingScreenshotToast_;
+            LeaveCriticalSection(&auxLock_);
+            if (!toast.empty()) {
+                hudOverlay_.showToast(toast, 2400);
+            }
+            return 0;
+        }
+        case MSG_PROBE_UPDATE: {
+            ProbeResult pr;
+            EnterCriticalSection(&auxLock_);
+            pr = probeResult_;
+            LeaveCriticalSection(&auxLock_);
+            if (!pr.running && pr.valid) {
+                hudOverlay_.showToast(pr.summaryLine, 4000);
+            }
+            if (!pr.running && autoProbeOnConnect_) {
+                autoProbeOnConnect_ = false;
+                PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            }
+            invalidateShell();
+            return 0;
+        }
 
         case MSG_CONNECT_DONE: {
             hubStatusMsg_ = asyncResultOk_ ? "" : asyncResultMsg_;
@@ -1989,20 +2245,36 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 lastPhoneW_ = pw;
                 lastPhoneH_ = ph;
                 std::string d3dErr;
-                if (viewportHost_.enableNativeVideo(pw, ph, d3dErr)) {
+                if (viewportHost_.enableNativeVideo(pw, ph, d3dErr, settings_.vsyncEnabled)) {
                     hudOverlay_.setEmbeddedD3DMode(true, ShellWindow::onHudBitmapReady, this);
                     sawEmbeddedMirror_ = true;
+                    if (fullscreen_) {
+                        HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+                        MONITORINFO mi;
+                        ZeroMemory(&mi, sizeof(mi));
+                        mi.cbSize = sizeof(mi);
+                        if (GetMonitorInfoA(mon, &mi)) {
+                            viewportHost_.setFullscreenTarget(hwnd_, true,
+                                mi.rcMonitor.right - mi.rcMonitor.left,
+                                mi.rcMonitor.bottom - mi.rcMonitor.top);
+                        }
+                    }
                     layoutChildren();
                     std::string modeTag = bridge_->isVirtualDisplayActive()
                         ? "Second-Phone Virtual Display (D3D11)"
                         : "Native D3D11 Single-Connection Stream";
                     hudOverlay_.showToast(modeTag + " · F2 Studio | " + KeyCodes::toName(profile_.toggleAimVk) + "/F1 Aim", 3600);
+                    if (autoProbeOnConnect_ && probeRunCount_ == 0) {
+                        autoProbeArmed_ = true;
+                        autoProbeDueTick_ = GetTickCount() + 2000;
+                    }
                 } else {
                     bridge_->appendLog("[D3D11] Fallback to scrcpy.exe: " + d3dErr);
                     startAsyncLegacyFallback("D3D11 unavailable (" + d3dErr + ").");
                     return 0;
                 }
             }
+            syncInputHookSnapshot();
             layoutChildren();
             invalidateShell();
             return 0;
@@ -2164,6 +2436,26 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     if (hSave) CloseHandle(hSave);
                     else { ProfileStore::save(job->path, job->profile); delete job; }
                 }
+                // N36: Debounced off-UI-thread settings save
+                if (hasPendingSettingsSave_ && static_cast<LONG>(nowTick - settingsSaveDueTick_) >= 0 &&
+                    InterlockedCompareExchange(&settingsSaveInFlight_, 1, 0) == 0) {
+                    hasPendingSettingsSave_ = false;
+                    SettingsSaveJob* sjob = new SettingsSaveJob{ settingsPath_, settings_, &settingsSaveInFlight_ };
+                    HANDLE hSet = CreateThread(NULL, 0, settingsSaveWorkerProc, sjob, 0, NULL);
+                    if (hSet) CloseHandle(hSet);
+                    else {
+                        AppSettingsStore::save(sjob->path, sjob->settings);
+                        InterlockedExchange(&settingsSaveInFlight_, 0);
+                        delete sjob;
+                    }
+                }
+                // Automated round-trip probe (--probe-on-connect after warmup)
+                if (autoProbeArmed_ && static_cast<LONG>(nowTick - autoProbeDueTick_) >= 0 &&
+                    bridge_->isConnected() && viewportHost_.hasNativeVideoFrame()) {
+                    autoProbeArmed_ = false;
+                    ++probeRunCount_;
+                    startRoundTripProbe(autoProbeSamples_);
+                }
                 bool connected = bridge_->isConnected();
                 if ((nowTick - lastTelemetryPaintTick_) >= 150) {
                     lastTelemetryPaintTick_ = nowTick;
@@ -2207,10 +2499,11 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     }
                 }
 
-                // Dirty-checked TopBar telemetry refresh (max 2.5 Hz, and 0 Hz when nothing changed!)
+                // Dirty-checked TopBar telemetry + video latency refresh (max 2.5 Hz, and 0 Hz when nothing changed!)
                 if (!fullscreen_ && (nowTick - lastTopBarPaintTick_) >= 400) {
                     lastTopBarPaintTick_ = nowTick;
                     EngineTelemetry tel = engine_->getTelemetry();
+                    TelemetrySummary vsum = telemetry_.getSummary();
                     TopBarVisualSig cur;
                     cur.valid = true;
                     cur.connected = connected;
@@ -2218,13 +2511,19 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     cur.keymapEnabled = profile_.keymapEnabled;
                     cur.fireMode = profile_.fireMode;
                     cur.touchRateHz = tel.touchRateHz;
+                    cur.latP50Q10 = static_cast<int>(vsum.rxToPresentP50Ms * 10.0 + 0.5);
+                    cur.latP95Q10 = static_cast<int>(vsum.rxToPresentP95Ms * 10.0 + 0.5);
+                    cur.skipped = vsum.skippedCount;
 
                     bool tbChanged = !lastTopBarSig_.valid ||
                         cur.connected != lastTopBarSig_.connected ||
                         cur.aimMode != lastTopBarSig_.aimMode ||
                         cur.keymapEnabled != lastTopBarSig_.keymapEnabled ||
                         cur.fireMode != lastTopBarSig_.fireMode ||
-                        cur.touchRateHz != lastTopBarSig_.touchRateHz;
+                        cur.touchRateHz != lastTopBarSig_.touchRateHz ||
+                        cur.latP50Q10 != lastTopBarSig_.latP50Q10 ||
+                        cur.latP95Q10 != lastTopBarSig_.latP95Q10 ||
+                        cur.skipped != lastTopBarSig_.skipped;
                     if (tbChanged) {
                         lastTopBarSig_ = cur;
                         InvalidateRect(hwnd, &topBarRc_, FALSE);
@@ -2456,8 +2755,9 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     editingHubWireless_ = false;
                 } else if (vk == VK_BACK && !settings_.lastWirelessAddr.empty()) {
                     settings_.lastWirelessAddr.pop_back();
-                    saveSettings();
+                    scheduleSettingsSave();
                 }
+                syncInputHookSnapshot();
                 invalidateShell();
                 return 0;
             }
@@ -2487,7 +2787,7 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (editingHubWireless_ && ch >= 32 && ch <= 126) {
                 if (settings_.lastWirelessAddr.size() < 28) {
                     settings_.lastWirelessAddr.push_back(static_cast<char>(ch));
-                    saveSettings();
+                    scheduleSettingsSave();
                     invalidateShell();
                 }
                 return 0;
@@ -2550,11 +2850,21 @@ LRESULT ShellWindow::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
 
         case WM_CLOSE:
+            InterlockedExchange(&stopAuxThreads_, 1);
+            InterlockedExchange(&stopProbe_, 1);
             flushOnExit();
             DestroyWindow(hwnd);
             return 0;
 
         case WM_DESTROY:
+            InterlockedExchange(&stopAuxThreads_, 1);
+            InterlockedExchange(&stopProbe_, 1);
+            if (asyncCtx_) {
+                EnterCriticalSection(&asyncCtx_->lock);
+                InterlockedExchange(&asyncCtx_->alive, 0);
+                asyncCtx_->hwnd = NULL;
+                LeaveCriticalSection(&asyncCtx_->lock);
+            }
             flushOnExit();
             setAimMode(false);
             viewportHost_.detachMirror();
@@ -2646,6 +2956,19 @@ void ShellWindow::handleLeftButtonDown(HWND hwnd, int mx, int my) {
 }
 
 void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
+    // 1.4(b): In F11 Native Video Fullscreen, swapchain renders directly on top-level hwnd_!
+    if (fullscreen_) {
+        if (viewportHost_.isNativeVideoActive()) {
+            viewportHost_.renderNativeFrame(true);
+        } else {
+            HBRUSH br = CreateSolidBrush(RGB(10, 13, 19));
+            FillRect(hdc, &dirtyRc, br);
+            DeleteObject(br);
+        }
+        return;
+    }
+
+    const int64_t tPaint0 = LatencyTelemetry::nowQpc();
     RECT rc;
     GetClientRect(hwnd_, &rc);
     int w = rc.right - rc.left;
@@ -2664,7 +2987,19 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
             DeleteDC(cacheDC_);
         }
         cacheDC_ = CreateCompatibleDC(hdc);
-        cacheBmp_ = CreateCompatibleBitmap(hdc, w, h);
+        BITMAPINFO bmi;
+        ZeroMemory(&bmi, sizeof(bmi));
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* dibBits = NULL;
+        cacheBmp_ = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &dibBits, NULL, 0);
+        if (!cacheBmp_) {
+            cacheBmp_ = CreateCompatibleBitmap(hdc, w, h);
+        }
         cacheOldBmp_ = SelectObject(cacheDC_, cacheBmp_);
         cacheW_ = w;
         cacheH_ = h;
@@ -2676,6 +3011,8 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         return IntersectRect(&inter, &paintRc, &r) != FALSE;
     };
 
+    double msHub = 0.0, msTop = 0.0, msDraw = 0.0, msRail = 0.0;
+    TelemetrySummary vidTel = telemetry_.getSummary();
     {
         Gdiplus::Graphics g(cacheDC_);
         g.SetClip(Gdiplus::Rect(paintRc.left, paintRc.top,
@@ -2701,6 +3038,7 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
 
         // 1. Center Viewport backdrop / Device Hub (skip completely when D3D11 child HWND owns viewportRc_!)
         if (!childCoversViewport && hitsDirty(viewportRc_)) {
+            const int64_t ts = LatencyTelemetry::nowQpc();
             std::string qrSt;
             EnterCriticalSection(&auxLock_);
             qrSt = qrPairStatus_;
@@ -2708,28 +3046,39 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
             viewportHost_.paint(g, viewportRc_, connected, demoMode_, (connecting_ != 0),
                                 hubStatusMsg_, adbDevices_, settings_.lastWirelessAddr,
                                 editingHubWireless_, showingQrPair_, &qrMatrix_, qrSt, hoverX_, hoverY_);
+            msHub = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
         }
 
         if (!fullscreen_) {
             // 2. TopBar (only when TopBar region is dirty)
             if (hitsDirty(topBarRc_)) {
+                const int64_t ts = LatencyTelemetry::nowQpc();
                 EngineTelemetry tel = engine_->getTelemetry();
                 topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
                               profile_, tel, settings_.alwaysOnTop,
-                              (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_);
+                              (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_, vidTel);
+                msTop = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
             }
 
             // 3. Docked Outside-Viewport DrawerPanel (only when open and dirty)
             if (drawerOpen_ && hitsDirty(drawerRc_)) {
+                const int64_t ts = LatencyTelemetry::nowQpc();
+                ProbeResult pr;
+                EnterCriticalSection(&auxLock_);
+                pr = probeResult_;
+                LeaveCriticalSection(&auxLock_);
+                drawerPanel_.setLatencyDiagnostics(vidTel, pr, viewportHost_.presentationModeLabel());
                 std::vector<std::string> logs = bridge_->getRecentLogs();
                 drawerPanel_.paint(g, drawerRc_, profile_, settings_, profilePath_,
                                    hudOverlay_.selectedBtnIndex(),
                                    (hudOverlay_.rebindTarget() == HUD_REBIND_BUTTON),
                                    connected, devLabel, activeAppPackage_, logs, hoverX_, hoverY_);
+                msDraw = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
             }
 
             // 4. Right Emulator SideRail (only when dirty)
             if (hitsDirty(railRc_)) {
+                const int64_t ts = LatencyTelemetry::nowQpc();
                 SideRailState st;
                 st.aimMode = aimMode_;
                 st.drawerOpen = drawerOpen_;
@@ -2738,6 +3087,24 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 st.fullscreen = fullscreen_;
                 st.connected = connected;
                 sideRail_.paint(g, railRc_, st, hoverX_, hoverY_);
+                msRail = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - ts);
+            }
+
+            // S6: Debug overlay strip (Ctrl+Shift+D) over top edge of viewport/TopBar
+            if (debugOverlayVisible_ && hitsDirty(topBarRc_)) {
+                char dbg[160];
+                std::snprintf(dbg, sizeof(dbg),
+                              "DBG %s | rx->pres %.1f/%.1fms dec/prs/skp=%llu/%llu/%llu | UI max=%.2fms stalls=%u | paint=%.2fms",
+                              viewportHost_.presentationModeLabel().c_str(),
+                              vidTel.rxToPresentP50Ms, vidTel.rxToPresentP95Ms,
+                              static_cast<unsigned long long>(vidTel.decodedCount),
+                              static_cast<unsigned long long>(vidTel.presentedCount),
+                              static_cast<unsigned long long>(vidTel.skippedCount),
+                              maxUiMsgMs_, uiStallCount_, lastPaintMs_);
+                RECT rDbg = { topBarRc_.left + 8, topBarRc_.bottom - 14, topBarRc_.right - 8, topBarRc_.bottom };
+                GdiPlusDraw::fillRect(g, rDbg, 0xD8081018u);
+                GdiPlusDraw::textLeft(g, dbg, static_cast<float>(rDbg.left + 4),
+                                      static_cast<float>(rDbg.top + 7), 9.5f, true, Theme::ACCENT_CYAN);
             }
 
             // Subtle hover tooltip left of SideRail (only when actually hovering SideRail)
@@ -2770,4 +3137,17 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
     int bw = paintRc.right - paintRc.left;
     int bh = paintRc.bottom - paintRc.top;
     BitBlt(hdc, bx, by, bw, bh, cacheDC_, bx, by, SRCCOPY);
+    lastPaintMs_ = LatencyTelemetry::qpcToMs(LatencyTelemetry::nowQpc() - tPaint0);
+    if (lastPaintMs_ > 16.0 || (consoleEnabled_ && lastPaintMs_ > 8.0)) {
+        char pbuf[160];
+        std::snprintf(pbuf, sizeof(pbuf),
+                      "[S6-Paint] total=%.2fms (hub=%.2f top=%.2f drawer=%.2f rail=%.2f)",
+                      lastPaintMs_, msHub, msTop, msDraw, msRail);
+        if (lastPaintMs_ > 16.0) {
+            bridge_->appendLog(pbuf);
+        }
+        if (consoleEnabled_) {
+            std::printf("%s\n", pbuf);
+        }
+    }
 }

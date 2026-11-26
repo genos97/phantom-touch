@@ -4,6 +4,7 @@
 #include "config/Profile.hpp"
 #include "config/ProfileStore.hpp"
 #include "engine/InputEngine.hpp"
+#include "engine/ThreadScheduling.hpp"
 #include "ui/GdiPlusDraw.hpp"
 #include "ui/ShellWindow.hpp"
 
@@ -56,11 +57,15 @@ void Application::printUsage() {
 
 int Application::run(int argc, char** argv) {
     enableDpiAwareness();
+    ThreadScheduling::disableProcessEcoQoS();
 
     bool demoMode = false;
     bool noMirror = false;
     bool showConsole = false;
     bool explicitProfile = false;
+    bool probeOnConnect = false;
+    bool startFullscreen = false;
+    int probeSamples = 60;
     std::string profilePath;
 
     for (int i = 1; i < argc; ++i) {
@@ -71,6 +76,13 @@ int Application::run(int argc, char** argv) {
             noMirror = true;
         } else if (arg == "--console") {
             showConsole = true;
+        } else if (arg == "--probe-on-connect") {
+            probeOnConnect = true;
+        } else if (arg == "--fullscreen") {
+            startFullscreen = true;
+        } else if (arg.find("--probe-samples=") == 0) {
+            int n = std::atoi(arg.c_str() + 16);
+            if (n >= 5 && n <= 200) probeSamples = n;
         } else if (arg == "--help" || arg == "-h") {
             showConsole = true;
             AllocConsole();
@@ -138,6 +150,7 @@ int Application::run(int argc, char** argv) {
     engine.start();
 
     ShellWindow shell(&bridge, &engine, exeDir, profilesDir, profilePath, settingsPath, demoMode, noMirror);
+    shell.setLaunchOptions(showConsole, probeOnConnect, probeSamples, startFullscreen);
     int exitCode = 1;
     if (shell.create(GetModuleHandleA(NULL))) {
         exitCode = shell.runMessageLoop();

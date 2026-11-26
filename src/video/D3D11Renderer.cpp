@@ -7,8 +7,16 @@
 #include <d3d10.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <dxgi1_5.h>
 #include <d3dcommon.h>
+
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+#ifndef DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+#define DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT 64
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -32,6 +40,9 @@ const GUID kIID_IDXGIDevice1 = {
 };
 const GUID kIID_IDXGIFactory2 = {
     0x50C83A1C, 0xE072, 0x4C48, { 0x87, 0xB0, 0x36, 0x30, 0xFA, 0x36, 0xA6, 0xD0 }
+};
+const GUID kIID_IDXGISwapChain2 = {
+    0xA8BE2AC4, 0x199F, 0x4946, { 0xB3, 0x31, 0x79, 0x59, 0x9F, 0xB9, 0x8D, 0xE7 }
 };
 const GUID kIID_IDXGIFactory5 = {
     0x7632E1F5, 0xEE65, 0x4DCA, { 0x87, 0xFD, 0x84, 0xCD, 0x75, 0xF8, 0x83, 0x8D }
@@ -95,6 +106,10 @@ Texture2D<float4> texHud : register(t0);
 float4 psHud(VSOut i) : SV_TARGET {
     return texHud.Sample(samp, i.uv);
 }
+
+float4 psYOnly(VSOut i) : SV_TARGET {
+    return float4(texY.Sample(samp, i.uv).r, 0.0, 0.0, 1.0);
+}
 )";
 
 // Official GDI+ PNG encoder CLSID: {557CF406-1A04-11D3-9A73-0000F81EF32E}
@@ -121,7 +136,7 @@ D3D11Renderer::~D3D11Renderer() {
     DeleteCriticalSection(&d3dLock_);
 }
 
-bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::string& outError) {
+bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::string& outError, bool vsyncEnabled) {
     shutdown();
     if (!targetHwnd || !IsWindow(targetHwnd)) {
         outError = "Invalid HWND for D3D11Renderer.";
@@ -136,6 +151,7 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
     backbufH_ = (initialH > 8) ? initialH : 360;
     savedW_ = backbufW_;
     savedH_ = backbufH_;
+    vsyncEnabled_ = vsyncEnabled;
     occluded_ = false;
     InterlockedExchange(&deviceLost_, 0);
 
@@ -193,100 +209,12 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
         dxgiDev1->Release();
     }
 
-    // Obtain DXGI Factory from the exact adapter that owns our device
-    IDXGIDevice* dxgiDev = nullptr;
-    IDXGIAdapter* adapter = nullptr;
-    IDXGIFactory* factory = nullptr;
-    if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
-        if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
-            adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory));
-            adapter->Release();
-        }
-        dxgiDev->Release();
-    }
-    if (!factory) {
+    if (!createSwapChainLocked(targetHwnd_, backbufW_, backbufH_, vsyncEnabled_)) {
         LeaveCriticalSection(&d3dLock_);
-        outError = "Failed querying IDXGIFactory.";
+        outError = "Failed creating DXGI swap chain.";
         shutdown();
         return false;
     }
-
-    // Check Windows 10/11 tearing support for zero-latency Flip-Model Present(0, DXGI_PRESENT_ALLOW_TEARING)
-    tearingSupported_ = false;
-    IDXGIFactory5* factory5 = nullptr;
-    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory5, reinterpret_cast<void**>(&factory5))) && factory5) {
-        BOOL allowTearing = FALSE;
-        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                                                    &allowTearing, sizeof(allowTearing))) && allowTearing) {
-            tearingSupported_ = true;
-        }
-        factory5->Release();
-    }
-
-    // Prefer modern zero-copy Flip-Model swap chain (DXGI_SWAP_EFFECT_FLIP_DISCARD) on Win10/11!
-    flipModel_ = false;
-    swapChainFlags_ = 0;
-    IDXGIFactory2* factory2 = nullptr;
-    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory2, reinterpret_cast<void**>(&factory2))) && factory2) {
-        DXGI_SWAP_CHAIN_DESC1 scd1;
-        ZeroMemory(&scd1, sizeof(scd1));
-        scd1.Width = static_cast<UINT>(backbufW_);
-        scd1.Height = static_cast<UINT>(backbufH_);
-        scd1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        scd1.SampleDesc.Count = 1;
-        scd1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd1.BufferCount = 2;
-        scd1.Scaling = DXGI_SCALING_STRETCH;
-        scd1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        scd1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        scd1.Flags = tearingSupported_ ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
-
-        IDXGISwapChain1* sc1 = nullptr;
-        hr = factory2->CreateSwapChainForHwnd(device_, targetHwnd_, &scd1, NULL, NULL, &sc1);
-        if (FAILED(hr) && scd1.Flags != 0) {
-            // Retry flip-discard without tearing flag (e.g. WARP / remote desktop)
-            scd1.Flags = 0;
-            tearingSupported_ = false;
-            hr = factory2->CreateSwapChainForHwnd(device_, targetHwnd_, &scd1, NULL, NULL, &sc1);
-        }
-        if (SUCCEEDED(hr) && sc1) {
-            swapChain_ = sc1;
-            flipModel_ = true;
-            swapChainFlags_ = scd1.Flags;
-        }
-        factory2->Release();
-    }
-
-    if (!swapChain_) {
-        // Fallback to legacy BitBlt swap chain (Win7 / headless tests)
-        DXGI_SWAP_CHAIN_DESC scd;
-        ZeroMemory(&scd, sizeof(scd));
-        scd.BufferCount = 2;
-        scd.BufferDesc.Width = static_cast<UINT>(backbufW_);
-        scd.BufferDesc.Height = static_cast<UINT>(backbufH_);
-        scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.OutputWindow = targetHwnd_;
-        scd.SampleDesc.Count = 1;
-        scd.Windowed = TRUE;
-        scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-        hr = factory->CreateSwapChain(device_, &scd, &swapChain_);
-        if (FAILED(hr) || !swapChain_) {
-            factory->Release();
-            LeaveCriticalSection(&d3dLock_);
-            outError = "Failed creating DXGI swap chain.";
-            shutdown();
-            return false;
-        }
-        flipModel_ = false;
-        tearingSupported_ = false;
-        swapChainFlags_ = 0;
-    }
-
-    // Disable Alt+Enter DXGI fullscreen hijack so our own Shell F11 fullscreen stays in control
-    factory->MakeWindowAssociation(targetHwnd_, DXGI_MWA_NO_ALT_ENTER);
-    factory->Release();
 
     // Check if GPU supports direct DXGI_FORMAT_NV12 Shader Resource Views (D3D11.1+ WDDM 1.2+)
     supportsGpuNv12Srv_ = false;
@@ -299,12 +227,6 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
         }
     }
 
-    if (!createRenderTargetLocked()) {
-        LeaveCriticalSection(&d3dLock_);
-        outError = "Failed creating D3D11 render target view.";
-        shutdown();
-        return false;
-    }
     if (!compileShadersLocked(outError)) {
         LeaveCriticalSection(&d3dLock_);
         shutdown();
@@ -355,13 +277,179 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
     rd.DepthClipEnable = TRUE;
     device_->CreateRasterizerState(&rd, &rasterNoCull_);
 
-    std::printf("[D3D11] Initialized (hw=%d flip=%d tearing=%d gpuNV12=%d)\n",
+    std::printf("[D3D11] Initialized (hw=%d flip=%d tearing=%d vsync=%d waitable=%d gpuNV12=%d)\n",
                 hardwareAccel_ ? 1 : 0, flipModel_ ? 1 : 0,
-                tearingSupported_ ? 1 : 0, supportsGpuNv12Srv_ ? 1 : 0);
+                tearingSupported_ ? 1 : 0, vsyncEnabled_ ? 1 : 0,
+                frameLatencyWaitable_ ? 1 : 0, supportsGpuNv12Srv_ ? 1 : 0);
     std::fflush(stdout);
 
     LeaveCriticalSection(&d3dLock_);
     return true;
+}
+
+void D3D11Renderer::closeWaitableObjectLocked() {
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = NULL;
+    }
+}
+
+bool D3D11Renderer::createSwapChainLocked(HWND hwnd, int w, int h, bool vsync) {
+    if (!device_ || !hwnd || !IsWindow(hwnd)) return false;
+    if (w < 8) w = 8;
+    if (h < 8) h = 8;
+
+    if (ctx_) ctx_->OMSetRenderTargets(0, NULL, NULL);
+    safeRelease(rtv_);
+    closeWaitableObjectLocked();
+    safeRelease(swapChain_);
+
+    IDXGIDevice* dxgiDev = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory* factory = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
+        if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
+            adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory));
+            adapter->Release();
+        }
+        dxgiDev->Release();
+    }
+    if (!factory) return false;
+
+    tearingSupported_ = false;
+    IDXGIFactory5* factory5 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory5, reinterpret_cast<void**>(&factory5))) && factory5) {
+        BOOL allowTearing = FALSE;
+        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                    &allowTearing, sizeof(allowTearing))) && allowTearing) {
+            tearingSupported_ = true;
+        }
+        factory5->Release();
+    }
+
+    flipModel_ = false;
+    swapChainFlags_ = 0;
+    IDXGIFactory2* factory2 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory2, reinterpret_cast<void**>(&factory2))) && factory2) {
+        DXGI_SWAP_CHAIN_DESC1 scd1;
+        ZeroMemory(&scd1, sizeof(scd1));
+        scd1.Width = static_cast<UINT>(w);
+        scd1.Height = static_cast<UINT>(h);
+        scd1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd1.SampleDesc.Count = 1;
+        scd1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd1.BufferCount = 2;
+        scd1.Scaling = DXGI_SCALING_STRETCH;
+        scd1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        if (vsync) {
+            scd1.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        } else {
+            scd1.Flags = tearingSupported_ ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
+        }
+
+        IDXGISwapChain1* sc1 = nullptr;
+        HRESULT hr = factory2->CreateSwapChainForHwnd(device_, hwnd, &scd1, NULL, NULL, &sc1);
+        if (FAILED(hr) && scd1.Flags != 0) {
+            scd1.Flags = 0;
+            if (!vsync) tearingSupported_ = false;
+            hr = factory2->CreateSwapChainForHwnd(device_, hwnd, &scd1, NULL, NULL, &sc1);
+        }
+        if (SUCCEEDED(hr) && sc1) {
+            swapChain_ = sc1;
+            flipModel_ = true;
+            swapChainFlags_ = scd1.Flags;
+            if (vsync && (swapChainFlags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
+                IDXGISwapChain2* sc2 = nullptr;
+                if (SUCCEEDED(sc1->QueryInterface(kIID_IDXGISwapChain2, reinterpret_cast<void**>(&sc2))) && sc2) {
+                    sc2->SetMaximumFrameLatency(1);
+                    frameLatencyWaitable_ = sc2->GetFrameLatencyWaitableObject();
+                    sc2->Release();
+                }
+            }
+        }
+        factory2->Release();
+    }
+
+    if (!swapChain_) {
+        DXGI_SWAP_CHAIN_DESC scd;
+        ZeroMemory(&scd, sizeof(scd));
+        scd.BufferCount = 2;
+        scd.BufferDesc.Width = static_cast<UINT>(w);
+        scd.BufferDesc.Height = static_cast<UINT>(h);
+        scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.OutputWindow = hwnd;
+        scd.SampleDesc.Count = 1;
+        scd.Windowed = TRUE;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+        HRESULT hr = factory->CreateSwapChain(device_, &scd, &swapChain_);
+        if (FAILED(hr) || !swapChain_) {
+            factory->Release();
+            return false;
+        }
+        flipModel_ = false;
+        tearingSupported_ = false;
+        swapChainFlags_ = 0;
+    }
+
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    factory->Release();
+
+    if (!createRenderTargetLocked()) {
+        return false;
+    }
+
+    targetHwnd_ = hwnd;
+    savedHwnd_ = hwnd;
+    backbufW_ = w;
+    backbufH_ = h;
+    savedW_ = w;
+    savedH_ = h;
+    vsyncEnabled_ = vsync;
+    occluded_ = false;
+    return true;
+}
+
+bool D3D11Renderer::setVsync(bool enabled) {
+    EnterCriticalSection(&d3dLock_);
+    if (!device_ || !targetHwnd_ || !IsWindow(targetHwnd_)) {
+        vsyncEnabled_ = enabled;
+        LeaveCriticalSection(&d3dLock_);
+        return true;
+    }
+    if (vsyncEnabled_ == enabled && swapChain_) {
+        LeaveCriticalSection(&d3dLock_);
+        return true;
+    }
+    bool ok = createSwapChainLocked(targetHwnd_, backbufW_, backbufH_, enabled);
+    LeaveCriticalSection(&d3dLock_);
+    return ok;
+}
+
+bool D3D11Renderer::rebindSwapChainTarget(HWND newHwnd, int width, int height) {
+    if (!newHwnd || !IsWindow(newHwnd)) return false;
+    EnterCriticalSection(&d3dLock_);
+    if (!device_) {
+        LeaveCriticalSection(&d3dLock_);
+        return false;
+    }
+    bool ok = createSwapChainLocked(newHwnd, width, height, vsyncEnabled_);
+    LeaveCriticalSection(&d3dLock_);
+    return ok;
+}
+
+std::string D3D11Renderer::presentationModeLabel() const {
+    EnterCriticalSection(&d3dLock_);
+    bool flip = flipModel_;
+    bool vsync = vsyncEnabled_;
+    bool waitable = (frameLatencyWaitable_ != NULL);
+    bool tear = tearingSupported_;
+    LeaveCriticalSection(&d3dLock_);
+    if (!flip) return "LegacyBlt";
+    if (vsync) return waitable ? "Flip+VSync(Waitable)" : "Flip+VSync";
+    return tear ? "Flip+Tearing" : "Flip";
 }
 
 bool D3D11Renderer::createRenderTargetLocked() {
@@ -377,8 +465,9 @@ bool D3D11Renderer::createRenderTargetLocked() {
 }
 
 bool D3D11Renderer::compileShadersLocked(std::string& outError) {
-    HMODULE hComp = LoadLibraryA("d3dcompiler_47.dll");
-    if (!hComp) hComp = LoadLibraryA("d3dcompiler_43.dll");
+    HMODULE hComp = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hComp) hComp = LoadLibraryExW(L"d3dcompiler_43.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hComp) hComp = LoadLibraryW(L"d3dcompiler_47.dll");
     if (!hComp) {
         outError = "d3dcompiler_47.dll not found on system.";
         return false;
@@ -413,14 +502,17 @@ bool D3D11Renderer::compileShadersLocked(std::string& outError) {
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* psNV12Blob = nullptr;
     ID3DBlob* psHudBlob = nullptr;
+    ID3DBlob* psYOnlyBlob = nullptr;
     bool ok = compileOne("vsMain", "vs_4_0", &vsBlob) &&
               compileOne("psNV12", "ps_4_0", &psNV12Blob) &&
-              compileOne("psHud", "ps_4_0", &psHudBlob);
+              compileOne("psHud", "ps_4_0", &psHudBlob) &&
+              compileOne("psYOnly", "ps_4_0", &psYOnlyBlob);
 
     if (ok) {
         if (FAILED(device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), NULL, &vsQuad_)) ||
             FAILED(device_->CreatePixelShader(psNV12Blob->GetBufferPointer(), psNV12Blob->GetBufferSize(), NULL, &psNV12_)) ||
-            FAILED(device_->CreatePixelShader(psHudBlob->GetBufferPointer(), psHudBlob->GetBufferSize(), NULL, &psHud_))) {
+            FAILED(device_->CreatePixelShader(psHudBlob->GetBufferPointer(), psHudBlob->GetBufferSize(), NULL, &psHud_)) ||
+            FAILED(device_->CreatePixelShader(psYOnlyBlob->GetBufferPointer(), psYOnlyBlob->GetBufferSize(), NULL, &psYOnly_))) {
             outError = "Failed creating D3D11 shader objects.";
             ok = false;
         }
@@ -429,12 +521,16 @@ bool D3D11Renderer::compileShadersLocked(std::string& outError) {
     safeRelease(vsBlob);
     safeRelease(psNV12Blob);
     safeRelease(psHudBlob);
+    safeRelease(psYOnlyBlob);
     FreeLibrary(hComp);
     return ok;
 }
 
 void D3D11Renderer::shutdown() {
     EnterCriticalSection(&d3dLock_);
+    safeRelease(probeStageTex_);
+    safeRelease(probeRtv_);
+    safeRelease(probeRtTex_);
     safeRelease(srvHud_);
     safeRelease(texHud_);
     safeRelease(srvNV12UV_);
@@ -448,10 +544,12 @@ void D3D11Renderer::shutdown() {
     safeRelease(blendPremul_);
     safeRelease(samplerLinear_);
     safeRelease(cbQuad_);
+    safeRelease(psYOnly_);
     safeRelease(psHud_);
     safeRelease(psNV12_);
     safeRelease(vsQuad_);
     safeRelease(rtv_);
+    closeWaitableObjectLocked();
     safeRelease(swapChain_);
     safeRelease(ctx_);
     safeRelease(device_);
@@ -478,6 +576,7 @@ bool D3D11Renderer::rebuildDevice(std::string& outError) {
     HWND hwndCopy = savedHwnd_;
     int wCopy = savedW_;
     int hCopy = savedH_;
+    bool vsyncCopy = vsyncEnabled_;
     if (!hwndCopy || !IsWindow(hwndCopy)) {
         outError = "Cannot rebuild D3D11 device: window destroyed.";
         return false;
@@ -498,7 +597,7 @@ bool D3D11Renderer::rebuildDevice(std::string& outError) {
     }
     LeaveCriticalSection(&frameLock_);
 
-    if (!init(hwndCopy, wCopy, hCopy, outError)) {
+    if (!init(hwndCopy, wCopy, hCopy, outError, vsyncCopy)) {
         return false;
     }
     if (hadHud) {
@@ -725,9 +824,155 @@ void D3D11Renderer::updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x
     }
 }
 
+bool D3D11Renderer::ensureProbeTargetsLocked() {
+    if (probeRtTex_ && probeRtv_ && probeStageTex_) return true;
+    safeRelease(probeStageTex_);
+    safeRelease(probeRtv_);
+    safeRelease(probeRtTex_);
+
+    D3D11_TEXTURE2D_DESC td;
+    ZeroMemory(&td, sizeof(td));
+    td.Width = 16;
+    td.Height = 16;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    if (FAILED(device_->CreateTexture2D(&td, NULL, &probeRtTex_)) || !probeRtTex_ ||
+        FAILED(device_->CreateRenderTargetView(probeRtTex_, NULL, &probeRtv_)) || !probeRtv_) {
+        safeRelease(probeRtv_);
+        safeRelease(probeRtTex_);
+        return false;
+    }
+
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device_->CreateTexture2D(&td, NULL, &probeStageTex_)) || !probeStageTex_) {
+        safeRelease(probeRtv_);
+        safeRelease(probeRtTex_);
+        return false;
+    }
+    return true;
+}
+
+bool D3D11Renderer::sampleYRectGpuLocked(float normX, float normY, float& outMeanY) {
+    ID3D11ShaderResourceView* activeY = gpuVideoActive_ ? srvNV12Y_ : srvY_;
+    if (!device_ || !ctx_ || !activeY || !psYOnly_ || !ensureProbeTargetsLocked()) return false;
+
+    uint32_t texW = gpuVideoActive_ ? texGpuW_ : texVideoW_;
+    uint32_t texH = gpuVideoActive_ ? texGpuH_ : texVideoH_;
+    uint32_t cropX = gpuVideoActive_ ? gpuCropX_ : 0u;
+    uint32_t cropY = gpuVideoActive_ ? gpuCropY_ : 0u;
+    uint32_t cropW = (gpuVideoActive_ && gpuCropW_ > 0) ? gpuCropW_ : texW;
+    uint32_t cropH = (gpuVideoActive_ && gpuCropH_ > 0) ? gpuCropH_ : texH;
+    if (texW < 16 || texH < 16 || cropW < 16 || cropH < 16) return false;
+
+    float cx = static_cast<float>(cropX) + std::max(0.02f, std::min(0.98f, normX)) * static_cast<float>(cropW);
+    float cy = static_cast<float>(cropY) + std::max(0.02f, std::min(0.98f, normY)) * static_cast<float>(cropH);
+    float x0 = std::max(static_cast<float>(cropX), cx - 8.0f);
+    float x1 = std::min(static_cast<float>(cropX + cropW), x0 + 16.0f);
+    float y0 = std::max(static_cast<float>(cropY), cy - 8.0f);
+    float y1 = std::min(static_cast<float>(cropY + cropH), y0 + 16.0f);
+
+    float u0 = x0 / static_cast<float>(texW);
+    float v0 = y0 / static_cast<float>(texH);
+    float u1 = x1 / static_cast<float>(texW);
+    float v1 = y1 / static_cast<float>(texH);
+
+    ctx_->OMSetRenderTargets(1, &probeRtv_, NULL);
+    D3D11_VIEWPORT vp;
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = 16.0f;
+    vp.Height = 16.0f;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ctx_->RSSetViewports(1, &vp);
+    ctx_->RSSetState(rasterNoCull_);
+    ctx_->IASetInputLayout(NULL);
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx_->VSSetShader(vsQuad_, NULL, 0);
+    ctx_->VSSetConstantBuffers(0, 1, &cbQuad_);
+    ctx_->PSSetSamplers(0, 1, &samplerLinear_);
+    ctx_->OMSetBlendState(NULL, NULL, 0xFFFFFFFFu);
+
+    updateConstantBufferLocked(-1.0f, -1.0f, 1.0f, 1.0f, u0, v0, u1, v1);
+    ctx_->PSSetShader(psYOnly_, NULL, 0);
+    ctx_->PSSetShaderResources(0, 1, &activeY);
+    ctx_->Draw(4, 0);
+
+    ID3D11ShaderResourceView* nullSrv = NULL;
+    ctx_->PSSetShaderResources(0, 1, &nullSrv);
+    ctx_->OMSetRenderTargets(0, NULL, NULL);
+    ctx_->CopyResource(probeStageTex_, probeRtTex_);
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(ctx_->Map(probeStageTex_, 0, D3D11_MAP_READ, 0, &ms)) || !ms.pData) {
+        return false;
+    }
+    uint32_t sum = 0;
+    const uint8_t* ptr = static_cast<const uint8_t*>(ms.pData);
+    for (int r = 0; r < 16; ++r) {
+        const uint8_t* row = ptr + static_cast<size_t>(r) * ms.RowPitch;
+        for (int c = 0; c < 16; ++c) {
+            sum += row[c];
+        }
+    }
+    ctx_->Unmap(probeStageTex_, 0);
+    outMeanY = static_cast<float>(sum) / 256.0f;
+    return true;
+}
+
+void D3D11Renderer::setProbeFrameEvent(HANDLE evt) {
+    EnterCriticalSection(&frameLock_);
+    probeFrameEvent_ = evt;
+    LeaveCriticalSection(&frameLock_);
+}
+
+void D3D11Renderer::setProbeSampleRect(bool active, float normX, float normY) {
+    EnterCriticalSection(&frameLock_);
+    probeNormX_ = normX;
+    probeNormY_ = normY;
+    InterlockedExchange(&probeActive_, active ? 1 : 0);
+    LeaveCriticalSection(&frameLock_);
+}
+
+bool D3D11Renderer::getLastProbeSample(float& outMeanY, int64_t& outPresentQpc, uint64_t& outSeq) const {
+    EnterCriticalSection(&frameLock_);
+    bool ok = (probeSeq_ > 0);
+    outMeanY = lastProbeMeanY_;
+    outPresentQpc = lastProbePresentQpc_;
+    outSeq = probeSeq_;
+    LeaveCriticalSection(&frameLock_);
+    return ok;
+}
+
+bool D3D11Renderer::sampleGridBrightness(float outGridY[9]) const {
+    if (!outGridY) return false;
+    D3D11Renderer* self = const_cast<D3D11Renderer*>(this);
+    EnterCriticalSection(&d3dLock_);
+    bool ok = true;
+    const float coords[3] = { 0.25f, 0.50f, 0.75f };
+    int idx = 0;
+    for (int gy = 0; gy < 3 && ok; ++gy) {
+        for (int gx = 0; gx < 3 && ok; ++gx) {
+            if (!self->sampleYRectGpuLocked(coords[gx], coords[gy], outGridY[idx++])) {
+                ok = false;
+            }
+        }
+    }
+    LeaveCriticalSection(&d3dLock_);
+    return ok;
+}
+
 bool D3D11Renderer::submitAndRenderGpuNV12(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
                                            uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                           const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+                                           const ViewportRect& videoRectInHost, bool drawHudOverlay,
+                                           FrameTiming* ioTiming) {
     if (!srcTex || outW < 16 || outH < 16) return false;
     EnterCriticalSection(&d3dLock_);
     if (!isInitialized() || !rtv_ || !supportsGpuNv12Srv_) {
@@ -763,14 +1008,15 @@ bool D3D11Renderer::submitAndRenderGpuNV12(ID3D11Texture2D* srcTex, uint32_t sub
     videoDirty_ = false;
     LeaveCriticalSection(&frameLock_);
 
-    renderLocked(videoRectInHost, drawHudOverlay);
+    renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     LeaveCriticalSection(&d3dLock_);
     return true;
 }
 
 void D3D11Renderer::submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
                                            uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                           const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+                                           const ViewportRect& videoRectInHost, bool drawHudOverlay,
+                                           FrameTiming* ioTiming) {
     if (!yPlane || !uvPlane || outW < 16 || outH < 16) return;
     EnterCriticalSection(&d3dLock_);
     if (!isInitialized() || !rtv_) {
@@ -804,19 +1050,19 @@ void D3D11Renderer::submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t*
         videoDirty_ = false;
         LeaveCriticalSection(&frameLock_);
 
-        renderLocked(videoRectInHost, drawHudOverlay);
+        renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     }
 
     LeaveCriticalSection(&d3dLock_);
 }
 
-void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming) {
     EnterCriticalSection(&d3dLock_);
-    renderLocked(videoRectInHost, drawHudOverlay);
+    renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     LeaveCriticalSection(&d3dLock_);
 }
 
-void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay) {
+void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming) {
     if (!isInitialized() || !rtv_ || backbufW_ < 8 || backbufH_ < 8 || deviceLost_ != 0) return;
 
     if (occluded_) {
@@ -829,6 +1075,10 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
             return;
         }
         occluded_ = false;
+    }
+
+    if (vsyncEnabled_ && frameLatencyWaitable_) {
+        WaitForSingleObject(frameLatencyWaitable_, 32);
     }
 
     // 1. Upload staged NV12 frame if submitNV12Frame() was used (unit tests / external caller)
@@ -952,8 +1202,16 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
         ctx_->PSSetShaderResources(0, 1, &nullSrv);
     }
 
-    UINT presentFlags = (flipModel_ && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
-    HRESULT phr = swapChain_->Present(0, presentFlags);
+    UINT syncInterval = vsyncEnabled_ ? 1u : 0u;
+    UINT presentFlags = (!vsyncEnabled_ && flipModel_ && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    const int64_t qpcCall = LatencyTelemetry::nowQpc();
+    HRESULT phr = swapChain_->Present(syncInterval, presentFlags);
+    const int64_t qpcRet = LatencyTelemetry::nowQpc();
+    lastPresentHr_ = phr;
+    if (ioTiming) {
+        ioTiming->qpcPresentCall = qpcCall;
+        ioTiming->qpcPresentRet = qpcRet;
+    }
     if (phr == DXGI_STATUS_OCCLUDED) {
         occluded_ = true;
     } else if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
@@ -961,6 +1219,24 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
     } else {
         occluded_ = false;
         InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
+        if (probeActive_ != 0 && readyVideo && activeY) {
+            float nx = 0.5f, ny = 0.5f;
+            HANDLE evt = NULL;
+            EnterCriticalSection(&frameLock_);
+            nx = probeNormX_;
+            ny = probeNormY_;
+            evt = probeFrameEvent_;
+            LeaveCriticalSection(&frameLock_);
+            float meanY = 0.0f;
+            if (sampleYRectGpuLocked(nx, ny, meanY)) {
+                EnterCriticalSection(&frameLock_);
+                lastProbeMeanY_ = meanY;
+                lastProbePresentQpc_ = qpcRet;
+                ++probeSeq_;
+                LeaveCriticalSection(&frameLock_);
+                if (evt) SetEvent(evt);
+            }
+        }
     }
 }
 

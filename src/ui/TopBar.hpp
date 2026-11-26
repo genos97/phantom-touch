@@ -3,6 +3,7 @@
 #include "config/Profile.hpp"
 #include "engine/InputEngine.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "video/LatencyTelemetry.hpp"
 
 #include <string>
 #include <vector>
@@ -22,7 +23,8 @@ public:
     void paint(Gdiplus::Graphics& g, const RECT& bounds,
                const std::string& deviceLabel, bool connected, bool demoMode,
                const Profile& profile, const EngineTelemetry& tel,
-               bool alwaysOnTop, bool maximized, int hoverX, int hoverY);
+               bool alwaysOnTop, bool maximized, int hoverX, int hoverY,
+               const TelemetrySummary& videoTel = TelemetrySummary());
 
     TopBarAction hitTest(int x, int y) const;
     bool isInteractivePoint(int x, int y) const { return hitTest(x, y) != TB_NONE; }

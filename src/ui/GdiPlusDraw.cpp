@@ -2,19 +2,131 @@
 #include "ui/Theme.hpp"
 
 #include <cmath>
+#include <map>
+
+namespace {
+
+struct GdiFontCache {
+    CRITICAL_SECTION lock;
+    bool lockInit = false;
+    bool active = false;
+    Gdiplus::FontFamily* fam = nullptr;
+    Gdiplus::StringFormat* fmtLeft = nullptr;
+    Gdiplus::StringFormat* fmtCenter = nullptr;
+    Gdiplus::StringFormat* fmtRight = nullptr;
+    std::map<uint32_t, Gdiplus::Font*> fonts;
+
+    GdiFontCache() {
+        InitializeCriticalSection(&lock);
+        lockInit = true;
+    }
+    ~GdiFontCache() {
+        clear();
+        if (lockInit) {
+            DeleteCriticalSection(&lock);
+            lockInit = false;
+        }
+    }
+
+    static uint32_t fontKey(float sizePx, bool bold) {
+        int q = static_cast<int>(sizePx * 4.0f + 0.5f);
+        if (q < 4) q = 4;
+        return (static_cast<uint32_t>(q) << 1) | (bold ? 1u : 0u);
+    }
+
+    Gdiplus::Font* getOrCreateFontLocked(float sizePx, bool bold) {
+        if (!active || !fam) return nullptr;
+        uint32_t k = fontKey(sizePx, bold);
+        std::map<uint32_t, Gdiplus::Font*>::iterator it = fonts.find(k);
+        if (it != fonts.end()) return it->second;
+        Gdiplus::Font* f = new Gdiplus::Font(
+            fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        fonts[k] = f;
+        return f;
+    }
+
+    void warm() {
+        if (!lockInit) return;
+        EnterCriticalSection(&lock);
+        if (!active) {
+            fam = new Gdiplus::FontFamily(L"Segoe UI");
+            fmtLeft = new Gdiplus::StringFormat();
+            fmtLeft->SetAlignment(Gdiplus::StringAlignmentNear);
+            fmtLeft->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            fmtLeft->SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            fmtLeft->SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+
+            fmtCenter = new Gdiplus::StringFormat();
+            fmtCenter->SetAlignment(Gdiplus::StringAlignmentCenter);
+            fmtCenter->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            fmtCenter->SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+            fmtRight = new Gdiplus::StringFormat();
+            fmtRight->SetAlignment(Gdiplus::StringAlignmentFar);
+            fmtRight->SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            fmtRight->SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+
+            active = true;
+            static const float kSizes[] = { 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 18.0f };
+            for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); ++i) {
+                getOrCreateFontLocked(kSizes[i], false);
+                getOrCreateFontLocked(kSizes[i], true);
+            }
+
+            Gdiplus::Bitmap bmp(16, 16, PixelFormat32bppPARGB);
+            Gdiplus::Graphics g(&bmp);
+            g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+            Gdiplus::SolidBrush br(Gdiplus::Color(255, 255, 255, 255));
+            Gdiplus::Font* reg = getOrCreateFontLocked(12.0f, false);
+            Gdiplus::Font* bld = getOrCreateFontLocked(12.0f, true);
+            if (reg) g.DrawString(L"A", 1, reg, Gdiplus::PointF(0.0f, 0.0f), fmtLeft, &br);
+            if (bld) g.DrawString(L"A", 1, bld, Gdiplus::PointF(0.0f, 0.0f), fmtLeft, &br);
+        }
+        LeaveCriticalSection(&lock);
+    }
+
+    void clear() {
+        if (!lockInit) return;
+        EnterCriticalSection(&lock);
+        active = false;
+        for (std::map<uint32_t, Gdiplus::Font*>::iterator it = fonts.begin(); it != fonts.end(); ++it) {
+            delete it->second;
+        }
+        fonts.clear();
+        delete fmtRight;  fmtRight = nullptr;
+        delete fmtCenter; fmtCenter = nullptr;
+        delete fmtLeft;   fmtLeft = nullptr;
+        delete fam;       fam = nullptr;
+        LeaveCriticalSection(&lock);
+    }
+};
+
+GdiFontCache g_fontCache;
+
+} // namespace
 
 GdiPlusSession::GdiPlusSession() {
     Gdiplus::GdiplusStartupInput input;
     if (Gdiplus::GdiplusStartup(&token_, &input, NULL) == Gdiplus::Ok) {
         started_ = true;
+        GdiPlusDraw::warmCache();
     }
 }
 
 GdiPlusSession::~GdiPlusSession() {
     if (started_) {
+        GdiPlusDraw::clearCache();
         Gdiplus::GdiplusShutdown(token_);
         started_ = false;
     }
+}
+
+void GdiPlusDraw::warmCache() {
+    g_fontCache.warm();
+}
+
+void GdiPlusDraw::clearCache() {
+    g_fontCache.clear();
 }
 
 Gdiplus::Color GdiPlusDraw::argb(uint32_t c) {
@@ -115,44 +227,74 @@ void GdiPlusDraw::vLine(Gdiplus::Graphics& g, int x, int y1, int y2, uint32_t ar
 void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
                            float x, float cy, float sizePx, bool bold, uint32_t colorArgb, float maxW) {
     std::wstring wtxt = toWide(text);
+    Gdiplus::SolidBrush br(argb(colorArgb));
+    float width = (maxW > 1.0f) ? maxW : 1600.0f;
+    Gdiplus::RectF layout(x, cy - sizePx * 1.1f, width, sizePx * 2.2f);
+    if (g_fontCache.lockInit) {
+        EnterCriticalSection(&g_fontCache.lock);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        if (font && g_fontCache.fmtLeft) {
+            g.DrawString(wtxt.c_str(), -1, font, layout, g_fontCache.fmtLeft, &br);
+            LeaveCriticalSection(&g_fontCache.lock);
+            return;
+        }
+        LeaveCriticalSection(&g_fontCache.lock);
+    }
     Gdiplus::FontFamily fam(L"Segoe UI");
     Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentNear);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
     fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
     fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-    float width = (maxW > 1.0f) ? maxW : 1600.0f;
-    Gdiplus::RectF layout(x, cy - sizePx * 1.1f, width, sizePx * 2.2f);
     g.DrawString(wtxt.c_str(), -1, &font, layout, &fmt, &br);
 }
 
 void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
                              float cx, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    Gdiplus::SolidBrush br(argb(colorArgb));
+    Gdiplus::PointF pt(cx, cy);
+    if (g_fontCache.lockInit) {
+        EnterCriticalSection(&g_fontCache.lock);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        if (font && g_fontCache.fmtCenter) {
+            g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtCenter, &br);
+            LeaveCriticalSection(&g_fontCache.lock);
+            return;
+        }
+        LeaveCriticalSection(&g_fontCache.lock);
+    }
     Gdiplus::FontFamily fam(L"Segoe UI");
     Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
     fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    Gdiplus::PointF pt(cx, cy);
     g.DrawString(wtxt.c_str(), -1, &font, pt, &fmt, &br);
 }
 
 void GdiPlusDraw::textRight(Gdiplus::Graphics& g, const std::string& text,
                             float rightX, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    Gdiplus::SolidBrush br(argb(colorArgb));
+    Gdiplus::PointF pt(rightX, cy);
+    if (g_fontCache.lockInit) {
+        EnterCriticalSection(&g_fontCache.lock);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(sizePx, bold);
+        if (font && g_fontCache.fmtRight) {
+            g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtRight, &br);
+            LeaveCriticalSection(&g_fontCache.lock);
+            return;
+        }
+        LeaveCriticalSection(&g_fontCache.lock);
+    }
     Gdiplus::FontFamily fam(L"Segoe UI");
     Gdiplus::Font font(&fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentFar);
     fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
     fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    Gdiplus::PointF pt(rightX, cy);
     g.DrawString(wtxt.c_str(), -1, &font, pt, &fmt, &br);
 }
 

@@ -90,6 +90,9 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "auto_switch_profiles") s.autoSwitchProfiles = (v == "1");
         else if (k == "right_click_back") s.rightClickBack = (v == "1");
         else if (k == "use_native_video") s.useNativeVideo = (v == "1");
+        else if (k == "vsync") s.vsyncEnabled = (v == "1");
+        else if (k == "audio_buffer_ms") s.audioBufferMs = clampInt(std::atoi(v.c_str()), 15, 100);
+        else if (k == "audio_raw_codec") s.audioRawCodec = (v == "1");
         else if (k == "virtual_display_mode") s.virtualDisplayMode = (v == "1");
         else if (k == "virtual_display_spec" && !v.empty()) s.virtualDisplaySpec = v;
         else if (k == "gamepad_enabled") s.gamepadEnabled = (v == "1");
@@ -122,6 +125,9 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "auto_switch_profiles = " << (s.autoSwitchProfiles ? 1 : 0) << "\n";
         out << "right_click_back = " << (s.rightClickBack ? 1 : 0) << "\n";
         out << "use_native_video = " << (s.useNativeVideo ? 1 : 0) << "\n";
+        out << "vsync = " << (s.vsyncEnabled ? 1 : 0) << "\n";
+        out << "audio_buffer_ms = " << clampInt(s.audioBufferMs, 15, 100) << "\n";
+        out << "audio_raw_codec = " << (s.audioRawCodec ? 1 : 0) << "\n";
         out << "virtual_display_mode = " << (s.virtualDisplayMode ? 1 : 0) << "\n";
         out << "virtual_display_spec = " << s.virtualDisplaySpec << "\n";
         out << "gamepad_enabled = " << (s.gamepadEnabled ? 1 : 0) << "\n";

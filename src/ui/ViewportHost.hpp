@@ -39,27 +39,42 @@ public:
     HWND hwnd() const { return hwnd_; }
 
     // Stage 2 Native Direct3D 11 single-connection renderer
-    bool ensureNativeDeviceInitialized(std::string& outError);
-    bool enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError);
+    bool ensureNativeDeviceInitialized(std::string& outError, bool vsyncEnabled = false);
+    bool enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::string& outError, bool vsyncEnabled = false);
     void disableNativeVideo();
     bool isNativeVideoActive() const { return nativeVideoActive_ && d3d_.isInitialized(); }
     ID3D11Device* d3dDevice() const { return d3d_.d3dDevice(); }
     bool supportsGpuNv12() const { return d3d_.supportsGpuNv12(); }
     bool isFlipModel() const { return d3d_.isFlipModel(); }
+    bool setVsync(bool enabled) { return d3d_.setVsync(enabled); }
+    bool setFullscreenTarget(HWND topLevelHwnd, bool enterFullscreen, int monW, int monH);
+    std::string presentationModeLabel() const { return d3d_.presentationModeLabel(); }
+    HRESULT lastPresentHResult() const { return d3d_.lastPresentHResult(); }
+    bool isOccluded() const { return d3d_.isOccluded(); }
+    bool hasRtv() const { return d3d_.hasRtv(); }
+    int backbufW() const { return d3d_.backbufW(); }
     bool isNativeDeviceLost() const { return d3d_.isDeviceLost(); }
     bool rebuildNativeDevice(std::string& outError);
     DWORD lastPresentTick() const { return d3d_.lastPresentTick(); }
     bool presentGpuNV12Frame(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
                              uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                             bool drawHudOverlay);
+                             bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
     void presentCpuNV12Frame(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
                              uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                             bool drawHudOverlay);
+                             bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
     void submitDecodedFrame(const DecodedNV12Frame& frame);
     void updateEmbeddedHud(const void* bgraPremulPixels, int width, int height);
-    void renderNativeFrame(bool drawHudOverlay);
+    void renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
     bool captureNativeScreenshot(const std::string& savePath, std::string& outError) const;
     bool hasNativeVideoFrame() const { return d3d_.hasVideoFrame(); }
+
+    // Round-trip probe forwarding (LATENCY_PLAN 0.2)
+    void setProbeFrameEvent(HANDLE evt) { d3d_.setProbeFrameEvent(evt); }
+    void setProbeSampleRect(bool active, float normX, float normY) { d3d_.setProbeSampleRect(active, normX, normY); }
+    bool getLastProbeSample(float& outMeanY, int64_t& outPresentQpc, uint64_t& outSeq) const {
+        return d3d_.getLastProbeSample(outMeanY, outPresentQpc, outSeq);
+    }
+    bool sampleGridBrightness(float outGridY[9]) const { return d3d_.sampleGridBrightness(outGridY); }
 
     // Legacy fallback: locate & embed borderless scrcpy.exe window by title + PID
     bool tryEmbedMirror(const std::string& windowTitle, DWORD expectedPid,
@@ -102,6 +117,7 @@ private:
     HWND parentHwnd_ = NULL;
     HWND embeddedHwnd_ = NULL;
     volatile LONG nativeVideoActive_ = 0;
+    bool fullscreenTarget_ = false;
     D3D11Renderer d3d_;
     mutable CRITICAL_SECTION rectLock_;
     RECT hostBounds_;

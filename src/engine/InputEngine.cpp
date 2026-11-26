@@ -1,4 +1,5 @@
 #include "engine/InputEngine.hpp"
+#include "engine/ThreadScheduling.hpp"
 
 #include "config/KeyCodes.hpp"
 
@@ -187,7 +188,7 @@ void InputEngine::start() {
     InterlockedExchange(&stopFlag_, 0);
     thread_ = CreateThread(NULL, 0, tickThreadProc, this, 0, NULL);
     if (thread_) {
-        SetThreadPriority(thread_, THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriority(thread_, THREAD_PRIORITY_HIGHEST);
     }
 }
 
@@ -308,6 +309,7 @@ void InputEngine::setAimMode(bool enabled) {
     EnterCriticalSection(&inputLock_);
     accumRawDx_ = 0.0;
     accumRawDy_ = 0.0;
+    hasPendingAimDelta_ = false;
     pendingCursor_.clear();
     pendingScroll_.clear();
     LeaveCriticalSection(&inputLock_);
@@ -320,14 +322,12 @@ void InputEngine::setAimMode(bool enabled) {
 
 void InputEngine::onRawMouseDelta(int dx, int dy) {
     if (!aimMode_ || (dx == 0 && dy == 0)) return;
-    bool shouldWake = false;
     EnterCriticalSection(&inputLock_);
-    bool wasZero = (std::fabs(accumRawDx_) < 0.0001 && std::fabs(accumRawDy_) < 0.0001);
     accumRawDx_ += static_cast<double>(dx);
     accumRawDy_ += static_cast<double>(dy);
-    shouldWake = wasZero || (pollHzAtomic_ == 0);
+    hasPendingAimDelta_ = true;
     LeaveCriticalSection(&inputLock_);
-    if (shouldWake && wakeEvent_) SetEvent(wakeEvent_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
 void InputEngine::onDirectCursorTouch(TouchAction action, float normX, float normY) {
@@ -879,6 +879,7 @@ void InputEngine::releaseAllTouches() {
     pendingScroll_.clear();
     accumRawDx_ = 0.0;
     accumRawDy_ = 0.0;
+    hasPendingAimDelta_ = false;
     std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
     LeaveCriticalSection(&inputLock_);
     LeaveCriticalSection(&lock_);
@@ -893,7 +894,7 @@ void InputEngine::resetAimView() {
     LeaveCriticalSection(&lock_);
 }
 
-bool InputEngine::processTick(double nowMs) {
+bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     std::vector<QueuedKeyEvent> localKeys;
     std::vector<QueuedCursorTouch> localCursor;
     std::vector<QueuedCursorScroll> localScroll;
@@ -934,51 +935,52 @@ bool InputEngine::processTick(double nowMs) {
         }
     }
 
-    actions_.tick(profile_, nowMs, packetsThisSec_);
-    joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
-
-    // Stage 3: XInput Gamepad-to-Touch polling (E3 single joystick owner + E4 focus/edit gating)
-    double dtMs = (lastTickMs_ > 0.0) ? clampd(nowMs - lastTickMs_, 0.5, 40.0) : 4.0;
-    lastTickMs_ = nowMs;
     GamepadFrameOutput gpOut;
-    if (appFocused_ == 0 || editMode_ != 0) {
-        gamepad_.suspendForFocusLoss(packetsThisSec_, gpOut);
-        if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
-        prevGpStickDeflected_ = false;
-    } else if (profile_.keymapEnabled) {
-        bool kbOwnsJoy = (joyOwner_ == JOY_KEYBOARD);
-        gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut, kbOwnsJoy);
-        if (gpOut.stickDeflected && !prevGpStickDeflected_ && kbOwnsJoy) {
-            // Fresh gamepad stick deflection while WASD owns joystick -> last-input-wins handoff on next tick!
-            joystick_.release(packetsThisSec_);
-            joyOwner_ = JOY_GAMEPAD;
-        } else if (gpOut.analogJoyActive) {
-            joyOwner_ = JOY_GAMEPAD;
-        } else if (!gpOut.stickDeflected && joyOwner_ == JOY_GAMEPAD) {
-            joyOwner_ = JOY_NONE;
+    if (runPeriodic) {
+        actions_.tick(profile_, nowMs, packetsThisSec_);
+        joystick_.tick(profile_, w, h, nowMs, packetsThisSec_);
+
+        // Stage 3: XInput Gamepad-to-Touch polling (E3 single joystick owner + E4 focus/edit gating)
+        double dtMs = (lastTickMs_ > 0.0) ? clampd(nowMs - lastTickMs_, 0.5, 40.0) : 4.0;
+        lastTickMs_ = nowMs;
+        if (appFocused_ == 0 || editMode_ != 0) {
+            gamepad_.suspendForFocusLoss(packetsThisSec_, gpOut);
+            if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
+            prevGpStickDeflected_ = false;
+        } else if (profile_.keymapEnabled) {
+            bool kbOwnsJoy = (joyOwner_ == JOY_KEYBOARD);
+            gamepad_.pollAndProcess(profile_, w, h, dtMs, packetsThisSec_, gpOut, kbOwnsJoy);
+            if (gpOut.stickDeflected && !prevGpStickDeflected_ && kbOwnsJoy) {
+                joystick_.release(packetsThisSec_);
+                joyOwner_ = JOY_GAMEPAD;
+            } else if (gpOut.analogJoyActive) {
+                joyOwner_ = JOY_GAMEPAD;
+            } else if (!gpOut.stickDeflected && joyOwner_ == JOY_GAMEPAD) {
+                joyOwner_ = JOY_NONE;
+            }
+            prevGpStickDeflected_ = gpOut.stickDeflected;
         }
-        prevGpStickDeflected_ = gpOut.stickDeflected;
-    }
-    for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
-        processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs, true);
+        for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
+            processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, nowMs, true);
+        }
+
+        if (cursorScrollDown_ && (aimMode_ || nowMs >= cursorScrollReleaseAtMs_)) {
+            releaseCursorScrollLocked();
+        }
+        if (cursorPinchDown_ && (aimMode_ || nowMs >= pinchReleaseAtMs_)) {
+            releaseCursorPinchLocked();
+        }
+
+        if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {
+            pendingFireDown_ = false;
+            pressFireLocked(nowMs);
+        }
+        if (fireDown_ && quickTapFireReleaseAtMs_ > 0.0 && nowMs >= quickTapFireReleaseAtMs_) {
+            liftFireFingerLocked();
+            aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
+        }
     }
     bool hasGpLook = (std::fabs(gpOut.lookDx) > 0.001 || std::fabs(gpOut.lookDy) > 0.001);
-
-    if (cursorScrollDown_ && (aimMode_ || nowMs >= cursorScrollReleaseAtMs_)) {
-        releaseCursorScrollLocked();
-    }
-    if (cursorPinchDown_ && (aimMode_ || nowMs >= pinchReleaseAtMs_)) {
-        releaseCursorPinchLocked();
-    }
-
-    if (pendingFireDown_ && nowMs >= pendingFireAtMs_) {
-        pendingFireDown_ = false;
-        pressFireLocked(nowMs);
-    }
-    if (fireDown_ && quickTapFireReleaseAtMs_ > 0.0 && nowMs >= quickTapFireReleaseAtMs_) {
-        liftFireFingerLocked();
-        aimCooldownUntilMs_ = nowMs + static_cast<double>(profile_.touchDownDelayMs);
-    }
 
     auto computeNeedsFastTicks = [&]() -> bool {
         return joystick_.isDown() || gamepad_.isConnected() ||
@@ -997,13 +999,21 @@ bool InputEngine::processTick(double nowMs) {
 
     double rawDx = gpOut.lookDx;
     double rawDy = gpOut.lookDy;
+    bool tookRaw = false;
     if (aimMode_) {
         EnterCriticalSection(&inputLock_);
-        rawDx += accumRawDx_;
-        rawDy += accumRawDy_;
-        accumRawDx_ = 0.0;
-        accumRawDy_ = 0.0;
+        if (hasPendingAimDelta_ || std::fabs(accumRawDx_) > 0.0001 || std::fabs(accumRawDy_) > 0.0001) {
+            rawDx += accumRawDx_;
+            rawDy += accumRawDy_;
+            accumRawDx_ = 0.0;
+            accumRawDy_ = 0.0;
+            hasPendingAimDelta_ = false;
+            tookRaw = true;
+        }
         LeaveCriticalSection(&inputLock_);
+    }
+    if (tookRaw) {
+        lastAimSendMs_ = nowMs;
     }
 
     if (w != lastConfiguredW_ || h != lastConfiguredH_) {
@@ -1120,65 +1130,84 @@ DWORD WINAPI InputEngine::tickThreadProc(LPVOID param) {
 }
 
 void InputEngine::runLoop() {
+    DWORD taskIdx = 0;
+    HANDLE avrt = ThreadScheduling::enableMmcssGames(taskIdx);
     timeBeginPeriod(1);
     double nextTickMs = getTimeMs();
+    lastAimSendMs_ = nextTickMs - 10.0;
 
     while (!stopFlag_) {
         int hz = static_cast<int>(pollHzAtomic_);
-        if (hz <= 0) hz = 500; // Event-driven wakeEvent_ still processes 1000+ Hz raw mouse/key bursts immediately!
+        if (hz <= 0) hz = 250; // 1.5: 250 Hz periodic for joystick glide & gamepad; aim sends on arrival!
         if (hz < 60) hz = 60;
         if (hz > 500) hz = 500;
         double periodMs = 1000.0 / static_cast<double>(hz);
 
         double nowMs = getTimeMs();
-        bool active = processTick(nowMs);
-
-        // Drain immediately if fresh key/cursor/raw-mouse input arrived while we were processing
-        bool hasQueued = false;
+        bool periodicDue = (nowMs >= nextTickMs);
+        bool hasEventQueue = false;
+        bool hasPendingAim = false;
         EnterCriticalSection(&inputLock_);
-        hasQueued = !pendingKeys_.empty() || !pendingCursor_.empty() || !pendingScroll_.empty() ||
-                    ((pollHzAtomic_ == 0) && (std::fabs(accumRawDx_) > 0.0001 || std::fabs(accumRawDy_) > 0.0001));
+        hasEventQueue = !pendingKeys_.empty() || !pendingCursor_.empty() || !pendingScroll_.empty();
+        hasPendingAim = hasPendingAimDelta_;
         LeaveCriticalSection(&inputLock_);
-        if (hasQueued) {
+
+        bool aimDue = (!periodicDue && hasPendingAim && ((nowMs - lastAimSendMs_) >= 1.0));
+        bool active = false;
+        if (periodicDue || hasEventQueue || aimDue) {
+            active = processTick(nowMs, periodicDue);
+            if (periodicDue) {
+                nextTickMs += periodMs;
+                if (nextTickMs <= nowMs) {
+                    nextTickMs = nowMs + periodMs;
+                }
+            }
+        }
+
+        // Check immediately if fresh input is ready now (after 1ms aim coalescing floor)
+        bool immediateMore = false;
+        bool aimWaitingCoalesce = false;
+        EnterCriticalSection(&inputLock_);
+        immediateMore = !pendingKeys_.empty() || !pendingCursor_.empty() || !pendingScroll_.empty();
+        aimWaitingCoalesce = hasPendingAimDelta_;
+        LeaveCriticalSection(&inputLock_);
+
+        double afterMs = getTimeMs();
+        if (immediateMore || (aimWaitingCoalesce && (afterMs - lastAimSendMs_) >= 1.0)) {
             continue;
         }
 
-        if (!active) {
-            // Idle (0.0% CPU): wakes instantaneously (<0.1ms) on ANY key, click, scroll, or first raw-mouse pixel!
+        if (!active && !aimWaitingCoalesce) {
+            // Idle (0.0% CPU): wakes instantaneously (<0.1ms) on ANY key, click, scroll, or raw mouse delta!
             WaitForSingleObject(wakeEvent_, 20);
             nextTickMs = getTimeMs();
             continue;
         }
 
-        nextTickMs += periodMs;
-        double afterMs = getTimeMs();
-        if (nextTickMs <= afterMs) {
-            nextTickMs = afterMs + periodMs;
+        double targetMs = nextTickMs;
+        if (aimWaitingCoalesce) {
+            double aimReadyMs = lastAimSendMs_ + 1.0;
+            if (aimReadyMs < targetMs) targetMs = aimReadyMs;
         }
-        double waitMs = nextTickMs - afterMs;
-        if (waitMs >= 0.5) {
+        double waitMs = targetMs - afterMs;
+        if (waitMs >= 0.4) {
             if (hiResTimer_) {
                 LARGE_INTEGER due;
                 due.QuadPart = -static_cast<LONGLONG>(waitMs * 10000.0);
-                if (due.QuadPart >= 0) due.QuadPart = -5000;
+                if (due.QuadPart >= 0) due.QuadPart = -4000;
                 SetWaitableTimer(hiResTimer_, &due, 0, NULL, NULL, FALSE);
                 HANDLE handles[2] = { wakeEvent_, hiResTimer_ };
-                DWORD res = WaitForMultipleObjects(2, handles, FALSE, 20);
-                if (res == WAIT_OBJECT_0) {
-                    nextTickMs = getTimeMs();
-                }
+                WaitForMultipleObjects(2, handles, FALSE, 20);
             } else {
                 DWORD sleepMs = static_cast<DWORD>(waitMs);
                 if (sleepMs < 1) sleepMs = 1;
-                DWORD res = WaitForSingleObject(wakeEvent_, sleepMs);
-                if (res == WAIT_OBJECT_0) {
-                    nextTickMs = getTimeMs();
-                }
+                WaitForSingleObject(wakeEvent_, sleepMs);
             }
         }
     }
 
     timeEndPeriod(1);
+    ThreadScheduling::disableMmcss(avrt);
 }
 
 EngineTelemetry InputEngine::getTelemetry() const {

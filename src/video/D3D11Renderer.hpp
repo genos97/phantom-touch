@@ -2,6 +2,7 @@
 
 #include "ui/GdiPlusDraw.hpp"
 #include "video/H264Decoder.hpp"
+#include "video/LatencyTelemetry.hpp"
 
 #include <cstdint>
 #include <string>
@@ -32,11 +33,20 @@ public:
     D3D11Renderer();
     ~D3D11Renderer();
 
-    bool init(HWND targetHwnd, int initialW, int initialH, std::string& outError);
+    bool init(HWND targetHwnd, int initialW, int initialH, std::string& outError, bool vsyncEnabled = false);
     void shutdown();
     bool isInitialized() const { return device_ != nullptr && swapChain_ != nullptr; }
     bool isHardwareAccelerated() const { return hardwareAccel_; }
     bool isFlipModel() const { return flipModel_; }
+    bool isVsyncEnabled() const { return vsyncEnabled_; }
+    bool setVsync(bool enabled);
+    bool rebindSwapChainTarget(HWND newHwnd, int width, int height);
+    std::string presentationModeLabel() const;
+    HRESULT lastPresentHResult() const { return lastPresentHr_; }
+    bool isOccluded() const { return occluded_; }
+    void clearOccluded() { occluded_ = false; }
+    bool hasRtv() const { return rtv_ != nullptr; }
+    int backbufW() const { return backbufW_; }
     bool supportsGpuNv12() const { return supportsGpuNv12Srv_; }
     bool isDeviceLost() const { return deviceLost_ != 0; }
     bool rebuildDevice(std::string& outError);
@@ -49,13 +59,21 @@ public:
     // Copies cropped NV12 slice in VRAM and presents immediately off the Win32 UI thread.
     bool submitAndRenderGpuNV12(ID3D11Texture2D* srcTex, uint32_t subresourceIdx,
                                 uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                const ViewportRect& videoRectInHost, bool drawHudOverlay);
+                                const ViewportRect& videoRectInHost, bool drawHudOverlay,
+                                FrameTiming* ioTiming = nullptr);
 
     // Zero-intermediate-copy CPU NV12 fast path: uploads directly from Media Foundation buffer
     // to D3D11 dynamic Y/UV textures and presents immediately off the Win32 UI thread.
     void submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t* uvPlane, uint32_t stride,
                                 uint32_t cropX, uint32_t cropY, uint32_t outW, uint32_t outH,
-                                const ViewportRect& videoRectInHost, bool drawHudOverlay);
+                                const ViewportRect& videoRectInHost, bool drawHudOverlay,
+                                FrameTiming* ioTiming = nullptr);
+
+    // Round-trip probe 16x16 Y-plane sampler (LATENCY_PLAN 0.2; zero overhead when inactive)
+    void setProbeFrameEvent(HANDLE evt);
+    void setProbeSampleRect(bool active, float normX, float normY);
+    bool getLastProbeSample(float& outMeanY, int64_t& outPresentQpc, uint64_t& outSeq) const;
+    bool sampleGridBrightness(float outGridY[9]) const;
 
     // Staged NV12 frame path (used by unit tests and external callers)
     void submitNV12Frame(const DecodedNV12Frame& frame);
@@ -68,7 +86,7 @@ public:
     void clearHudBitmap();
 
     // Thread-safe: renders dark canvas + letterboxed NV12 video + same-frame HUD overlay and Presents!
-    void render(const ViewportRect& videoRectInHost, bool drawHudOverlay);
+    void render(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
     // Instant local PNG screenshot straight from the latest GPU/CPU NV12 frame (zero ADB lag!)
     bool saveLatestFramePng(const std::string& savePath, std::string& outError) const;
@@ -77,14 +95,18 @@ public:
     static bool convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<uint8_t>& outBgra);
 
 private:
+    bool createSwapChainLocked(HWND hwnd, int w, int h, bool vsync);
+    void closeWaitableObjectLocked();
     bool createRenderTargetLocked();
     bool compileShadersLocked(std::string& outError);
     bool ensureVideoTexturesLocked(uint32_t w, uint32_t h);
     bool ensureGpuNV12TextureLocked(uint32_t w, uint32_t h);
     bool ensureHudTextureLocked(int w, int h);
+    bool ensureProbeTargetsLocked();
+    bool sampleYRectGpuLocked(float normX, float normY, float& outMeanY);
     void updateConstantBufferLocked(float x0Ndc, float y0Ndc, float x1Ndc, float y1Ndc,
                                     float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
-    void renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay);
+    void renderLocked(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
     mutable CRITICAL_SECTION d3dLock_;   // Protects all D3D11/DXGI calls (ALWAYS acquired before frameLock_)
     mutable CRITICAL_SECTION frameLock_; // Protects stagedFrame_ / stagedHud_ / hasFrame_
@@ -98,11 +120,14 @@ private:
     bool hardwareAccel_ = false;
     bool flipModel_ = false;
     bool tearingSupported_ = false;
+    bool vsyncEnabled_ = false;
+    HANDLE frameLatencyWaitable_ = NULL;
     bool supportsGpuNv12Srv_ = false;
     bool occluded_ = false;
     volatile LONG deviceLost_ = 0;
     UINT swapChainFlags_ = 0;
     volatile LONG lastPresentTick_ = 0;
+    HRESULT lastPresentHr_ = S_OK;
 
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* ctx_ = nullptr;
@@ -112,6 +137,7 @@ private:
     ID3D11VertexShader* vsQuad_ = nullptr;
     ID3D11PixelShader* psNV12_ = nullptr;
     ID3D11PixelShader* psHud_ = nullptr;
+    ID3D11PixelShader* psYOnly_ = nullptr;
     ID3D11Buffer* cbQuad_ = nullptr;
     ID3D11SamplerState* samplerLinear_ = nullptr;
     ID3D11BlendState* blendPremul_ = nullptr;
@@ -151,4 +177,16 @@ private:
     int stagedHudH_ = 0;
     bool hudDirty_ = false;
     bool hasHud_ = false;
+
+    // 16x16 probe Y-plane readback targets
+    ID3D11Texture2D* probeRtTex_ = nullptr;
+    ID3D11RenderTargetView* probeRtv_ = nullptr;
+    ID3D11Texture2D* probeStageTex_ = nullptr;
+    volatile LONG probeActive_ = 0;
+    float probeNormX_ = 0.5f;
+    float probeNormY_ = 0.5f;
+    float lastProbeMeanY_ = 0.0f;
+    int64_t lastProbePresentQpc_ = 0;
+    uint64_t probeSeq_ = 0;
+    HANDLE probeFrameEvent_ = NULL;
 };
