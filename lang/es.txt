@@ -1,0 +1,50 @@
+# Phantom Touch UI Strings - Español (es)
+tab.keys = TECLAS
+tab.sens = SENS
+tab.cfg = PERFIL
+tab.dev = DISP
+tab.pad = MANDO
+
+sec.connection = CONEXIÓN
+sec.stream = TRANSMISIÓN
+sec.input = ENTRADA
+sec.gamepad = MANDO
+sec.privacy = PRIVACIDAD Y LOGS
+sec.language = IDIOMA
+
+lbl.in_app_audio = Audio en la App (WASAPI)
+lbl.clipboard_sync = Sincronizar Portapapeles (PC <-> Móvil)
+lbl.clipboard_note = Copias del móvil excluidas del historial Win+V
+lbl.auto_switch = Cambiar Perfil según App Abierta
+lbl.rclick_back = Clic Derecho = Atrás Android
+lbl.gamepad_ctrl = Mando XInput a Toque
+lbl.screen_off = Apagar Pantalla del Móvil al Transmitir
+lbl.stay_awake = Mantener Pantalla Despierta
+
+btn.apply_reconnect = APLICAR Y RECONECTAR
+btn.disconnect = DESCONECTAR
+btn.refresh = Actualizar
+btn.back = ATRÁS
+
+hub.title = Centro de Dispositivos Phantom Touch
+hub.subtitle = Detectando depuración USB y ADB inalámbrico
+
+tb.no_device = Sin Dispositivo
+tb.offline_studio = Estudio Offline
+tb.reconnecting = Reconectando...
+tb.lost_link = Enlace Perdido
+tb.typing_mode = ESCRITURA | F1: Juego
+
+rail.aim = MIRA
+rail.hud = HUD
+rail.fire = TIRO
+rail.rst = RST
+rail.full = PANT.
+rail.keys = TECLAS
+rail.sens = SENS
+rail.cfg = PERFIL
+rail.back = ATRÁS
+rail.home = INICIO
+rail.apps = APPS
+rail.shot = CAP.
+rail.dev = DISP

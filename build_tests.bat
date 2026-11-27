@@ -47,6 +47,7 @@ if defined MINGW64_BIN (
     src\engine\InputHookThread.cpp ^
     src\engine\InputEngine.cpp ^
     src\ui\GdiPlusDraw.cpp ^
+    src\ui\Strings.cpp ^
     src\ui\Animator.cpp ^
     src\ui\OverlayPopups.cpp ^
     src\ui\EditorState.cpp ^
@@ -58,7 +59,7 @@ if defined MINGW64_BIN (
     src\ui\DrawerPanel.cpp ^
     -o tests\test_core.exe ^
     -static ^
-    -ld3d11 -ldxgi -lmfplat -lmfuuid -lgdiplus -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -lgdi32 -luser32
+    -ld3d11 -ldxgi -lmfplat -lmfuuid -lgdiplus -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -limm32 -lgdi32 -luser32
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

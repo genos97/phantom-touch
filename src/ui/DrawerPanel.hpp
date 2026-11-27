@@ -102,6 +102,8 @@ enum DrawerActionId {
     DA_TOGGLE_STAY_AWAKE,
     DA_TOGGLE_AUTO_SWITCH,
     DA_TOGGLE_RCLICK_BACK,
+    DA_TOGGLE_CLIPBOARD_SYNC,
+    DA_SET_LANGUAGE,      // extra = 0..5
     DA_TOGGLE_DEV_ADVANCED,
     DA_APPLY_RECONNECT,
     DA_DISCONNECT,
@@ -140,6 +142,7 @@ struct DrawerActionResult {
     bool requestCalibrateAspect = false;
     bool requestRunLatencyProbe = false;
     bool vsyncToggled = false;
+    bool languageChanged = false;
     bool requestOpenOnboarding = false;
     bool requestToggleEditTest = false;
     bool requestCreateTemplate = false;

@@ -1,15 +1,21 @@
 #include "ui/ShellWindow.hpp"
 #include "config/KeyCodes.hpp"
 #include "config/ProfileStore.hpp"
+#include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 #include <shellapi.h>
 #include <commdlg.h>
+#include <imm.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+
+#ifndef WM_CLIPBOARDUPDATE
+#define WM_CLIPBOARDUPDATE 0x031D
+#endif
 
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
@@ -153,6 +159,7 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
 
     profile_ = engine_->getProfileCopy();
     AppSettingsStore::load(settingsPath_, settings_);
+    Strings::init(exeDir_ + "\\lang", settings_.uiLanguage);
     if (profile_.keymapEnabled) {
         lastGameProfilePath_ = profilePath_;
         settings_.lastGameProfile = profilePath_;
@@ -209,6 +216,10 @@ ShellWindow::~ShellWindow() {
     }
     tooltipPopup_.destroy();
     modalPopup_.destroy();
+    if (clipboardListenerActive_ && hwnd_ && IsWindow(hwnd_)) {
+        RemoveClipboardFormatListener(hwnd_);
+        clipboardListenerActive_ = false;
+    }
     bridge_->setClipboardCallback(nullptr, nullptr);
     bridge_->setConnectStepCallback(nullptr, nullptr);
     bridge_->setVideoPacketCallback(nullptr, nullptr);
@@ -300,6 +311,7 @@ bool ShellWindow::create(HINSTANCE hInst) {
     LeaveCriticalSection(&asyncCtx_->lock);
 
     dwmRoundedActive_ = GdiPlusDraw::enableDarkDwmFrame(hwnd_);
+    clipboardListenerActive_ = (AddClipboardFormatListener(hwnd_) != FALSE);
     DragAcceptFiles(hwnd_, TRUE);
     viewportHost_.create(hwnd_, hInst_);
     hudOverlay_.create(hwnd_, hInst_);
@@ -1104,12 +1116,14 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.maxFps = self->settings_.mirrorFps;
         cfg.bitrateMbps = self->settings_.mirrorBitrateMbps;
         cfg.stayAwake = self->settings_.stayAwake;
+        cfg.clipboardAutosync = self->settings_.clipboardSync;
         cfg.enableAudio = wantAudio;
         cfg.audioCodec = self->forceAudioCodec_;
         cfg.virtualDisplay = self->settings_.virtualDisplayMode;
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
         cfg.videoCodecOptions = self->settings_.videoCodecOptions;
         cfg.videoEncoder = chosenEnc;
+        self->clipGuard_.reset();
 
         ok = self->bridge_->connectSession(self->tools_, cfg, err, job->arg);
         if (ok) {
@@ -1783,8 +1797,8 @@ std::string ShellWindow::readWindowsClipboardUtf8() const {
     return out;
 }
 
-void ShellWindow::writeWindowsClipboardUtf8(const std::string& utf8Text) {
-    if (utf8Text.empty() || utf8Text == lastSyncedClip_) return;
+void ShellWindow::writeWindowsClipboardUtf8(const std::string& utf8Text, bool fromPhone) {
+    if (utf8Text.empty()) return;
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), static_cast<int>(utf8Text.size()), NULL, 0);
     if (wlen <= 0) return;
 
@@ -1802,8 +1816,24 @@ void ShellWindow::writeWindowsClipboardUtf8(const std::string& utf8Text) {
             GlobalFree(hMem);
         } else {
             lastSyncedClip_ = utf8Text;
+            if (fromPhone) {
+                auto setZeroDwordFormat = [](const wchar_t* fmtName) {
+                    UINT fmt = RegisterClipboardFormatW(fmtName);
+                    if (fmt == 0) return;
+                    HGLOBAL hFlag = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DWORD));
+                    if (hFlag) {
+                        if (!SetClipboardData(fmt, hFlag)) {
+                            GlobalFree(hFlag);
+                        }
+                    }
+                };
+                setZeroDwordFormat(L"CanIncludeInClipboardHistory");
+                setZeroDwordFormat(L"CanUploadToCloudClipboard");
+                setZeroDwordFormat(L"ExcludeClipboardContentFromMonitorProcessing");
+            }
         }
         CloseClipboard();
+        clipGuard_.noteLocalClipboardWrite(GetClipboardSequenceNumber(), utf8Text);
     } else {
         GlobalFree(hMem);
     }
@@ -2072,6 +2102,7 @@ bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
             std::string clip = readWindowsClipboardUtf8();
             if (!clip.empty()) {
                 lastSyncedClip_ = clip;
+                clipGuard_.shouldSendPcToPhone(clip, GetClipboardSequenceNumber());
                 bridge_->sendSetClipboard(clip, true);
                 showToast("Pasted clipboard to phone", 1000);
             }
@@ -2113,6 +2144,20 @@ bool ShellWindow::handleDesktopKeyEvent(int vk, bool down) {
     return false;
 }
 
+void ShellWindow::sendPhoneText(const std::string& utf8) {
+    if (!bridge_->isConnected() || utf8.empty()) return;
+    if (ScrcpyBridge::isPureAscii(utf8)) {
+        bridge_->sendText(utf8);
+        return;
+    }
+    // F10 / B3: Non-ASCII text travels via SET_CLIPBOARD(..., paste=true); restore phone clipboard afterward.
+    std::string preserve = !lastDeviceClip_.empty()
+        ? lastDeviceClip_
+        : (settings_.clipboardSync ? readWindowsClipboardUtf8() : lastSyncedClip_);
+    clipGuard_.beginNonAsciiTyping(utf8, preserve, GetTickCount64());
+    bridge_->sendSetClipboard(utf8, true);
+}
+
 bool ShellWindow::handleDesktopChar(wchar_t ch) {
     // N8: text typing only runs in Typing/Desktop profiles (keymapEnabled == false)
     if (!bridge_->isConnected() || aimMode_ || editMode_ || profile_.keymapEnabled) return false;
@@ -2128,7 +2173,7 @@ bool ShellWindow::handleDesktopChar(wchar_t ch) {
     if (bytes <= 0) return false;
     std::string utf8(static_cast<size_t>(bytes), '\0');
     WideCharToMultiByte(CP_UTF8, 0, buf, 1, &utf8[0], bytes, NULL, NULL);
-    bridge_->sendText(utf8);
+    sendPhoneText(utf8);
     return true;
 }
 
@@ -3212,6 +3257,7 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 reconnectAttempt_ = 0;
                 userDisconnected_ = false;
                 secureAppDetected_ = false;
+                lastDeviceClip_.clear();
                 appliedStreamSettings_ = settings_;
                 hasAppliedStreamSettings_ = true;
                 if (showOnboarding_ && onboardingView_.step() <= OB_STEP_CONNECT) {
@@ -3269,11 +3315,16 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                 mi.rcMonitor.bottom - mi.rcMonitor.top);
                         }
                     }
-                    layoutChildren();
                     std::string modeTag = bridge_->isVirtualDisplayActive()
                         ? "Second-Phone Virtual Display (D3D11)"
                         : "Native D3D11 Single-Connection Stream";
-                    showToast(modeTag + " · F2 Studio | " + KeyCodes::toName(profile_.toggleAimVk) + "/F1 Aim", 3600);
+                    if (settings_.clipboardSync && !settings_.clipboardNoticeShown) {
+                        settings_.clipboardNoticeShown = true;
+                        scheduleSettingsSave();
+                        showToast("Clipboard sync is ON (phone copies excluded from Win+V history). Toggle in DEV.", 4500, TOAST_INFO);
+                    } else {
+                        showToast(modeTag + " · F2 Studio | " + KeyCodes::toName(profile_.toggleAimVk) + "/F1 Aim", 3600);
+                    }
                     if (autoProbeOnConnect_ && probeRunCount_ == 0) {
                         autoProbeArmed_ = true;
                         autoProbeDueTick_ = GetTickCount() + 2000;
@@ -3338,8 +3389,11 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             EnterCriticalSection(&auxLock_);
             clip.swap(pendingDeviceClip_);
             LeaveCriticalSection(&auxLock_);
-            if (!clip.empty()) {
-                writeWindowsClipboardUtf8(clip);
+            if (settings_.clipboardSync && !clip.empty()) {
+                lastDeviceClip_ = clip;
+                if (clipGuard_.shouldApplyPhoneToPc(clip, GetTickCount64())) {
+                    writeWindowsClipboardUtf8(clip, true);
+                }
             }
             return 0;
         }
@@ -3556,6 +3610,13 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     RECT tr = shellToastRect();
                     if (tr.right > tr.left && tr.bottom > tr.top) {
                         InvalidateRect(hwnd, &tr, FALSE);
+                    }
+                }
+                // F10 / B3: Restore preserved phone clipboard 250ms after non-ASCII typing burst
+                std::string restoreClip;
+                if (clipGuard_.pollClipboardRestore(GetTickCount64(), restoreClip)) {
+                    if (bridge_->isConnected()) {
+                        bridge_->sendSetClipboard(restoreClip, false);
                     }
                 }
                 // V5: Debounced virtual display flex resize
@@ -4066,6 +4127,47 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             break;
         }
 
+        case WM_IME_COMPOSITION: {
+            if ((lParam & GCS_RESULTSTR) != 0 &&
+                bridge_->isConnected() && !aimMode_ && !editMode_ && !profile_.keymapEnabled &&
+                activePopup_ == POPUP_NONE && !editingHubWireless_ &&
+                !(drawerOpen_ && drawerPanel_.isTypingText())) {
+                HIMC hImc = ImmGetContext(hwnd);
+                if (hImc) {
+                    LONG bytes = ImmGetCompositionStringW(hImc, GCS_RESULTSTR, NULL, 0);
+                    if (bytes > 0) {
+                        std::vector<wchar_t> wbuf(static_cast<size_t>(bytes) / sizeof(wchar_t) + 1u, L'\0');
+                        LONG got = ImmGetCompositionStringW(hImc, GCS_RESULTSTR, wbuf.data(), bytes);
+                        if (got > 0) {
+                            const int wcharCnt = static_cast<int>(got / sizeof(wchar_t));
+                            int u8Len = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wcharCnt, NULL, 0, NULL, NULL);
+                            if (u8Len > 0) {
+                                std::string u8(static_cast<size_t>(u8Len), '\0');
+                                WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), wcharCnt, &u8[0], u8Len, NULL, NULL);
+                                sendPhoneText(u8);
+                            }
+                        }
+                    }
+                    ImmReleaseContext(hwnd, hImc);
+                    LPARAM rem = lParam & ~static_cast<LPARAM>(GCS_RESULTSTR);
+                    return (rem == 0) ? 0 : DefWindowProcW(hwnd, msg, wParam, rem);
+                }
+            }
+            break;
+        }
+
+        case WM_CLIPBOARDUPDATE: {
+            if (!settings_.clipboardSync || !bridge_->isConnected()) return 0;
+            if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return 0;
+            const DWORD seq = GetClipboardSequenceNumber();
+            const std::string clip = readWindowsClipboardUtf8();
+            if (clipGuard_.shouldSendPcToPhone(clip, seq)) {
+                lastSyncedClip_ = clip;
+                bridge_->sendSetClipboard(clip, false);
+            }
+            return 0;
+        }
+
         case WM_CHAR: {
             wchar_t ch = static_cast<wchar_t>(wParam);
             if (activePopup_ != POPUP_NONE) {
@@ -4109,7 +4211,7 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     if (bytes > 0) {
                         std::string u8(static_cast<size_t>(bytes), '\0');
                         WideCharToMultiByte(CP_UTF8, 0, pair, 2, &u8[0], bytes, NULL, NULL);
-                        bridge_->sendText(u8);
+                        sendPhoneText(u8);
                     }
                     return 0;
                 }
@@ -4167,6 +4269,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             viewportHost_.detachMirror();
             tooltipPopup_.destroy();
             modalPopup_.destroy();
+            if (clipboardListenerActive_) {
+                RemoveClipboardFormatListener(hwnd);
+                clipboardListenerActive_ = false;
+            }
             KillTimer(hwnd, TIMER_TICK);
             KillTimer(hwnd, TIMER_ANIM);
             animTimerActive_ = false;
@@ -4774,6 +4880,8 @@ void ShellWindow::initCommandPalette() {
     addCmd("preset.qual",     "Stream Preset: Quality",            "preset quality native",        "",            "Stream");
     addCmd("preset.wifi",     "Stream Preset: Wi-Fi",              "preset wifi wireless",         "",            "Stream");
     addCmd("setting.audio",   "Toggle Phone Audio Forwarding",     "audio sound scrcpy",           "",            "Stream");
+    addCmd("setting.clipboard","Toggle Clipboard Auto-Sync",       "clipboard copy paste sync winv","",           "Privacy");
+    addCmd("lang.cycle",      "Switch UI Language",              "language locale i18n en pt es id hi ru", "",   "Display");
     addCmd("setting.screenoff","Toggle Turn Phone Screen Off",     "screen off power battery",     "",            "Device");
     addCmd("setting.autoswitch","Toggle Per-App Auto-Switch",      "auto switch package app",      "",            "Input");
     addCmd("setting.gamepad", "Toggle XInput Gamepad-to-Touch",    "gamepad controller xbox",      "",            "Gamepad");
@@ -4925,6 +5033,23 @@ void ShellWindow::executeCommandById(const std::string& cmdId) {
         scheduleSettingsSave();
         invalidateShell();
         showToast(settings_.mirrorAudio ? "Phone Audio Forwarding: ON" : "Phone Audio Forwarding: OFF", 1800, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "setting.clipboard") {
+        settings_.clipboardSync = !settings_.clipboardSync;
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(settings_.clipboardSync ? "Clipboard Sync: ON (Apply & Reconnect)" : "Clipboard Sync: OFF (Apply & Reconnect)", 2200, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "lang.cycle") {
+        const std::vector<LanguageInfo>& langs = Strings::languages();
+        int idx = (Strings::languageIndex(settings_.uiLanguage) + 1) % static_cast<int>(langs.size());
+        settings_.uiLanguage = langs[idx].code;
+        Strings::setLanguage(settings_.uiLanguage);
+        scheduleSettingsSave();
+        invalidateShell();
+        showToast(std::string("Language: ") + langs[idx].nativeName, 1800, TOAST_INFO);
         return;
     }
     if (cmdId == "setting.screenoff") {

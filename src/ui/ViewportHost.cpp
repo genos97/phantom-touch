@@ -1,4 +1,5 @@
 #include "ui/ViewportHost.hpp"
+#include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 #include <cstdio>
@@ -71,7 +72,9 @@ LRESULT ViewportHost::handleHostMessage(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
             if (isNativeVideoActive()) {
-                renderNativeFrame(true);
+                if (GetTickCount() - lastPresentTick() >= 45) {
+                    renderNativeFrame(true);
+                }
             } else {
                 RECT rc;
                 GetClientRect(hwnd, &rc);
@@ -200,14 +203,14 @@ bool ViewportHost::enableNativeVideo(uint32_t phoneW, uint32_t phoneH, std::stri
     if (w < 64) w = 640;
     if (h < 64) h = 360;
 
-    InterlockedExchange(&nativeVideoActive_, 1);
-    d3d_.clearOccluded();
+    updateVideoLayout(phoneW, phoneH);
     if (!fullscreenTarget_) {
         ShowWindow(hwnd_, SW_SHOW);
         SetWindowPos(hwnd_, HWND_BOTTOM, hostBounds_.left, hostBounds_.top, w, h, SWP_NOACTIVATE);
     }
-    updateVideoLayout(phoneW, phoneH);
-    renderNativeFrame(true);
+    d3d_.clearOccluded();
+    d3d_.markStreamActivated();
+    InterlockedExchange(&nativeVideoActive_, 1);
     return true;
 }
 
@@ -285,7 +288,7 @@ void ViewportHost::renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming)
         EnterCriticalSection(&rectLock_);
         vr = videoRect_;
         LeaveCriticalSection(&rectLock_);
-        d3d_.render(vr, drawHudOverlay, ioTiming);
+        d3d_.tryRender(vr, drawHudOverlay, ioTiming);
     }
 }
 
@@ -298,6 +301,8 @@ bool ViewportHost::captureNativeScreenshot(const std::string& savePath, std::str
 }
 
 void ViewportHost::setBounds(const RECT& boundsInParent) {
+    int prevLeft = hostBounds_.left;
+    int prevTop  = hostBounds_.top;
     int prevW = hostBounds_.right - hostBounds_.left;
     int prevH = hostBounds_.bottom - hostBounds_.top;
     hostBounds_ = boundsInParent;
@@ -306,21 +311,25 @@ void ViewportHost::setBounds(const RECT& boundsInParent) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     bool sizeChanged = (w != prevW || h != prevH);
+    bool posChanged  = (boundsInParent.left != prevLeft || boundsInParent.top != prevTop);
 
     if (hwnd_) {
         if (fullscreenTarget_ && isNativeVideoActive()) {
-            ShowWindow(hwnd_, SW_HIDE);
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
             if (sizeChanged) d3d_.resize(w, h);
         } else if (isMirrorEmbedded() || isNativeVideoActive()) {
-            ShowWindow(hwnd_, SW_SHOW);
-            SetWindowPos(hwnd_, HWND_BOTTOM, boundsInParent.left, boundsInParent.top, w, h,
-                         SWP_NOACTIVATE);
+            bool wasVisible = (IsWindowVisible(hwnd_) != FALSE);
+            if (!wasVisible) ShowWindow(hwnd_, SW_SHOW);
+            if (!wasVisible || sizeChanged || posChanged) {
+                SetWindowPos(hwnd_, HWND_BOTTOM, boundsInParent.left, boundsInParent.top, w, h,
+                             SWP_NOACTIVATE);
+            }
             if (isNativeVideoActive() && sizeChanged) {
                 d3d_.resize(w, h);
             }
         } else {
             // Keep child host hidden when Device Hub or Offline Studio is drawn directly on ShellWindow
-            ShowWindow(hwnd_, SW_HIDE);
+            if (IsWindowVisible(hwnd_)) ShowWindow(hwnd_, SW_HIDE);
         }
     }
     updateVideoLayout(lastPhoneW_, lastPhoneH_);
@@ -500,11 +509,12 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     // Header
     GdiPlusDraw::drawIcon(g, ICON_LOGO, static_cast<float>(x + GdiPlusDraw::dp(12)),
                           static_cast<float>(y + GdiPlusDraw::dp(11)), GdiPlusDraw::dpf(22.0f), Theme::ACCENT_CYAN);
-    GdiPlusDraw::textLeft(g, hub.showingQrPair ? "Wireless QR Pairing (Android 11+)" : "Phantom Touch Device Hub",
+    GdiPlusDraw::textLeft(g, hub.showingQrPair ? "Wireless QR Pairing (Android 11+)"
+                                               : Strings::tr("hub.title", "Phantom Touch Device Hub"),
                           static_cast<float>(x + GdiPlusDraw::dp(34)), static_cast<float>(y + GdiPlusDraw::dp(8)),
                           17.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - GdiPlusDraw::dp(135)));
     GdiPlusDraw::textLeft(g, hub.showingQrPair ? "Developer options -> Wireless debugging -> Pair device with QR code"
-                                               : "Auto-detecting USB debugging & Wireless ADB devices",
+                                               : Strings::tr("hub.subtitle", "Auto-detecting USB debugging & Wireless ADB devices"),
                           static_cast<float>(x + GdiPlusDraw::dp(34)), static_cast<float>(y + GdiPlusDraw::dp(27)),
                           11.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - GdiPlusDraw::dp(135)));
 
@@ -513,13 +523,13 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     GdiPlusDraw::roundedCard(g, rRef, GdiPlusDraw::dpf(8.0f), hovRef ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
                              hovRef ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE, 1.0f);
     if (hub.showingQrPair) {
-        GdiPlusDraw::textCenter(g, "BACK", static_cast<float>(rRef.left + rRef.right) * 0.5f,
+        GdiPlusDraw::textCenter(g, Strings::tr("btn.back", "BACK"), static_cast<float>(rRef.left + rRef.right) * 0.5f,
                                 static_cast<float>(rRef.top + rRef.bottom) * 0.5f, 12.0f, true, Theme::ACCENT_CYAN);
         hotspots_.push_back(HubHotspot{ rRef, HUB_TOGGLE_QR_PAIR, 0 });
     } else {
         GdiPlusDraw::drawIcon(g, ICON_REFRESH, static_cast<float>(rRef.left + GdiPlusDraw::dp(16)),
                               static_cast<float>(rRef.top + GdiPlusDraw::dp(15)), GdiPlusDraw::dpf(12.0f), Theme::ACCENT_CYAN);
-        GdiPlusDraw::textLeft(g, "Refresh", static_cast<float>(rRef.left + GdiPlusDraw::dp(30)),
+        GdiPlusDraw::textLeft(g, Strings::tr("btn.refresh", "Refresh"), static_cast<float>(rRef.left + GdiPlusDraw::dp(30)),
                               static_cast<float>(rRef.top + GdiPlusDraw::dp(15)), 11.5f, true, Theme::TEXT_PRIMARY, static_cast<float>(GdiPlusDraw::dp(58)));
         hotspots_.push_back(HubHotspot{ rRef, HUB_REFRESH_DEVICES, 0 });
     }

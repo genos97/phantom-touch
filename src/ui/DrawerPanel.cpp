@@ -2,6 +2,7 @@
 #include "config/KeyCodes.hpp"
 #include "config/ProfileStore.hpp"
 #include "ui/EditorState.hpp"
+#include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 #include <algorithm>
@@ -267,7 +268,13 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
     hotspots_.push_back(Hotspot{ rCls, DA_CLOSE, 0 });
 
     // 2. 5 Navigation Tabs (KEYS | SENS | CFG | DEV | PAD)
-    const char* tabNames[5] = { "KEYS", "SENS", "CFG", "DEV", "PAD" };
+    const std::string tabNames[5] = {
+        Strings::tr("tab.keys", "KEYS"),
+        Strings::tr("tab.sens", "SENS"),
+        Strings::tr("tab.cfg",  "CFG"),
+        Strings::tr("tab.dev",  "DEV"),
+        Strings::tr("tab.pad",  "PAD")
+    };
     int tabY = hdrY + dp(32);
     int tabW = (w - dp(16)) / 5;
     for (int i = 0; i < 5; ++i) {
@@ -1124,8 +1131,8 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         y += 44;
     }
 
-    // 1. DEVICE
-    drawSectionHdr(ICON_QR, "DEVICE", Theme::ACCENT_CYAN);
+    // 1. CONNECTION
+    drawSectionHdr(ICON_QR, Strings::tr("sec.connection", "CONNECTION").c_str(), Theme::ACCENT_CYAN);
     RECT rWInp = { x, y, x + w - 82, y + 28 };
     GdiPlusDraw::roundedCard(g, rWInp, 6.0f, Theme::BG_INPUT, editingWireless_ ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, editingWireless_ ? 1.5f : 1.0f);
     GdiPlusDraw::textLeft(g, s.lastWirelessAddr + (editingWireless_ ? "_" : ""), static_cast<float>(x + 8), static_cast<float>(y + 14), 11.5f, false, Theme::TEXT_PRIMARY, static_cast<float>(w - 94));
@@ -1137,8 +1144,8 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         hotspots_.push_back(Hotspot{ rWGo, DA_CONNECT_WIRELESS, 0 });
     }
     y += 34;
-    drawToggleRow(g, x, y, w, "Turn Phone Screen Off", s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "Keep Phone Awake", s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.screen_off", "Turn Phone Screen Off").c_str(), s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.stay_awake", "Keep Phone Awake").c_str(), s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
     RECT rGuide = { x, y, x + w, y + 28 };
     bool hovG = ptIn(rGuide, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, rGuide, 7.0f, hovG ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
@@ -1150,7 +1157,7 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     y += 38;
 
     // 2. STREAM
-    drawSectionHdr(ICON_CAST, "STREAM", Theme::ACCENT_GREEN);
+    drawSectionHdr(ICON_CAST, Strings::tr("sec.stream", "STREAM").c_str(), Theme::ACCENT_GREEN);
     const char* spLbls[4] = { "Comp", "Bal", "Qual", "WiFi" };
     const StreamPresetId spIds[4] = { PRESET_COMPETITIVE, PRESET_BALANCED, PRESET_QUALITY, PRESET_WIFI };
     StreamPresetId curPreset = s.detectStreamPreset();
@@ -1205,7 +1212,7 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y += 34;
 
-    drawToggleRow(g, x, y, w, "In-App Phone Audio (WASAPI)", s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.in_app_audio", "In-App Phone Audio (WASAPI)").c_str(), s.mirrorAudio, Theme::ACCENT_GREEN, DA_TOGGLE_AUDIO, hoverX, hoverY); y += 36;
     if (s.mirrorAudio) {
         drawSeg3("IN-APP AUDIO BUFFER (F7)", "20ms", "25ms", "30ms", 20, 25, 30, s.audioBufferMs, DA_AUDIO_BUFFER);
         GdiPlusDraw::textLeft(g, "Auto codec: Raw PCM (USB) / MF AAC (Wi-Fi)",
@@ -1216,16 +1223,22 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     y += 4;
 
     // 3. INPUT
-    drawSectionHdr(ICON_KEYMAP, "INPUT", Theme::ACCENT_AMBER);
-    drawToggleRow(g, x, y, w, "Auto-Switch Profile by Open App", s.autoSwitchProfiles, Theme::ACCENT_GREEN, DA_TOGGLE_AUTO_SWITCH, hoverX, hoverY); y += 36;
-    drawToggleRow(g, x, y, w, "Right-Click = Android Back (Cursor)", s.rightClickBack, Theme::ACCENT_CYAN, DA_TOGGLE_RCLICK_BACK, hoverX, hoverY); y += 40;
+    drawSectionHdr(ICON_KEYMAP, Strings::tr("sec.input", "INPUT").c_str(), Theme::ACCENT_AMBER);
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.auto_switch", "Auto-Switch Profile by Open App").c_str(), s.autoSwitchProfiles, Theme::ACCENT_GREEN, DA_TOGGLE_AUTO_SWITCH, hoverX, hoverY); y += 36;
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.rclick_back", "Right-Click = Android Back (Cursor)").c_str(), s.rightClickBack, Theme::ACCENT_CYAN, DA_TOGGLE_RCLICK_BACK, hoverX, hoverY); y += 40;
 
     // 4. GAMEPAD
-    drawSectionHdr(ICON_GAMEPAD, "GAMEPAD", Theme::ACCENT_GREEN);
-    drawToggleRow(g, x, y, w, "XInput Gamepad-to-Touch Controller", s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 40;
+    drawSectionHdr(ICON_GAMEPAD, Strings::tr("sec.gamepad", "GAMEPAD").c_str(), Theme::ACCENT_GREEN);
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.gamepad_ctrl", "XInput Gamepad-to-Touch Controller").c_str(), s.gamepadEnabled, Theme::ACCENT_GREEN, DA_TOGGLE_GAMEPAD, hoverX, hoverY); y += 40;
 
     // 5. PRIVACY & LOGS
-    drawSectionHdr(ICON_SHIELD, "PRIVACY & LOGS", Theme::ACCENT_CYAN);
+    drawSectionHdr(ICON_SHIELD, Strings::tr("sec.privacy", "PRIVACY & LOGS").c_str(), Theme::ACCENT_CYAN);
+    drawToggleRow(g, x, y, w, Strings::tr("lbl.clipboard_sync", "Auto-Sync Clipboard (PC <-> Phone)").c_str(),
+                  s.clipboardSync, Theme::ACCENT_CYAN, DA_TOGGLE_CLIPBOARD_SYNC, hoverX, hoverY);
+    y += 34;
+    GdiPlusDraw::textLeft(g, Strings::tr("lbl.clipboard_note", "Phone copies excluded from Windows Win+V history"),
+                          static_cast<float>(x + 4), static_cast<float>(y + 7), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
+    y += 18;
     RECT rLatCard = { x, y, x + w, y + 90 };
     GdiPlusDraw::roundedCard(g, rLatCard, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
     char modeLine[112];
@@ -1279,6 +1292,34 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     }
     y = rLog.bottom + 10;
 
+    // 5b. LANGUAGE PICKER (F10)
+    drawSectionHdr(ICON_LANGUAGE, Strings::tr("sec.language", "LANGUAGE").c_str(), Theme::ACCENT_CYAN);
+    {
+        const std::vector<LanguageInfo>& langs = Strings::languages();
+        const int colW = (w - 8) / 3;
+        for (size_t li = 0; li < langs.size() && li < 6; ++li) {
+            const int row = static_cast<int>(li / 3);
+            const int col = static_cast<int>(li % 3);
+            const int bx = x + col * (colW + 4);
+            const int by = y + row * 30;
+            RECT rLang = { bx, by, bx + colW, by + 26 };
+            bool on = (s.uiLanguage == langs[li].code);
+            bool hov = ptIn(rLang, hoverX, hoverY);
+            GdiPlusDraw::roundedCard(g, rLang, 6.0f,
+                                     on ? Theme::ACCENT_CYAN_BG : (hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD),
+                                     on ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE,
+                                     on ? 1.4f : 1.0f);
+            GdiPlusDraw::textCenter(g, langs[li].shortLabel,
+                                    static_cast<float>(rLang.left + rLang.right) * 0.5f,
+                                    static_cast<float>(rLang.top + rLang.bottom) * 0.5f,
+                                    10.5f, true, on ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+            if (rLang.bottom > bodyClip_.top && rLang.top < bodyClip_.bottom) {
+                hotspots_.push_back(Hotspot{ rLang, DA_SET_LANGUAGE, static_cast<int>(li) });
+            }
+        }
+        y += 64;
+    }
+
     // 6. ADVANCED (F16 - collapsible)
     RECT rAdv = { x, y, x + w, y + 28 };
     GdiPlusDraw::roundedCard(g, rAdv, 7.0f, ptIn(rAdv, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
@@ -1329,10 +1370,10 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     RECT rRec = { x + 8, y + 22, x + 8 + hw + 18, y + 50 };
     RECT rDis = { rRec.right + 8, y + 22, x + w - 8, y + 50 };
     GdiPlusDraw::roundedCard(g, rRec, 6.0f, ptIn(rRec, hoverX, hoverY) ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.1f);
-    GdiPlusDraw::textCenter(g, "APPLY & RECONNECT", static_cast<float>(rRec.left + rRec.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
+    GdiPlusDraw::textCenter(g, Strings::tr("btn.apply_reconnect", "APPLY & RECONNECT"), static_cast<float>(rRec.left + rRec.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
                             ptIn(rRec, hoverX, hoverY) ? 0xFF08121Au : Theme::TEXT_PRIMARY);
     GdiPlusDraw::roundedCard(g, rDis, 6.0f, ptIn(rDis, hoverX, hoverY) ? Theme::ACCENT_RED : Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.0f);
-    GdiPlusDraw::textCenter(g, "DISCONNECT", static_cast<float>(rDis.left + rDis.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
+    GdiPlusDraw::textCenter(g, Strings::tr("btn.disconnect", "DISCONNECT"), static_cast<float>(rDis.left + rDis.right) * 0.5f, static_cast<float>(y + 36), 10.0f, true,
                             ptIn(rDis, hoverX, hoverY) ? 0xFFFFFFFFu : Theme::ACCENT_RED);
     if (rRec.bottom > bodyClip_.top && rRec.top < bodyClip_.bottom) {
         hotspots_.push_back(Hotspot{ rRec, DA_APPLY_RECONNECT, 0 });
@@ -1933,6 +1974,23 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
                 out.settingsModified = true;
                 out.toastMessage = settings.rightClickBack ? "Cursor Right-Click = Back: ON" : "Cursor Right-Click = Back: OFF";
                 return true;
+            case DA_TOGGLE_CLIPBOARD_SYNC:
+                settings.clipboardSync = !settings.clipboardSync;
+                out.settingsModified = true;
+                out.toastMessage = settings.clipboardSync
+                    ? "Clipboard Sync: ON (Apply & Reconnect to enable server autosync)"
+                    : "Clipboard Sync: OFF (Apply & Reconnect to disable server autosync)";
+                return true;
+            case DA_SET_LANGUAGE: {
+                const std::vector<LanguageInfo>& langs = Strings::languages();
+                int idx = (hs.extra >= 0 && hs.extra < static_cast<int>(langs.size())) ? hs.extra : 0;
+                settings.uiLanguage = langs[idx].code;
+                Strings::setLanguage(settings.uiLanguage);
+                out.settingsModified = true;
+                out.languageChanged = true;
+                out.toastMessage = std::string("Language: ") + langs[idx].nativeName;
+                return true;
+            }
             case DA_TOGGLE_DEV_ADVANCED:
                 devAdvancedExpanded_ = !devAdvancedExpanded_;
                 return true;

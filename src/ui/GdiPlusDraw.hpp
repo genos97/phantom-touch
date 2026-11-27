@@ -71,6 +71,7 @@ class GdiPlusDraw {
 public:
     static Gdiplus::Color argb(uint32_t c);
     static std::wstring toWide(const std::string& utf8OrAscii);
+    static const char* detectFontFamilyForText(const std::string& utf8);
 
     static void addRoundedRectPath(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float r);
 

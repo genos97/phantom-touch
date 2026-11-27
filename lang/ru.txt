@@ -1,0 +1,50 @@
+# Phantom Touch UI Strings - Русский (ru)
+tab.keys = КЛАВ.
+tab.sens = ЧУВСТ.
+tab.cfg = ПРОФ.
+tab.dev = УСТР.
+tab.pad = ГЕЙМП.
+
+sec.connection = ПОДКЛЮЧЕНИЕ
+sec.stream = ПОТОК
+sec.input = ВВОД
+sec.gamepad = ГЕЙМПАД
+sec.privacy = ПРИВАТНОСТЬ И ЛОГИ
+sec.language = ЯЗЫК
+
+lbl.in_app_audio = Звук в приложении (WASAPI)
+lbl.clipboard_sync = Авто-буфер обмена (ПК <-> Телефон)
+lbl.clipboard_note = Копии с телефона скрыты из истории Win+V
+lbl.auto_switch = Авто-смена профиля по приложению
+lbl.rclick_back = ПКМ = Назад на Android
+lbl.gamepad_ctrl = XInput-геймпад -> касания
+lbl.screen_off = Выключать экран при трансляции
+lbl.stay_awake = Не давать экрану уснуть
+
+btn.apply_reconnect = ПРИМЕНИТЬ И ПЕРЕПОДКЛ.
+btn.disconnect = ОТКЛЮЧИТЬ
+btn.refresh = Обновить
+btn.back = НАЗАД
+
+hub.title = Центр устройств Phantom Touch
+hub.subtitle = Поиск устройств USB и беспроводного ADB
+
+tb.no_device = Нет устройства
+tb.offline_studio = Офлайн-студия
+tb.reconnecting = Переподкл...
+tb.lost_link = Связь потеряна
+tb.typing_mode = ВВОД  |  F1: Игра
+
+rail.aim = ПРИЦ.
+rail.hud = HUD
+rail.fire = ОГОНЬ
+rail.rst = СБРОС
+rail.full = ЭКРАН
+rail.keys = КЛАВ.
+rail.sens = ЧУВСТ.
+rail.cfg = ПРОФ.
+rail.back = НАЗАД
+rail.home = ДОМОЙ
+rail.apps = ПРИЛ.
+rail.shot = СКРИН
+rail.dev = УСТР.

@@ -19,6 +19,7 @@
 #include "ui/DrawerPanel.hpp"
 #include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
+#include "ui/Strings.hpp"
 #include "ui/HudRenderer.hpp"
 #include "ui/OnboardingView.hpp"
 #include "ui/OverlayPopups.hpp"
@@ -2268,6 +2269,178 @@ static void testSprint4bInAppAudio() {
     std::printf("[Test] Sprint 4B (F7 In-App WASAPI Audio + MF AAC) OK!\n");
 }
 
+static void testSprint5aLanguageAndClipboard() {
+    std::printf("[Test] Sprint 5A (F10 IME/Unicode/i18n + F11 Clipboard v2)...\n");
+
+    // 1. ClipboardSyncGuard: loop suppression (E14), Win seq dedup, and B3 non-ASCII clipboard restore
+    {
+        ClipboardSyncGuard cg;
+        assert(!cg.shouldSendPcToPhone("", 1u));
+        assert(cg.shouldSendPcToPhone("pc copy 1", 10u));
+        assert(!cg.shouldSendPcToPhone("pc copy 1", 10u));  // same Windows seq
+        assert(!cg.shouldSendPcToPhone("pc copy 1", 11u));  // same text hash
+        assert(!cg.shouldApplyPhoneToPc("pc copy 1", 1000ULL)); // Android echoes PC copy back
+
+        assert(cg.shouldApplyPhoneToPc("phone otp 918273", 1100ULL));
+        cg.noteLocalClipboardWrite(12u, "phone otp 918273");
+        assert(!cg.shouldSendPcToPhone("phone otp 918273", 12u)); // WM_CLIPBOARDUPDATE same seq
+        assert(!cg.shouldSendPcToPhone("phone otp 918273", 13u)); // same hash
+
+        // B3 non-ASCII burst typing preserves initial clipboard & restores after 250ms
+        cg.beginNonAsciiTyping("\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82", "keep_this", 2000ULL);
+        assert(cg.hasPendingRestore());
+        cg.beginNonAsciiTyping("za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87", "should_not_overwrite", 2100ULL);
+        assert(!cg.shouldApplyPhoneToPc("za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87", 2150ULL)); // echo suppressed
+        std::string restored;
+        assert(!cg.pollClipboardRestore(2250ULL, restored));
+        assert(cg.pollClipboardRestore(2360ULL, restored));
+        assert(restored == "keep_this");
+        assert(!cg.hasPendingRestore());
+        assert(!cg.shouldApplyPhoneToPc("keep_this", 2400ULL)); // restored clipboard echo suppressed
+    }
+
+    // 2. UTF-8 pure-ASCII & multi-script chunk splitting (Polish, Russian, Hindi, Chinese, Emoji)
+    {
+        assert(ScrcpyBridge::isPureAscii("Hello 123!"));
+        const std::string pl = "za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87";
+        const std::string ru = "\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82";
+        const std::string hi = "\xE0\xA4\xA8\xE0\xA4\xAE\xE0\xA4\xB8\xE0\xA5\x8D\xE0\xA4\xA4\xE0\xA5\x87";
+        const std::string zh = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C";
+        const std::string em = "\xF0\x9F\x94\xA5\xF0\x9F\x8E\xAE";
+        assert(!ScrcpyBridge::isPureAscii(pl));
+        assert(!ScrcpyBridge::isPureAscii(ru));
+        assert(!ScrcpyBridge::isPureAscii(hi));
+        assert(!ScrcpyBridge::isPureAscii(zh));
+        assert(!ScrcpyBridge::isPureAscii(em));
+        std::vector<std::string> chunks = ScrcpyBridge::splitUtf8Chunks(hi + zh + em, 5);
+        std::string rejoined;
+        for (size_t i = 0; i < chunks.size(); ++i) rejoined += chunks[i];
+        assert(rejoined == hi + zh + em);
+    }
+
+    // 3. Strings catalog parser & all 6 live lang/*.txt files (no rebuild switching)
+    {
+        std::map<std::string, std::string> pm;
+        const std::string bomSample = "\xEF\xBB\xBF# Comment line\n  tab.keys = CLEF  \r\nsec.input=ENTR\xC3\x89" "E\n";
+        Strings::parseCatalogText(bomSample, pm);
+        assert(pm["tab.keys"] == "CLEF");
+        assert(pm["sec.input"] == "ENTR\xC3\x89" "E");
+
+        Strings::init("lang", "en");
+        const std::vector<LanguageInfo>& langs = Strings::languages();
+        assert(langs.size() == 6u);
+        for (size_t i = 0; i < langs.size(); ++i) {
+            assert(Strings::setLanguage(langs[i].code));
+            assert(Strings::currentLanguage() == langs[i].code);
+            assert(!Strings::tr("tab.keys", "KEYS").empty());
+            assert(Strings::tr("nonexistent.key", "FallbackEn") == "FallbackEn");
+        }
+        assert(Strings::setLanguage("hi"));
+        assert(Strings::tr("sec.language", "LANGUAGE") == "\xE0\xA4\xAD\xE0\xA4\xBE\xE0\xA4\xB7\xE0\xA4\xBE");
+        assert(Strings::setLanguage("ru"));
+        assert(Strings::tr("sec.language", "LANGUAGE") == "\xD0\xAF\xD0\x97\xD0\xAB\xD0\x9A");
+        assert(Strings::setLanguage("en"));
+        assert(Strings::tr("sec.language", "LANGUAGE") == "LANGUAGE");
+    }
+
+    // 4. Script font fallback detection + offscreen GDI+ draw smoke across all 4 scripts
+    {
+        assert(std::string(GdiPlusDraw::detectFontFamilyForText("Phantom Touch")) == "Segoe UI");
+        assert(std::string(GdiPlusDraw::detectFontFamilyForText("za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87")) == "Segoe UI");
+        assert(std::string(GdiPlusDraw::detectFontFamilyForText("\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82")) == "Segoe UI");
+        assert(std::string(GdiPlusDraw::detectFontFamilyForText("\xE0\xA4\xA8\xE0\xA4\xAE\xE0\xA4\xB8\xE0\xA5\x8D\xE0\xA4\xA4\xE0\xA5\x87")) == "Nirmala UI");
+        assert(std::string(GdiPlusDraw::detectFontFamilyForText("\xE4\xBD\xA0\xE5\xA5\xBD")) == "Microsoft YaHei UI");
+
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 320, 120);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        {
+            Gdiplus::Graphics g(mDC);
+            GdiPlusDraw::textLeft(g, "za\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87", 10.0f, 20.0f, 12.0f, false, 0xFFFFFFFFu);
+            GdiPlusDraw::textLeft(g, "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82", 10.0f, 45.0f, 12.0f, false, 0xFFFFFFFFu);
+            GdiPlusDraw::textLeft(g, "\xE0\xA4\xA8\xE0\xA4\xAE\xE0\xA4\xB8\xE0\xA5\x8D\xE0\xA4\xA4\xE0\xA5\x87", 10.0f, 70.0f, 12.0f, false, 0xFFFFFFFFu);
+            GdiPlusDraw::textLeft(g, "\xE4\xBD\xA0\xE5\xA5\xBD", 10.0f, 95.0f, 12.0f, false, 0xFFFFFFFFu);
+        }
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    // 5. AppSettingsStore round-trip + pending change detection for clipboardSync & uiLanguage
+    {
+        AppSettings a1;
+        a1.clipboardSync = false;
+        a1.clipboardNoticeShown = true;
+        a1.uiLanguage = "pt-BR";
+        const std::string tmpCfg = "profiles\\_test_sprint5a_settings.cfg";
+        assert(AppSettingsStore::save(tmpCfg, a1));
+        AppSettings a2;
+        assert(AppSettingsStore::load(tmpCfg, a2));
+        std::remove(tmpCfg.c_str());
+        assert(a2.clipboardSync == false);
+        assert(a2.clipboardNoticeShown == true);
+        assert(a2.uiLanguage == "pt-BR");
+
+        AppSettings base;
+        assert(AppSettings::countPendingStreamChanges(a2, base, "") >= 1);
+    }
+
+    // 6. DrawerPanel DEV tab localization render + DA_TOGGLE_CLIPBOARD_SYNC & DA_SET_LANGUAGE actions
+    {
+        DrawerPanel dp;
+        dp.setActiveTab(3); // DEV
+        Profile p = ProfileDefaults::createDesktop("Desktop");
+        AppSettings s;
+        RECT bounds = { 0, 0, 356, 1600 };
+        std::vector<std::string> logs;
+
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 356, 1600);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        {
+            Gdiplus::Graphics g(mDC);
+            Strings::setLanguage("hi");
+            dp.paint(g, bounds, p, s, "", -1, false, true, "SM-G990E", "", logs, -1, -1, 0);
+            Strings::setLanguage("ru");
+            dp.paint(g, bounds, p, s, "", -1, false, true, "SM-G990E", "", logs, -1, -1, 0);
+        }
+
+        RECT rcClip = {0, 0, 0, 0};
+        assert(dp.rectForAction(DA_TOGGLE_CLIPBOARD_SYNC, -1, rcClip));
+        int sel = -1;
+        DrawerActionResult res;
+        assert(dp.onMouseDown((rcClip.left + rcClip.right) / 2, (rcClip.top + rcClip.bottom) / 2, p, s, sel, res));
+        assert(s.clipboardSync == false && res.settingsModified);
+
+        RECT rcHi = {0, 0, 0, 0};
+        assert(dp.rectForAction(DA_SET_LANGUAGE, 4, rcHi));
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcHi.left + rcHi.right) / 2, (rcHi.top + rcHi.bottom) / 2, p, s, sel, res));
+        assert(s.uiLanguage == "hi" && res.languageChanged && Strings::currentLanguage() == "hi");
+
+        Strings::setLanguage("en");
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    {
+        D3D11Renderer r;
+        assert(r.lastPresentTick() == 0);
+        r.markStreamActivated();
+        assert(r.lastPresentTick() != 0);
+        ViewportRect vr;
+        vr.x = 0; vr.y = 0; vr.w = 64; vr.h = 64;
+        r.tryRender(vr, false);
+    }
+
+    std::printf("[Test] Sprint 5A (F10 IME/Unicode/i18n + F11 Clipboard v2) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -2291,6 +2464,8 @@ int main() {
     testSprint4aMobaAndGamepadV2();
     std::fflush(stdout);
     testSprint4bInAppAudio();
-    std::printf("ALL SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint5aLanguageAndClipboard();
+    std::printf("ALL SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

@@ -12,12 +12,36 @@ namespace {
 
 int g_activeDpi = 96;
 
+enum UiScriptKind {
+    SCRIPT_LATIN = 0,
+    SCRIPT_INDIC = 1,
+    SCRIPT_CJK   = 2
+};
+
+UiScriptKind detectScriptWide(const std::wstring& ws) {
+    for (size_t i = 0; i < ws.size(); ++i) {
+        const wchar_t ch = ws[i];
+        if (ch < 0x0900) continue;
+        if (ch <= 0x0D7F) return SCRIPT_INDIC;
+        if ((ch >= 0x3040 && ch <= 0x30FF) ||
+            (ch >= 0x3400 && ch <= 0x4DBF) ||
+            (ch >= 0x4E00 && ch <= 0x9FFF) ||
+            (ch >= 0xAC00 && ch <= 0xD7AF) ||
+            (ch >= 0xFF00 && ch <= 0xFFEF)) {
+            return SCRIPT_CJK;
+        }
+    }
+    return SCRIPT_LATIN;
+}
+
 struct GdiFontCache {
     CRITICAL_SECTION lock;
     bool lockInit = false;
     bool active = false;
     int warmedDpi = 0;
-    Gdiplus::FontFamily* fam = nullptr;
+    Gdiplus::FontFamily* famLatin = nullptr;
+    Gdiplus::FontFamily* famIndic = nullptr;
+    Gdiplus::FontFamily* famCjk   = nullptr;
     Gdiplus::StringFormat* fmtLeft = nullptr;
     Gdiplus::StringFormat* fmtCenter = nullptr;
     Gdiplus::StringFormat* fmtRight = nullptr;
@@ -35,19 +59,24 @@ struct GdiFontCache {
         }
     }
 
-    static uint32_t fontKey(float sizePx, bool bold) {
+    static uint32_t fontKey(float sizePx, bool bold, UiScriptKind script) {
         int q = static_cast<int>(sizePx * 4.0f + 0.5f);
         if (q < 4) q = 4;
-        return (static_cast<uint32_t>(q) << 1) | (bold ? 1u : 0u);
+        return (static_cast<uint32_t>(script) << 24) |
+               (static_cast<uint32_t>(q) << 1) |
+               (bold ? 1u : 0u);
     }
 
-    Gdiplus::Font* getOrCreateFontLocked(float sizePx, bool bold) {
-        if (!active || !fam) return nullptr;
-        uint32_t k = fontKey(sizePx, bold);
+    Gdiplus::Font* getOrCreateFontLocked(float sizePx, bool bold, UiScriptKind script = SCRIPT_LATIN) {
+        if (!active || !famLatin) return nullptr;
+        uint32_t k = fontKey(sizePx, bold, script);
         std::map<uint32_t, Gdiplus::Font*>::iterator it = fonts.find(k);
         if (it != fonts.end()) return it->second;
+        Gdiplus::FontFamily* famPick = famLatin;
+        if (script == SCRIPT_INDIC && famIndic) famPick = famIndic;
+        else if (script == SCRIPT_CJK && famCjk) famPick = famCjk;
         Gdiplus::Font* f = new Gdiplus::Font(
-            fam, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            famPick, sizePx, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
         fonts[k] = f;
         return f;
     }
@@ -58,11 +87,19 @@ struct GdiFontCache {
         if (!active) {
             Gdiplus::FontFamily* varFam = new Gdiplus::FontFamily(L"Segoe UI Variable Text");
             if (varFam->IsAvailable()) {
-                fam = varFam;
+                famLatin = varFam;
             } else {
                 delete varFam;
-                fam = new Gdiplus::FontFamily(L"Segoe UI");
+                famLatin = new Gdiplus::FontFamily(L"Segoe UI");
             }
+            Gdiplus::FontFamily* indFam = new Gdiplus::FontFamily(L"Nirmala UI");
+            if (indFam->IsAvailable()) famIndic = indFam;
+            else delete indFam;
+
+            Gdiplus::FontFamily* cjkFam = new Gdiplus::FontFamily(L"Microsoft YaHei UI");
+            if (cjkFam->IsAvailable()) famCjk = cjkFam;
+            else delete cjkFam;
+
             fmtLeft = new Gdiplus::StringFormat();
             fmtLeft->SetAlignment(Gdiplus::StringAlignmentNear);
             fmtLeft->SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -152,7 +189,9 @@ struct GdiFontCache {
         delete fmtRight;  fmtRight = nullptr;
         delete fmtCenter; fmtCenter = nullptr;
         delete fmtLeft;   fmtLeft = nullptr;
-        delete fam;       fam = nullptr;
+        delete famCjk;    famCjk = nullptr;
+        delete famIndic;  famIndic = nullptr;
+        delete famLatin;  famLatin = nullptr;
         LeaveCriticalSection(&lock);
     }
 };
@@ -244,6 +283,14 @@ std::wstring GdiPlusDraw::toWide(const std::string& s) {
     return out;
 }
 
+const char* GdiPlusDraw::detectFontFamilyForText(const std::string& utf8) {
+    const std::wstring ws = toWide(utf8);
+    const UiScriptKind sk = detectScriptWide(ws);
+    if (sk == SCRIPT_INDIC) return "Nirmala UI";
+    if (sk == SCRIPT_CJK) return "Microsoft YaHei UI";
+    return "Segoe UI";
+}
+
 void GdiPlusDraw::addRoundedRectPath(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float r) {
     if (w <= 0.0f || h <= 0.0f) return;
     float d = r * 2.0f;
@@ -326,13 +373,14 @@ void GdiPlusDraw::vLine(Gdiplus::Graphics& g, int x, int y1, int y2, uint32_t ar
 void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
                            float x, float cy, float sizePx, bool bold, uint32_t colorArgb, float maxW) {
     std::wstring wtxt = toWide(text);
+    const UiScriptKind script = detectScriptWide(wtxt);
     const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
     float width = (maxW > 1.0f) ? maxW : 2400.0f;
     Gdiplus::RectF layout(x, cy - px * 1.1f, width, px * 2.2f);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold, script);
         if (font && g_fontCache.fmtLeft) {
             g.DrawString(wtxt.c_str(), -1, font, layout, g_fontCache.fmtLeft, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -340,7 +388,10 @@ void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
         }
         LeaveCriticalSection(&g_fontCache.lock);
     }
-    Gdiplus::FontFamily fam(L"Segoe UI");
+    const wchar_t* famName = (script == SCRIPT_INDIC) ? L"Nirmala UI"
+                           : (script == SCRIPT_CJK)   ? L"Microsoft YaHei UI"
+                                                      : L"Segoe UI";
+    Gdiplus::FontFamily fam(famName);
     Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentNear);
@@ -353,12 +404,13 @@ void GdiPlusDraw::textLeft(Gdiplus::Graphics& g, const std::string& text,
 void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
                              float cx, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    const UiScriptKind script = detectScriptWide(wtxt);
     const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::PointF pt(cx, cy);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold, script);
         if (font && g_fontCache.fmtCenter) {
             g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtCenter, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -366,7 +418,10 @@ void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
         }
         LeaveCriticalSection(&g_fontCache.lock);
     }
-    Gdiplus::FontFamily fam(L"Segoe UI");
+    const wchar_t* famName = (script == SCRIPT_INDIC) ? L"Nirmala UI"
+                           : (script == SCRIPT_CJK)   ? L"Microsoft YaHei UI"
+                                                      : L"Segoe UI";
+    Gdiplus::FontFamily fam(famName);
     Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
@@ -378,12 +433,13 @@ void GdiPlusDraw::textCenter(Gdiplus::Graphics& g, const std::string& text,
 void GdiPlusDraw::textRight(Gdiplus::Graphics& g, const std::string& text,
                             float rightX, float cy, float sizePx, bool bold, uint32_t colorArgb) {
     std::wstring wtxt = toWide(text);
+    const UiScriptKind script = detectScriptWide(wtxt);
     const float px = dpf(sizePx);
     Gdiplus::SolidBrush br(argb(colorArgb));
     Gdiplus::PointF pt(rightX, cy);
     if (g_fontCache.lockInit) {
         EnterCriticalSection(&g_fontCache.lock);
-        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold);
+        Gdiplus::Font* font = g_fontCache.getOrCreateFontLocked(px, bold, script);
         if (font && g_fontCache.fmtRight) {
             g.DrawString(wtxt.c_str(), -1, font, pt, g_fontCache.fmtRight, &br);
             LeaveCriticalSection(&g_fontCache.lock);
@@ -391,7 +447,10 @@ void GdiPlusDraw::textRight(Gdiplus::Graphics& g, const std::string& text,
         }
         LeaveCriticalSection(&g_fontCache.lock);
     }
-    Gdiplus::FontFamily fam(L"Segoe UI");
+    const wchar_t* famName = (script == SCRIPT_INDIC) ? L"Nirmala UI"
+                           : (script == SCRIPT_CJK)   ? L"Microsoft YaHei UI"
+                                                      : L"Segoe UI";
+    Gdiplus::FontFamily fam(famName);
     Gdiplus::Font font(&fam, px, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::StringFormat fmt;
     fmt.SetAlignment(Gdiplus::StringAlignmentFar);

@@ -1,4 +1,5 @@
 #include "ui/TopBar.hpp"
+#include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 #include <cstdio>
@@ -45,7 +46,11 @@ void TopBar::layout(const RECT& bounds,
     else if (st == TB_CONN_LOST)         dotCol_ = Theme::ACCENT_RED;
     else if (st == TB_CONN_DEMO)         dotCol_ = Theme::ACCENT_CYAN;
     else                                 dotCol_ = Theme::TEXT_MUTED;
-    devTxt_ = connected ? deviceLabel : (demoMode ? "Offline Studio" : (st == TB_CONN_RECONNECTING ? "Reconnecting..." : (st == TB_CONN_LOST ? "Lost Link" : "No Device")));
+    devTxt_ = connected ? deviceLabel
+                        : (demoMode ? Strings::tr("tb.offline_studio", "Offline Studio")
+                        : (st == TB_CONN_RECONNECTING ? Strings::tr("tb.reconnecting", "Reconnecting...")
+                        : (st == TB_CONN_LOST ? Strings::tr("tb.lost_link", "Lost Link")
+                        : Strings::tr("tb.no_device", "No Device"))));
     if (devTxt_.size() > 26) devTxt_ = devTxt_.substr(0, 25) + "...";
     int devW = dp(26 + static_cast<int>(devTxt_.size()) * 7);
     if (devW < dp(110)) devW = dp(110);
@@ -97,7 +102,8 @@ void TopBar::layout(const RECT& bounds,
         telFg_ = Theme::ACCENT_AMBER;
 
         if (!profile.keymapEnabled) {
-            std::snprintf(telBuf, sizeof(telBuf), "TYPING  |  F1: Game");
+            std::string tmode = Strings::tr("tb.typing_mode", "TYPING  |  F1: Game");
+            std::snprintf(telBuf, sizeof(telBuf), "%s", tmode.c_str());
             telBg_ = Theme::ACCENT_CYAN_BG;
             telBd_ = Theme::ACCENT_CYAN;
             telFg_ = Theme::ACCENT_CYAN;

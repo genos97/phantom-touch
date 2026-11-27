@@ -51,6 +51,82 @@ void ControlPacketQueue::clear() {
     lo_.clear();
 }
 
+uint64_t ClipboardSyncGuard::hashText(const std::string& utf8) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < utf8.size(); ++i) {
+        h ^= static_cast<unsigned char>(utf8[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+void ClipboardSyncGuard::reset() {
+    lastWinSeq_ = 0;
+    hasWinSeq_ = false;
+    lastSentToPhoneHash_ = 0;
+    lastRecvFromPhoneHash_ = 0;
+    suppressedEchoHash_ = 0;
+    suppressedEchoUntilMs_ = 0;
+    restorePending_ = false;
+    restoreDueMs_ = 0;
+    savedClip_.clear();
+}
+
+bool ClipboardSyncGuard::shouldSendPcToPhone(const std::string& utf8, uint32_t winSeq) {
+    if (utf8.empty()) return false;
+    if (hasWinSeq_ && winSeq == lastWinSeq_) return false;
+    const uint64_t h = hashText(utf8);
+    if (h == lastRecvFromPhoneHash_ || h == lastSentToPhoneHash_) {
+        lastWinSeq_ = winSeq;
+        hasWinSeq_ = true;
+        return false;
+    }
+    lastWinSeq_ = winSeq;
+    hasWinSeq_ = true;
+    lastSentToPhoneHash_ = h;
+    return true;
+}
+
+bool ClipboardSyncGuard::shouldApplyPhoneToPc(const std::string& utf8, uint64_t nowMs) {
+    if (utf8.empty()) return false;
+    const uint64_t h = hashText(utf8);
+    if (h == lastSentToPhoneHash_) return false;
+    if (nowMs <= suppressedEchoUntilMs_ && h == suppressedEchoHash_) return false;
+    lastRecvFromPhoneHash_ = h;
+    return true;
+}
+
+void ClipboardSyncGuard::noteLocalClipboardWrite(uint32_t newWinSeq, const std::string& utf8) {
+    lastWinSeq_ = newWinSeq;
+    hasWinSeq_ = true;
+    lastRecvFromPhoneHash_ = hashText(utf8);
+}
+
+void ClipboardSyncGuard::beginNonAsciiTyping(const std::string& typedUtf8,
+                                               const std::string& clipToPreserve,
+                                               uint64_t nowMs) {
+    if (!restorePending_) {
+        savedClip_ = clipToPreserve;
+        restorePending_ = true;
+    }
+    const uint64_t th = hashText(typedUtf8);
+    suppressedEchoHash_ = th;
+    suppressedEchoUntilMs_ = nowMs + 1500ULL;
+    restoreDueMs_ = nowMs + 250ULL;
+}
+
+bool ClipboardSyncGuard::pollClipboardRestore(uint64_t nowMs, std::string& outRestoreText) {
+    if (!restorePending_ || nowMs < restoreDueMs_) return false;
+    restorePending_ = false;
+    outRestoreText = savedClip_;
+    savedClip_.clear();
+    const uint64_t rh = hashText(outRestoreText);
+    suppressedEchoHash_ = rh;
+    suppressedEchoUntilMs_ = nowMs + 1500ULL;
+    lastSentToPhoneHash_ = rh;
+    return true;
+}
+
 namespace {
 
 std::wstring utf8ToWide(const std::string& utf8) {
@@ -1037,7 +1113,7 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
                          " send_device_meta=true" +
                          std::string(isV4OrNewer ? "" : " send_codec_meta=true") +
                          " send_frame_meta=true"
-                         " clipboard_autosync=true"
+                         " clipboard_autosync=" + std::string(cfg.clipboardAutosync ? "true" : "false") +
                          " power_on=true"
                          " stay_awake=" + std::string(cfg.stayAwake ? "true" : "false") +
                          " cleanup=true";

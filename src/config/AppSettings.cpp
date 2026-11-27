@@ -169,6 +169,7 @@ int AppSettings::countPendingStreamChanges(const AppSettings& live, const AppSet
     if (live.mirrorAudio != applied.mirrorAudio) ++count;
     if (live.mirrorAudio && live.audioBufferMs != applied.audioBufferMs) ++count;
     if (live.mirrorAudio && live.audioRawCodec != applied.audioRawCodec) ++count;
+    if (live.clipboardSync != applied.clipboardSync) ++count;
     if (live.stayAwake != applied.stayAwake) ++count;
     return count;
 }
@@ -218,6 +219,9 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "stay_awake") s.stayAwake = (v == "1");
         else if (k == "auto_switch_profiles") s.autoSwitchProfiles = (v == "1");
         else if (k == "right_click_back") s.rightClickBack = (v == "1");
+        else if (k == "clipboard_sync") s.clipboardSync = (v == "1");
+        else if (k == "clipboard_notice_shown") s.clipboardNoticeShown = (v == "1");
+        else if (k == "ui_language" && !v.empty()) s.uiLanguage = sanitizeSafeToken(v, false);
         else if (k == "use_native_video") s.useNativeVideo = (v == "1");
         else if (k == "vsync") s.vsyncEnabled = (v == "1");
         else if (k == "audio_buffer_ms") s.audioBufferMs = clampInt(std::atoi(v.c_str()), 15, 100);
@@ -265,6 +269,9 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "stay_awake = " << (s.stayAwake ? 1 : 0) << "\n";
         out << "auto_switch_profiles = " << (s.autoSwitchProfiles ? 1 : 0) << "\n";
         out << "right_click_back = " << (s.rightClickBack ? 1 : 0) << "\n";
+        out << "clipboard_sync = " << (s.clipboardSync ? 1 : 0) << "\n";
+        out << "clipboard_notice_shown = " << (s.clipboardNoticeShown ? 1 : 0) << "\n";
+        out << "ui_language = " << (s.uiLanguage.empty() ? std::string("en") : sanitizeSafeToken(s.uiLanguage, false)) << "\n";
         out << "use_native_video = " << (s.useNativeVideo ? 1 : 0) << "\n";
         out << "vsync = " << (s.vsyncEnabled ? 1 : 0) << "\n";
         out << "audio_buffer_ms = " << clampInt(s.audioBufferMs, 15, 100) << "\n";

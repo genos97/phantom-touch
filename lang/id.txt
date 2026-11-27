@@ -1,0 +1,50 @@
+# Phantom Touch UI Strings - Bahasa Indonesia (id)
+tab.keys = TOMBOL
+tab.sens = SENS
+tab.cfg = PROFIL
+tab.dev = ALAT
+tab.pad = PAD
+
+sec.connection = KONEKSI
+sec.stream = STREAMING
+sec.input = INPUT
+sec.gamepad = GAMEPAD
+sec.privacy = PRIVASI & LOG
+sec.language = BAHASA
+
+lbl.in_app_audio = Audio Dalam Aplikasi (WASAPI)
+lbl.clipboard_sync = Sinkronisasi Papan Klip (PC <-> HP)
+lbl.clipboard_note = Salinan HP dikecualikan dari riwayat Win+V
+lbl.auto_switch = Ganti Profil Otomatis per Aplikasi
+lbl.rclick_back = Klik Kanan = Kembali Android
+lbl.gamepad_ctrl = Pengontrol Gamepad XInput ke Sentuh
+lbl.screen_off = Matikan Layar HP Saat Streaming
+lbl.stay_awake = Jaga Layar HP Tetap Aktif
+
+btn.apply_reconnect = TERAPKAN & HUBUNGKAN
+btn.disconnect = PUTUSKAN
+btn.refresh = Segarkan
+btn.back = KEMBALI
+
+hub.title = Pusat Perangkat Phantom Touch
+hub.subtitle = Mendeteksi USB debugging & Wireless ADB
+
+tb.no_device = Tanpa Perangkat
+tb.offline_studio = Studio Offline
+tb.reconnecting = Menghubungkan...
+tb.lost_link = Koneksi Putus
+tb.typing_mode = KETIK  |  F1: Game
+
+rail.aim = BIDIK
+rail.hud = HUD
+rail.fire = TEMBAK
+rail.rst = RST
+rail.full = PENUH
+rail.keys = KUNCI
+rail.sens = SENS
+rail.cfg = PROFIL
+rail.back = BALIK
+rail.home = BERANDA
+rail.apps = APPS
+rail.shot = FOTO
+rail.dev = ALAT

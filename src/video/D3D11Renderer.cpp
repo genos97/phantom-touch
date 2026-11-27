@@ -1037,6 +1037,7 @@ bool D3D11Renderer::submitAndRenderGpuNV12(ID3D11Texture2D* srcTex, uint32_t sub
     videoDirty_ = false;
     LeaveCriticalSection(&frameLock_);
 
+    InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
     renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     LeaveCriticalSection(&d3dLock_);
     return true;
@@ -1079,6 +1080,7 @@ void D3D11Renderer::submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t*
         videoDirty_ = false;
         LeaveCriticalSection(&frameLock_);
 
+        InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount()));
         renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     }
 
@@ -1087,6 +1089,14 @@ void D3D11Renderer::submitAndRenderCpuNV12(const uint8_t* yPlane, const uint8_t*
 
 void D3D11Renderer::render(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming) {
     EnterCriticalSection(&d3dLock_);
+    renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
+    LeaveCriticalSection(&d3dLock_);
+}
+
+void D3D11Renderer::tryRender(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming) {
+    if (!TryEnterCriticalSection(&d3dLock_)) {
+        return;
+    }
     renderLocked(videoRectInHost, drawHudOverlay, ioTiming);
     LeaveCriticalSection(&d3dLock_);
 }

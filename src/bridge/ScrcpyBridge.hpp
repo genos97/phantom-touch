@@ -36,6 +36,32 @@ private:
     std::deque<std::vector<uint8_t>> lo_;
 };
 
+// Loop & echo guard for F11 bidirectional clipboard sync + F10/B3 non-ASCII clipboard restore.
+class ClipboardSyncGuard {
+public:
+    static uint64_t hashText(const std::string& utf8);
+
+    void reset();
+    bool shouldSendPcToPhone(const std::string& utf8, uint32_t winSeq);
+    bool shouldApplyPhoneToPc(const std::string& utf8, uint64_t nowMs);
+    void noteLocalClipboardWrite(uint32_t newWinSeq, const std::string& utf8);
+
+    void beginNonAsciiTyping(const std::string& typedUtf8, const std::string& clipToPreserve, uint64_t nowMs);
+    bool pollClipboardRestore(uint64_t nowMs, std::string& outRestoreText);
+    bool hasPendingRestore() const { return restorePending_; }
+
+private:
+    uint32_t lastWinSeq_ = 0;
+    bool hasWinSeq_ = false;
+    uint64_t lastSentToPhoneHash_ = 0;
+    uint64_t lastRecvFromPhoneHash_ = 0;
+    uint64_t suppressedEchoHash_ = 0;
+    uint64_t suppressedEchoUntilMs_ = 0;
+    bool restorePending_ = false;
+    uint64_t restoreDueMs_ = 0;
+    std::string savedClip_;
+};
+
 struct ToolPaths {
     std::string adbExe;
     std::string scrcpyExe;
@@ -85,6 +111,7 @@ struct BridgeStreamConfig {
     int bitrateMbps = 16;       // Video bitrate in Mbps (metadataOnly forces 100kbps)
     bool metadataOnly = false;  // True for legacy 1 FPS control-only mode
     bool stayAwake = true;
+    bool clipboardAutosync = true; // F11: scrcpy clipboard_autosync=true|false
     bool enableAudio = false;   // F7: request audio=true on native scrcpy session
     bool virtualDisplay = false;
     std::string virtualDisplaySpec; // e.g. "1920x1080/320", "1280x720/240", or "auto"

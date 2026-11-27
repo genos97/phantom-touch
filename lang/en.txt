@@ -1,0 +1,50 @@
+# Phantom Touch UI Strings - English (en)
+tab.keys = KEYS
+tab.sens = SENS
+tab.cfg = CFG
+tab.dev = DEV
+tab.pad = PAD
+
+sec.connection = CONNECTION
+sec.stream = STREAM
+sec.input = INPUT
+sec.gamepad = GAMEPAD
+sec.privacy = PRIVACY & LOGS
+sec.language = LANGUAGE
+
+lbl.in_app_audio = In-App Phone Audio (WASAPI)
+lbl.clipboard_sync = Auto-Sync Clipboard (PC <-> Phone)
+lbl.clipboard_note = Phone copies excluded from Windows Win+V history
+lbl.auto_switch = Auto-Switch Profile by Open App
+lbl.rclick_back = Right-Click = Android Back (Cursor)
+lbl.gamepad_ctrl = XInput Gamepad-to-Touch Controller
+lbl.screen_off = Turn Phone Screen Off While Streaming
+lbl.stay_awake = Keep Phone Awake While Plugged
+
+btn.apply_reconnect = APPLY & RECONNECT
+btn.disconnect = DISCONNECT
+btn.refresh = Refresh
+btn.back = BACK
+
+hub.title = Phantom Touch Device Hub
+hub.subtitle = Auto-detecting USB debugging & Wireless ADB devices
+
+tb.no_device = No Device
+tb.offline_studio = Offline Studio
+tb.reconnecting = Reconnecting...
+tb.lost_link = Lost Link
+tb.typing_mode = TYPING  |  F1: Game
+
+rail.aim = AIM
+rail.hud = HUD
+rail.fire = FIRE
+rail.rst = RST
+rail.full = FULL
+rail.keys = KEYS
+rail.sens = SENS
+rail.cfg = CFG
+rail.back = BACK
+rail.home = HOME
+rail.apps = APPS
+rail.shot = SHOT
+rail.dev = DEV

@@ -1,4 +1,5 @@
 #include "ui/SideRail.hpp"
+#include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 namespace {
@@ -26,28 +27,42 @@ void SideRail::layout(const RECT& bounds, const SideRailState& st) {
         bool enabled;
     };
 
+    std::string lblAim  = Strings::tr("rail.aim", "AIM");
+    std::string lblHud  = Strings::tr("rail.hud", "HUD");
+    std::string lblFire = Strings::tr("rail.fire", "FIRE");
+    std::string lblRst  = Strings::tr("rail.rst", "RST");
+    std::string lblFull = Strings::tr("rail.full", "FULL");
+    std::string lblKeys = Strings::tr("rail.keys", "KEYS");
+    std::string lblSens = Strings::tr("rail.sens", "SENS");
+    std::string lblCfg  = Strings::tr("rail.cfg", "CFG");
+    std::string lblBack = Strings::tr("rail.back", "BACK");
+    std::string lblHome = Strings::tr("rail.home", "HOME");
+    std::string lblApps = Strings::tr("rail.apps", "APPS");
+    std::string lblShot = Strings::tr("rail.shot", "SHOT");
+    std::string lblDev  = Strings::tr("rail.dev", "DEV");
+
     RailSpec playItems[] = {
-        { SR_AIM_TOGGLE,      ICON_AIM,        "AIM",  "Aim Lock (~ / F1)",              st.aimMode, Theme::ACCENT_GREEN, true },
-        { SR_HUD_TOGGLE,      ICON_HUD,        "HUD",  "Show / Hide Key Badges (F4)",    st.showHud, Theme::ACCENT_CYAN, true },
-        { SR_FIRE_CYCLE,      ICON_FIRE,       "FIRE", "Cycle Fire Mode (F3)",           false, Theme::ACCENT_AMBER, true },
-        { SR_RESET_TOUCH,     ICON_RESET,      "RST",  "Anti-Stuck Touch Reset (F5)",    false, Theme::ACCENT_AMBER, true },
-        { SR_FULLSCREEN,      ICON_FULLSCREEN, "FULL", "Fullscreen Gaming (F11)",        st.fullscreen, Theme::ACCENT_CYAN, true }
+        { SR_AIM_TOGGLE,      ICON_AIM,        lblAim.c_str(),  "Aim Lock (~ / F1)",              st.aimMode, Theme::ACCENT_GREEN, true },
+        { SR_HUD_TOGGLE,      ICON_HUD,        lblHud.c_str(),  "Show / Hide Key Badges (F4)",    st.showHud, Theme::ACCENT_CYAN, true },
+        { SR_FIRE_CYCLE,      ICON_FIRE,       lblFire.c_str(), "Cycle Fire Mode (F3)",           false, Theme::ACCENT_AMBER, true },
+        { SR_RESET_TOUCH,     ICON_RESET,      lblRst.c_str(),  "Anti-Stuck Touch Reset (F5)",    false, Theme::ACCENT_AMBER, true },
+        { SR_FULLSCREEN,      ICON_FULLSCREEN, lblFull.c_str(), "Fullscreen Gaming (F11)",        st.fullscreen, Theme::ACCENT_CYAN, true }
     };
 
     RailSpec studioItems[] = {
-        { SR_DRAWER_KEYS,     ICON_KEYMAP,     "KEYS", "Keymap Studio (F2)",             st.drawerOpen && st.activeDrawerTab == 0, Theme::ACCENT_CYAN, true },
-        { SR_DRAWER_SENS,     ICON_SENS,       "SENS", "Sensitivity & Aim Physics",      st.drawerOpen && st.activeDrawerTab == 1, Theme::ACCENT_CYAN, true },
-        { SR_DRAWER_PROFILES, ICON_PROFILES,   "CFG",  "Saved Profiles (Ctrl+K)",        st.drawerOpen && st.activeDrawerTab == 2, Theme::ACCENT_CYAN, true }
+        { SR_DRAWER_KEYS,     ICON_KEYMAP,     lblKeys.c_str(), "Keymap Studio (F2)",             st.drawerOpen && st.activeDrawerTab == 0, Theme::ACCENT_CYAN, true },
+        { SR_DRAWER_SENS,     ICON_SENS,       lblSens.c_str(), "Sensitivity & Aim Physics",      st.drawerOpen && st.activeDrawerTab == 1, Theme::ACCENT_CYAN, true },
+        { SR_DRAWER_PROFILES, ICON_PROFILES,   lblCfg.c_str(),  "Saved Profiles (Ctrl+K)",        st.drawerOpen && st.activeDrawerTab == 2, Theme::ACCENT_CYAN, true }
     };
 
     RailSpec devItems[] = {
-        { SR_ANDROID_BACK,    ICON_BACK,       "BACK", "Android Back",                   false, Theme::ACCENT_CYAN, st.connected },
-        { SR_ANDROID_HOME,    ICON_HOME,       "HOME", "Android Home",                   false, Theme::ACCENT_CYAN, st.connected },
-        { SR_ANDROID_RECENTS, ICON_RECENTS,    "APPS", "Android Recents",                false, Theme::ACCENT_CYAN, st.connected },
+        { SR_ANDROID_BACK,    ICON_BACK,       lblBack.c_str(), "Android Back",                   false, Theme::ACCENT_CYAN, st.connected },
+        { SR_ANDROID_HOME,    ICON_HOME,       lblHome.c_str(), "Android Home",                   false, Theme::ACCENT_CYAN, st.connected },
+        { SR_ANDROID_RECENTS, ICON_RECENTS,    lblApps.c_str(), "Android Recents",                false, Theme::ACCENT_CYAN, st.connected },
         { SR_ANDROID_VOL_UP,  ICON_VOL_UP,     "VOL+", "Volume Up",                      false, Theme::ACCENT_CYAN, st.connected },
         { SR_ANDROID_VOL_DN,  ICON_VOL_DN,     "VOL-", "Volume Down",                    false, Theme::ACCENT_CYAN, st.connected },
-        { SR_SCREENSHOT,      ICON_CAMERA,     "SHOT", "Capture Phone Screenshot",       false, Theme::ACCENT_GREEN, st.connected },
-        { SR_DRAWER_DEVICE,   ICON_SETTINGS,   "DEV",  "Device, Wireless ADB & Stream",  st.drawerOpen && st.activeDrawerTab == 3, Theme::ACCENT_CYAN, true }
+        { SR_SCREENSHOT,      ICON_CAMERA,     lblShot.c_str(), "Capture Phone Screenshot",       false, Theme::ACCENT_GREEN, st.connected },
+        { SR_DRAWER_DEVICE,   ICON_SETTINGS,   lblDev.c_str(),  "Device, Wireless ADB & Stream",  st.drawerOpen && st.activeDrawerTab == 3, Theme::ACCENT_CYAN, true }
     };
 
     const int totalH = bounds.bottom - bounds.top;

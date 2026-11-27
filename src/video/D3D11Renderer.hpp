@@ -101,6 +101,7 @@ public:
     bool hasVideoFrame() const;
     void clearVideoFrame();
     DWORD lastPresentTick() const { return static_cast<DWORD>(lastPresentTick_); }
+    void markStreamActivated() { InterlockedExchange(&lastPresentTick_, static_cast<LONG>(GetTickCount())); }
 
     // Thread-safe: submits latest premultiplied-alpha BGRA HUD surface (from HudOverlay/HudRenderer)
     void updateHudBitmap(const void* bgraPremulPixels, int width, int height);
@@ -111,6 +112,8 @@ public:
 
     // Thread-safe: renders dark canvas + letterboxed NV12 video + same-frame HUD overlay and Presents!
     void render(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
+    // Non-blocking UI-thread variant: returns immediately if video thread currently holds d3dLock_.
+    void tryRender(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
     // Instant local PNG screenshot straight from the latest GPU/CPU NV12 frame (zero ADB lag!)
     bool saveLatestFramePng(const std::string& savePath, std::string& outError) const;

@@ -32,6 +32,9 @@ struct AppSettings {
     bool stayAwake = true;
     bool autoSwitchProfiles = true; // Auto-switch game/desktop profile by foreground Android app
     bool rightClickBack = true;     // Right-click inside phone in Cursor Mode -> Android Back
+    bool clipboardSync = true;      // F11: Bidirectional PC <-> Phone clipboard sync (default ON)
+    bool clipboardNoticeShown = false; // F11: First-run notice shown once
+    std::string uiLanguage = "en";  // F10: Interface language code (en, pt-BR, es, id, hi, ru)
     bool useNativeVideo = true;     // Stage 2: single-connection Media Foundation + D3D11 video
     bool vsyncEnabled = false;      // LATENCY 1.4: Waitable-swapchain VSync (no tearing) vs immediate Flip+Tearing
     int audioBufferMs = 25;         // LATENCY 1.6: scrcpy audio relay buffer (15..100 ms)

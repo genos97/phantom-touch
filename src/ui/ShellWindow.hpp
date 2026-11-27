@@ -49,10 +49,6 @@ public:
         forceAudioOn_ = forceAudio;
         forceAudioCodec_ = forceAudioCodec;
         forceAudioBufferMs_ = forceAudioBufferMs;
-        if (forceAudioOn_) settings_.mirrorAudio = true;
-        if (forceAudioBufferMs_ >= 15 && forceAudioBufferMs_ <= 100) {
-            settings_.audioBufferMs = forceAudioBufferMs_;
-        }
         if (autoProbeOnConnect_) showOnboarding_ = false;
     }
 
@@ -156,8 +152,9 @@ private:
     std::string ensureDesktopProfileExists();
     bool handleDesktopKeyEvent(int vk, bool down);
     bool handleDesktopChar(wchar_t ch);
+    void sendPhoneText(const std::string& utf8);
     std::string readWindowsClipboardUtf8() const;
-    void writeWindowsClipboardUtf8(const std::string& utf8Text);
+    void writeWindowsClipboardUtf8(const std::string& utf8Text, bool fromPhone = true);
 
     void setAimMode(bool enabled);
     void setDrawerState(bool open, int tab);
@@ -293,6 +290,9 @@ private:
     std::map<std::string, std::string> sessionAppProfiles_; // E5: session app -> profile memory
     std::string pendingDeviceClip_;
     std::string lastSyncedClip_;
+    std::string lastDeviceClip_;
+    ClipboardSyncGuard clipGuard_;
+    bool clipboardListenerActive_ = false;
     std::vector<std::string> pendingDropFiles_;
     std::string pendingDropToast_;
     std::string pendingFallbackReason_;

@@ -1,0 +1,50 @@
+# Phantom Touch UI Strings - हिन्दी (hi)
+tab.keys = कुंजी
+tab.sens = सेंस
+tab.cfg = प्रोफाइल
+tab.dev = डिवाइस
+tab.pad = पैड
+
+sec.connection = कनेक्शन
+sec.stream = स्ट्रीम
+sec.input = इनपुट
+sec.gamepad = गेमपैड
+sec.privacy = गोपनीयता और लॉग
+sec.language = भाषा
+
+lbl.in_app_audio = ऐप में फ़ोन ऑडियो (WASAPI)
+lbl.clipboard_sync = ऑटो क्लिपबोर्ड सिंक (PC <-> फ़ोन)
+lbl.clipboard_note = फ़ोन कॉपी Windows Win+V इतिहास से बाहर
+lbl.auto_switch = ऐप के अनुसार ऑटो प्रोफाइल बदलें
+lbl.rclick_back = राइट-क्लिक = Android बैक
+lbl.gamepad_ctrl = XInput गेमपैड टच नियंत्रक
+lbl.screen_off = स्ट्रीमिंग में फ़ोन स्क्रीन बंद रखें
+lbl.stay_awake = फ़ोन स्क्रीन को जागृत रखें
+
+btn.apply_reconnect = लागू करें और जोड़ें
+btn.disconnect = डिस्कनेक्ट
+btn.refresh = रीफ़्रेश
+btn.back = वापस
+
+hub.title = Phantom Touch डिवाइस हब
+hub.subtitle = USB और वायरलेस ADB डिवाइस खोज रहा है
+
+tb.no_device = कोई डिवाइस नहीं
+tb.offline_studio = ऑफलाइन स्टूडियो
+tb.reconnecting = पुनः जुड़ रहा है...
+tb.lost_link = संपर्क टूटा
+tb.typing_mode = टाइपिंग  |  F1: गेम
+
+rail.aim = निशाना
+rail.hud = HUD
+rail.fire = फायर
+rail.rst = रीसेट
+rail.full = पूर्ण
+rail.keys = कुंजी
+rail.sens = सेंस
+rail.cfg = प्रोफाइल
+rail.back = वापस
+rail.home = होम
+rail.apps = ऐप्स
+rail.shot = फोटो
+rail.dev = सेटिंग
