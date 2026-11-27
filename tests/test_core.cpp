@@ -24,6 +24,7 @@
 #include "ui/HudRenderer.hpp"
 #include "ui/OnboardingView.hpp"
 #include "ui/OverlayPopups.hpp"
+#include "ui/SessionTabBar.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
@@ -2838,6 +2839,137 @@ static void testSprint6aCreatorAndDeviceControls() {
     std::printf("[Test] Sprint 6A (F12/F13/F14) OK!\n");
 }
 
+static void testSprint6bMultiDeviceSessions() {
+    // 1. Unique per-tab ADB forward port allocator (27199..27202) & setter
+    {
+        std::vector<int> used;
+        assert(ScrcpyBridge::allocateUniqueForwardPort(used) == 27199);
+        used.push_back(27199);
+        assert(ScrcpyBridge::allocateUniqueForwardPort(used) == 27200);
+        used.push_back(27201);
+        // Reuses lowest free gap (27200)
+        assert(ScrcpyBridge::allocateUniqueForwardPort(used) == 27200);
+        used.push_back(27200);
+        assert(ScrcpyBridge::allocateUniqueForwardPort(used) == 27202);
+
+        ScrcpyBridge b0, b1;
+        b0.setForwardPort(27199);
+        b1.setForwardPort(27200);
+        assert(b0.forwardPort() == 27199);
+        assert(b1.forwardPort() == 27200);
+    }
+
+    // 2. Strict P7 single-focus InputEngine::setBridge(): releases active touches & never broadcasts
+    {
+        ScrcpyBridge b0, b1;
+        b0.setForwardPort(27199);
+        b1.setForwardPort(27200);
+        InputEngine eng(&b0);
+        assert(eng.activeBridge() == &b0);
+
+        std::vector<RecordedTouch> touchLog;
+        eng.setTouchSinkForTest(recordTouchCb, &touchLog);
+        eng.setProfile(ProfileDefaults::createFreeFire());
+        eng.start();
+        eng.setAimMode(false);
+        eng.onDirectCursorTouch(TOUCH_DOWN, 0.50f, 0.50f);
+        Sleep(20);
+        const size_t beforeSwitchCount = touchLog.size();
+        assert(beforeSwitchCount >= 1);
+        assert(touchLog.back().action == TOUCH_DOWN);
+
+        // Switching focus to phone 2 synchronously releases phone 1 touches & routes only to b1
+        eng.setBridge(&b1);
+        assert(eng.activeBridge() == &b1);
+        assert(touchLog.size() > beforeSwitchCount);
+        bool sawRelease = false;
+        for (size_t i = beforeSwitchCount; i < touchLog.size(); ++i) {
+            if (touchLog[i].action == TOUCH_UP) {
+                sawRelease = true;
+                break;
+            }
+        }
+        assert(sawRelease);
+        eng.stop();
+    }
+
+    // 3. SessionTabBar 2-tab layout/hit-test & 4-tab hard cap (F15)
+    {
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 1280, 720);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        Gdiplus::Graphics g(mDC);
+
+        SessionTabBar bar;
+        std::vector<SessionTabInfo> tabs2;
+        SessionTabInfo t0;
+        t0.index = 0; t0.title = "Galaxy S21 FE"; t0.subtitle = "R5CRC0RS88Y:27199";
+        t0.active = true; t0.connected = true; t0.canClose = true;
+        SessionTabInfo t1;
+        t1.index = 1; t1.title = "Pixel 8 Pro [2ND]"; t1.subtitle = "USB/WiFi:27200";
+        t1.active = false; t1.connecting = true; t1.canClose = true;
+        tabs2.push_back(t0);
+        tabs2.push_back(t1);
+
+        RECT barRc = { 0, 40, 1226, 70 };
+        bar.paint(g, barRc, tabs2, true, -1, -1);
+        assert(bar.tabCount() == 2);
+
+        RECT rTab0 = bar.tabRect(0);
+        RECT rTab1 = bar.tabRect(1);
+        RECT rAdd = bar.addButtonRect();
+        assert(rTab0.right > rTab0.left && rTab1.right > rTab1.left && rAdd.right > rAdd.left);
+
+        SessionTabHit h0 = bar.hitTest(rTab0.left + 14, (rTab0.top + rTab0.bottom) / 2);
+        assert(h0.action == STAB_SELECT && h0.tabIndex == 0);
+        SessionTabHit h1 = bar.hitTest(rTab1.left + 14, (rTab1.top + rTab1.bottom) / 2);
+        assert(h1.action == STAB_SELECT && h1.tabIndex == 1);
+        SessionTabHit hc = bar.hitTest(rTab1.right - 10, (rTab1.top + rTab1.bottom) / 2);
+        assert(hc.action == STAB_CLOSE && hc.tabIndex == 1);
+        SessionTabHit ha = bar.hitTest((rAdd.left + rAdd.right) / 2, (rAdd.top + rAdd.bottom) / 2);
+        assert(ha.action == STAB_ADD);
+        assert(!bar.tooltipAt((rAdd.left + rAdd.right) / 2, (rAdd.top + rAdd.bottom) / 2).empty());
+
+        // 4-tab cap hides '+' button
+        std::vector<SessionTabInfo> tabs4 = tabs2;
+        SessionTabInfo t2 = t0; t2.index = 2; t2.active = false;
+        SessionTabInfo t3 = t1; t3.index = 3; t3.active = false;
+        tabs4.push_back(t2);
+        tabs4.push_back(t3);
+        bar.paint(g, barRc, tabs4, false, -1, -1);
+        assert(bar.tabCount() == 4);
+        assert(bar.addButtonRect().right <= bar.addButtonRect().left);
+
+        // 4. DrawerPanel DEV tab ADD PHONE TAB button + LaunchOptions --multi-tab-test
+        DrawerPanel dp;
+        dp.setActiveTab(3);
+        Profile p = ProfileDefaults::createDesktop();
+        AppSettings s;
+        std::vector<std::string> logs;
+        RECT drc = { 0, 0, 356, 1200 };
+        dp.paint(g, drc, p, s, "", -1, false, true, "TestPhone", "", logs, -1, -1, 0);
+        RECT rcAddTab = { 0, 0, 0, 0 };
+        assert(dp.rectForAction(DA_ADD_PHONE_TAB, -1, rcAddTab));
+        int sel = -1;
+        DrawerActionResult res;
+        assert(dp.onMouseDown((rcAddTab.left + rcAddTab.right) / 2,
+                              (rcAddTab.top + rcAddTab.bottom) / 2, p, s, sel, res));
+        assert(res.requestAddPhoneTab);
+
+        const char* argvMt[] = { "PhantomTouch.exe", "--multi-tab-test" };
+        LaunchOptions lo = parseLaunchOptions(2, argvMt);
+        assert(lo.multiTabTest);
+
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    std::printf("[Test] Sprint 6B (F15 Multi-Phone Tabs & Strict Focus) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -2867,6 +2999,8 @@ int main() {
     testSprint5bAppsFilesAndShortcuts();
     std::fflush(stdout);
     testSprint6aCreatorAndDeviceControls();
-    std::printf("ALL SPRINT 6A + SPRINT 5B + SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint6bMultiDeviceSessions();
+    std::printf("ALL SPRINT 6B + SPRINT 6A + SPRINT 5B + SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

@@ -1187,6 +1187,17 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
     y += 34;
     drawToggleRow(g, x, y, w, Strings::tr("lbl.screen_off", "Turn Phone Screen Off").c_str(), s.turnScreenOff, Theme::ACCENT_CYAN, DA_TOGGLE_SCREEN_OFF, hoverX, hoverY); y += 36;
     drawToggleRow(g, x, y, w, Strings::tr("lbl.stay_awake", "Keep Phone Awake").c_str(), s.stayAwake, Theme::ACCENT_CYAN, DA_TOGGLE_STAY_AWAKE, hoverX, hoverY); y += 36;
+    RECT rAddTab = { x, y, x + w, y + 28 };
+    bool hovAddTab = ptIn(rAddTab, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rAddTab, 7.0f, hovAddTab ? Theme::ACCENT_CYAN_BG : Theme::BG_CARD,
+                             hovAddTab ? Theme::ACCENT_CYAN : Theme::BORDER_STRONG, 1.0f);
+    GdiPlusDraw::textCenter(g, "ADD PHONE TAB (2-4 PHONES / CTRL+SHIFT+N)", static_cast<float>(x + w / 2),
+                            static_cast<float>(y + 14), 10.2f, true,
+                            hovAddTab ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+    if (rAddTab.bottom > bodyClip_.top && rAddTab.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rAddTab, DA_ADD_PHONE_TAB, 0 });
+    }
+    y += 36;
     RECT rGuide = { x, y, x + w, y + 28 };
     bool hovG = ptIn(rGuide, hoverX, hoverY);
     GdiPlusDraw::roundedCard(g, rGuide, 7.0f, hovG ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
@@ -2495,6 +2506,7 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
             case DA_DEV_VOL_UP:         out.requestDeviceControl = 8; return true;
             case DA_DEV_VOL_MUTE:       out.requestDeviceControl = 9; return true;
             case DA_DEV_SHOT_CLIP:      out.requestDeviceControl = 10; return true;
+            case DA_ADD_PHONE_TAB:      out.requestAddPhoneTab = true; return true;
             case DA_TOGGLE_GAMEPAD:
                 settings.gamepadEnabled = !settings.gamepadEnabled;
                 out.settingsModified = true;

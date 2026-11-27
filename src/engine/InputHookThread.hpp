@@ -51,7 +51,9 @@ enum ShellAppMsg {
     MSG_FILE_TRANSFER_DONE = WM_APP + 39,
     MSG_TOGGLE_RECORD      = WM_APP + 40,
     MSG_SAVE_REPLAY        = WM_APP + 41,
-    MSG_RECORDING_DONE     = WM_APP + 42
+    MSG_RECORDING_DONE     = WM_APP + 42,
+    MSG_ADD_PHONE_TAB      = WM_APP + 43,
+    MSG_NEXT_PHONE_TAB     = WM_APP + 44
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread
@@ -73,6 +75,7 @@ struct InputHookSnapshot {
     bool waitingSpecialRebind = false;
     bool keymapEnabled = false;
     bool rightClickBack = true;
+    bool multiTabActive = false;
 
     int toggleAimVk = 0x70;    // VK_F1
     int holdUnlockVk = 0xC0;   // '~'

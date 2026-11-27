@@ -1280,30 +1280,35 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
 
     std::string adb = adbPrefix();
 
-    // 2. Push scrcpy-server binary to a unique path so cleanup=true never races with scrcpy.exe!
+    // 2. Push scrcpy-server binary to a unique per-port path so cleanup=true and multi-phone tabs never collide!
     if (stepCb_) stepCb_(stepCbCtx_, 0);
+    if (forwardPort_ < 1024 || forwardPort_ > 65535) forwardPort_ = 27199;
+    char portBuf[16];
+    std::snprintf(portBuf, sizeof(portBuf), "%d", forwardPort_);
+    remoteServerJar_ = std::string("/data/local/tmp/km-scrcpy-server-") + portBuf + ".jar";
+
     std::string pushOut;
     DWORD exitCode = 0;
     if (!runCommandCapture(adb + " push \"" + tools.scrcpyServer +
-                           "\" /data/local/tmp/km-scrcpy-server.jar", pushOut, exitCode) || exitCode != 0) {
+                           "\" " + remoteServerJar_, pushOut, exitCode) || exitCode != 0) {
         outError = "Failed to push scrcpy-server to device:\n" + pushOut;
         return false;
     }
 
-    // 3. Create unique 31-bit scid and adb forward tunnel
-    std::srand(static_cast<unsigned int>(std::time(NULL) ^ GetTickCount()));
+    // 3. Create unique 31-bit scid and adb forward tunnel for this session port
+    std::srand(static_cast<unsigned int>(std::time(NULL) ^ GetTickCount() ^
+                                         (static_cast<unsigned int>(forwardPort_) * 2654435761u) ^
+                                         static_cast<unsigned int>(GetCurrentThreadId())));
     uint32_t scidVal = (static_cast<uint32_t>(std::rand()) << 16) ^
-                       static_cast<uint32_t>(std::rand());
+                       static_cast<uint32_t>(std::rand()) ^
+                       (static_cast<uint32_t>(forwardPort_) * 2654435761u) ^
+                       static_cast<uint32_t>(GetCurrentThreadId());
     scidVal &= 0x7FFFFFFFu;
     if (scidVal == 0) scidVal = 0x12345678u;
 
     char scidBuf[16];
     std::snprintf(scidBuf, sizeof(scidBuf), "%08x", scidVal);
     scid_ = scidBuf;
-    forwardPort_ = 27199;
-
-    char portBuf[16];
-    std::snprintf(portBuf, sizeof(portBuf), "%d", forwardPort_);
 
     std::string fwdOut;
     std::string fwdCmd = adb + " forward tcp:" + portBuf + " localabstract:scrcpy_" + scid_;
@@ -1348,7 +1353,10 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
         aCodec = selectAudioCodec(chosenSerial);
     }
 
-    std::string srvCmd = adb + " shell CLASSPATH=/data/local/tmp/km-scrcpy-server.jar "
+    const std::string jarPath = !remoteServerJar_.empty()
+        ? remoteServerJar_
+        : "/data/local/tmp/km-scrcpy-server.jar";
+    std::string srvCmd = adb + " shell CLASSPATH=" + jarPath + " "
                          "app_process / com.genymobile.scrcpy.Server " + tools.scrcpyVersion +
                          " scid=" + scid_ +
                          " log_level=info"
@@ -1617,9 +1625,36 @@ void ScrcpyBridge::disconnect() {
         std::string dummyOut;
         DWORD ec = 0;
         runCommandCapture(adb + " forward --remove tcp:" + portBuf, dummyOut, ec);
-        runCommandCapture(adb + " shell rm -f /data/local/tmp/km-scrcpy-server.jar", dummyOut, ec);
+        const std::string jarToRm = !remoteServerJar_.empty()
+            ? remoteServerJar_
+            : "/data/local/tmp/km-scrcpy-server.jar";
+        runCommandCapture(adb + " shell rm -f " + jarToRm, dummyOut, ec);
         scid_.clear();
+        remoteServerJar_.clear();
     }
+}
+
+int ScrcpyBridge::allocateUniqueForwardPort(const std::vector<int>& usedPorts, int basePort, int maxOffset) {
+    if (basePort < 1024) basePort = 27199;
+    if (maxOffset < 1) maxOffset = 32;
+    for (int off = 0; off < maxOffset; ++off) {
+        int cand = basePort + off;
+        if (cand > 65535) break;
+        bool inUse = false;
+        for (size_t i = 0; i < usedPorts.size(); ++i) {
+            if (usedPorts[i] == cand) {
+                inUse = true;
+                break;
+            }
+        }
+        if (!inUse) return cand;
+    }
+    return basePort + maxOffset;
+}
+
+void ScrcpyBridge::setForwardPort(int port) {
+    if (port < 1024 || port > 65535) return;
+    forwardPort_ = port;
 }
 
 std::string ScrcpyBridge::deviceName() const {

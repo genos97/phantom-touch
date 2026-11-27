@@ -113,6 +113,7 @@ enum DrawerActionId {
     DA_FOCUS_WIRELESS,
     DA_CONNECT_WIRELESS,
     DA_OPEN_ONBOARDING,
+    DA_ADD_PHONE_TAB,
 
     // Gamepad v2 tab (F6)
     DA_PAD_MODE,          // extra = 0 (TOUCH) / 1 (NATIVE)
@@ -186,6 +187,7 @@ struct DrawerActionResult {
     bool vsyncToggled = false;
     bool languageChanged = false;
     bool requestOpenOnboarding = false;
+    bool requestAddPhoneTab = false;
     bool requestToggleEditTest = false;
     bool requestCreateTemplate = false;
     bool requestToggleRecord = false;

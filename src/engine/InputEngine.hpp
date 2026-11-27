@@ -72,6 +72,10 @@ public:
     // Optional downstream sink override (for unit tests verifying 0..9 finger pool output)
     void setTouchSinkForTest(TouchEmitFn fn, void* ctx);
 
+    // P7 Strict single-focus routing: switches the sole active phone bridge and releases stale touches
+    void setBridge(ScrcpyBridge* bridge);
+    ScrcpyBridge* activeBridge() const;
+
     EngineTelemetry getTelemetry() const;
 
 private:
@@ -127,6 +131,7 @@ private:
     void releaseAllLocked();
 
     ScrcpyBridge* bridge_;
+    bool hasTestSinkOverride_ = false;
 
     mutable CRITICAL_SECTION lock_;      // Worker thread state & touch dispatch
     mutable CRITICAL_SECTION inputLock_; // Microsecond lock for non-blocking hook queues

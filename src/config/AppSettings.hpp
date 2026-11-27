@@ -27,6 +27,7 @@ struct LaunchOptions {
     std::string profilePath;
     std::string launchAppPackage;
     int recordTestSec = 0; // F12/F13 automated live MP4 + replay + clean-feed verification
+    bool multiTabTest = false; // F15 automated 2-tab unique port + focus routing verification
 };
 
 std::string sanitizePackageNameToken(const std::string& raw);

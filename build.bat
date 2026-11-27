@@ -63,6 +63,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\ui\EditorState.cpp ^
     src\ui\HudRenderer.cpp ^
     src\ui\TopBar.cpp ^
+    src\ui\SessionTabBar.cpp ^
     src\ui\SideRail.cpp ^
     src\ui\ViewportHost.cpp ^
     src\ui\OnboardingView.cpp ^

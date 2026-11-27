@@ -182,6 +182,7 @@ public:
     static size_t serializeRotateDevice(uint8_t* buf, size_t cap);
     static size_t serializeResetVideo(uint8_t* buf, size_t cap);
     static std::string buildShowTouchesServerArg(bool showTouches, bool cleanupEnabled);
+    static int allocateUniqueForwardPort(const std::vector<int>& usedPorts, int basePort = 27199, int maxOffset = 32);
 
     bool listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial, std::vector<VideoEncoderInfo>& outEncoders);
     bool listInstalledApps(const ToolPaths& tools, const std::string& deviceSerial, std::vector<DeviceAppInfo>& outApps);
@@ -208,6 +209,8 @@ public:
     bool isVirtualDisplayActive() const { return virtualDisplayActive_; }
     DWORD mirrorProcessId() const { return mirrorPid_; }
     std::string activeSerial() const;
+    void setForwardPort(int port);
+    int forwardPort() const { return forwardPort_; }
 
     std::string deviceName() const;
     void getScreenSize(uint32_t& outW, uint32_t& outH) const;
@@ -302,6 +305,7 @@ private:
     std::string activeSerial_;
     std::string scid_;
     int forwardPort_ = 27199;
+    std::string remoteServerJar_;
     bool isV4Proto_ = false;
 
     std::string deviceName_;

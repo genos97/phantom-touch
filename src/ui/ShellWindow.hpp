@@ -12,6 +12,7 @@
 #include "ui/HudOverlay.hpp"
 #include "ui/OnboardingView.hpp"
 #include "ui/OverlayPopups.hpp"
+#include "ui/SessionTabBar.hpp"
 #include "ui/SideRail.hpp"
 #include "ui/Theme.hpp"
 #include "ui/TopBar.hpp"
@@ -44,7 +45,8 @@ public:
                           const std::string& forceAudioCodec = "",
                           int forceAudioBufferMs = 0,
                           const std::string& launchAppPackage = "",
-                          int recordTestSec = 0) {
+                          int recordTestSec = 0,
+                          bool multiTabTest = false) {
         consoleEnabled_ = consoleEnabled;
         autoProbeOnConnect_ = probeOnConnect;
         autoProbeSamples_ = probeSamples;
@@ -55,11 +57,12 @@ public:
         launchAppPackage_ = launchAppPackage;
         pendingLaunchApp_ = launchAppPackage;
         recordTestSec_ = recordTestSec;
+        multiTabTest_ = multiTabTest;
         if (!launchAppPackage_.empty()) {
             forceVirtualDisplayOnce_ = true;
             showOnboarding_ = false;
         }
-        if (autoProbeOnConnect_ || recordTestSec_ > 0) showOnboarding_ = false;
+        if (autoProbeOnConnect_ || recordTestSec_ > 0 || multiTabTest_) showOnboarding_ = false;
     }
 
     bool create(HINSTANCE hInst);
@@ -95,6 +98,7 @@ private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK cleanFeedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static void onRecorderDone(void* ctx, const RecordingResult& result);
+    static DWORD WINAPI closeSessionThreadProc(LPVOID param);
     static DWORD WINAPI startupToolsThreadProc(LPVOID param);
     static DWORD WINAPI refreshDevicesThreadProc(LPVOID param);
     static DWORD WINAPI deviceMonitorThreadProc(LPVOID param);
@@ -218,7 +222,83 @@ private:
     void onPaint(HDC hdc, const RECT& dirtyRc);
     void invalidateShell();
 
+    struct AsyncContext;
+    struct SessionRuntime {
+        int id = 0;
+        volatile LONG refCount = 1;
+        ShellWindow* shell = nullptr;
+        ScrcpyBridge* bridge = nullptr;
+        bool ownsBridge = false;
+        ViewportHost viewportHost;
+        H264Decoder h264Decoder;
+        AudioPlayer audioPlayer;
+        Recorder recorder;
+        LatencyTelemetry telemetry;
+        PhoneThermalInfo thermalInfo;
+        std::vector<VideoEncoderInfo> deviceEncoders;
+        std::string activeEncoderName;
+        std::string mirrorTitle;
+        volatile LONG connecting = 0;
+        volatile LONG connectStep = 0;
+        volatile LONG deviceResetPending = 0;
+        volatile LONG reinitDecoderFlag = 0;
+        volatile LONG fallbackPending = 0;
+        bool nativeVideoSession = false;
+        bool sawEmbeddedMirror = false;
+        uint32_t lastPhoneW = 1920;
+        uint32_t lastPhoneH = 1080;
+        bool userDisconnected = false;
+        bool reconnecting = false;
+        bool reconnectCancelled = false;
+        int reconnectAttempt = 0;
+        DWORD reconnectNextTick = 0;
+        int lastCountdownShown = -1;
+        std::string lastConnectedSerial;
+        bool lastConnectedWireless = false;
+        bool secureAppDetected = false;
+        std::string activeAppPackage;
+        std::string pendingSerial;
+        std::string pendingWirelessIp;
+        std::string pendingLaunchApp;
+        bool forceVirtualDisplayOnce = false;
+        std::string pendingDiscoveredSerial;
+        std::string pendingDiscoveredEncoder;
+        std::string pendingFallbackReason;
+        std::string lastConnectError;
+        std::string hubStatusMsg;
+        bool asyncResultOk = false;
+        std::string asyncResultMsg;
+        AppSettings appliedStreamSettings;
+        bool hasAppliedStreamSettings = false;
+        bool isVirtualDisplayTab = false;
+        void addRef() { InterlockedIncrement(&refCount); }
+        void release() { if (InterlockedDecrement(&refCount) == 0) delete this; }
+    };
+
+    SessionRuntime* findSessionById(int id) const;
+    int allocateSessionPort() const;
+    void saveActiveSessionUiState();
+    void loadActiveSessionUiState();
+    int addPhoneTab(const std::string& connectSerial = "", bool virtualDisplay = false, const std::string& launchApp = "");
+    bool switchToTab(int index);
+    bool closePhoneTab(int index);
+    bool anySessionConnecting() const;
+
+    ViewportHost& vp_() { return activeSession_->viewportHost; }
+    const ViewportHost& vp_() const { return activeSession_->viewportHost; }
+    H264Decoder& dec_() { return activeSession_->h264Decoder; }
+    AudioPlayer& aud_() { return activeSession_->audioPlayer; }
+    Recorder& rec_() { return activeSession_->recorder; }
+    const Recorder& rec_() const { return activeSession_->recorder; }
+    LatencyTelemetry& tel_() { return activeSession_->telemetry; }
+    const LatencyTelemetry& tel_() const { return activeSession_->telemetry; }
+
     ScrcpyBridge* bridge_;
+    std::vector<SessionRuntime*> sessions_;
+    size_t activeSessionIdx_ = 0;
+    SessionRuntime* activeSession_ = nullptr;
+    SessionRuntime* cleanFeedSession_ = nullptr;
+    int nextSessionId_ = 1;
     InputEngine* engine_;
     std::string exeDir_;
     std::string profilesDir_;
@@ -230,7 +310,6 @@ private:
     HINSTANCE hInst_ = NULL;
     HWND hwnd_ = NULL;
     InputHookThread hookThread_;
-    LatencyTelemetry telemetry_;
     ProbeResult probeResult_;
     PhoneThermalInfo thermalInfo_;
     std::vector<VideoEncoderInfo> deviceEncoders_;
@@ -277,6 +356,9 @@ private:
         AsyncContext* ctx;
         std::string arg;
         int intArg;
+        SessionRuntime* session;
+        SimpleAsyncJob(ShellWindow* s, AsyncContext* c, const std::string& a = "", int ia = 0, SessionRuntime* sess = nullptr)
+            : shell(s), ctx(c), arg(a), intArg(ia), session(sess) {}
     };
 
     mutable CRITICAL_SECTION auxLock_;
@@ -355,13 +437,14 @@ private:
 
     // Modular outside-viewport UI components
     TopBar topBar_;
+    SessionTabBar sessionTabBar_;
     SideRail sideRail_;
     DrawerPanel drawerPanel_;
-    ViewportHost viewportHost_;
     OnboardingView onboardingView_;
     HudOverlay hudOverlay_;
 
     RECT topBarRc_;
+    RECT tabBarRc_;
     RECT railRc_;
     RECT drawerRc_;
     RECT viewportRc_;
@@ -423,9 +506,6 @@ private:
     volatile LONG deviceResetPending_ = 0;
     volatile LONG reinitDecoderFlag_ = 0;
     volatile LONG fallbackPending_ = 0;
-    H264Decoder h264Decoder_;
-    AudioPlayer audioPlayer_;
-    Recorder recorder_;
     HWND cleanFeedHwnd_ = NULL;
     std::vector<RecordingResult> pendingRecResults_;
     int recordTestSec_ = 0;
@@ -437,6 +517,10 @@ private:
     bool recordTestHasReplay_ = false;
     RecordingResult recordTestLiveRes_;
     RecordingResult recordTestReplayRes_;
+    bool multiTabTest_ = false;
+    int multiTabTestStage_ = 0;
+    DWORD multiTabTestDueTick_ = 0;
+    DWORD multiTabTestDeadlineTick_ = 0;
 
     struct HudVisualSig {
         bool valid = false;

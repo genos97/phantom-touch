@@ -66,8 +66,43 @@ void InputEngine::emitTouchThroughPool(void* ctx, TouchAction action, uint64_t l
 
 void InputEngine::setTouchSinkForTest(TouchEmitFn fn, void* ctx) {
     EnterCriticalSection(&lock_);
+    hasTestSinkOverride_ = (fn != nullptr);
     fingerPool_.setDownstreamSink(fn ? fn : emitTouchToBridge, fn ? ctx : bridge_);
     LeaveCriticalSection(&lock_);
+}
+
+void InputEngine::setBridge(ScrcpyBridge* bridge) {
+    EnterCriticalSection(&lock_);
+    if (bridge_ != bridge) {
+        // Strict single-focus P7: release every active pointer/key/UHID device before routing to another phone
+        releaseAllLocked();
+        EnterCriticalSection(&inputLock_);
+        pendingKeys_.clear();
+        pendingCursor_.clear();
+        pendingScroll_.clear();
+        accumRawDx_ = 0.0;
+        accumRawDy_ = 0.0;
+        hasPendingAimDelta_ = false;
+        std::memset(hookHeldKeys_, 0, sizeof(hookHeldKeys_));
+        LeaveCriticalSection(&inputLock_);
+
+        bridge_ = bridge;
+        if (!hasTestSinkOverride_) {
+            fingerPool_.setDownstreamSink(emitTouchToBridge, bridge_);
+        }
+        uint32_t w = 1920, h = 1080;
+        if (bridge_) bridge_->getScreenSize(w, h);
+        syncFpsViewConfigLocked(w, h);
+    }
+    LeaveCriticalSection(&lock_);
+    if (wakeEvent_) SetEvent(wakeEvent_);
+}
+
+ScrcpyBridge* InputEngine::activeBridge() const {
+    EnterCriticalSection(&lock_);
+    ScrcpyBridge* b = bridge_;
+    LeaveCriticalSection(&lock_);
+    return b;
 }
 
 InputEngine::InputEngine(ScrcpyBridge* bridge)
@@ -214,7 +249,7 @@ void InputEngine::setProfile(const Profile& profile) {
     InterlockedExchange(&pollHzAtomic_, profile_.pollHz);
     actions_.resetForProfile(profile_.buttons.size());
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     syncFpsViewConfigLocked(w, h);
     EnterCriticalSection(&inputLock_);
     pendingKeys_.clear();
@@ -266,7 +301,7 @@ void InputEngine::updateTuning(const Profile& profile) {
     copyTuning(profile_);
     InterlockedExchange(&pollHzAtomic_, profile_.pollHz);
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     syncFpsViewConfigLocked(w, h);
     LeaveCriticalSection(&lock_);
 }
@@ -283,13 +318,13 @@ void InputEngine::setGamepadEnabled(bool enabled) {
     gamepad_.setEnabled(enabled);
     if (!enabled) {
         uint32_t w = 1920, h = 1080;
-        bridge_->getScreenSize(w, h);
+        if (bridge_) bridge_->getScreenSize(w, h);
         GamepadFrameOutput gpOut;
         gamepad_.pollAndProcess(profile_, w, h, 0.0, packetsThisSec_, gpOut, true, shellMenuOpen_ != 0);
         for (int i = 0; i < gpOut.keyDeltaCount; ++i) {
             processKeyEventLocked(gpOut.keyDeltas[i].vk, gpOut.keyDeltas[i].down, getTimeMs(), true);
         }
-        if (gpOut.uhidNeedDestroy) {
+        if (gpOut.uhidNeedDestroy && bridge_) {
             bridge_->sendUhidDestroy(3);
         }
         if (joyOwner_ == JOY_GAMEPAD) joyOwner_ = JOY_NONE;
@@ -336,7 +371,7 @@ void InputEngine::setAimMode(bool enabled) {
     releaseMouseTouchesLocked();
     InterlockedExchange(&aimMode_, enabled ? 1 : 0);
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     syncFpsViewConfigLocked(w, h);
     if (enabled) {
         viewStack_.onFocusGain(nowMs);
@@ -475,7 +510,7 @@ void InputEngine::onDirectCursorPinch(float normX, float normY, int wheelNotches
 
 void InputEngine::processDirectCursorLocked(TouchAction action, float normX, float normY) {
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     actions_.setCursorNorm(normX, normY);
     int32_t px = static_cast<int32_t>(normX * static_cast<float>(w) + 0.5f);
     int32_t py = static_cast<int32_t>(normY * static_cast<float>(h) + 0.5f);
@@ -509,7 +544,7 @@ void InputEngine::processDirectCursorLocked(TouchAction action, float normX, flo
 
 void InputEngine::processDirectCursorTwoFingerPanLocked(TouchAction action, float normX, float normY) {
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     int32_t maxX = static_cast<int32_t>(w > 10 ? w - 5 : 1915);
     int32_t maxY = static_cast<int32_t>(h > 10 ? h - 5 : 1075);
     auto clampX = [&](int32_t v) -> int32_t { return (v < 4) ? 4 : (v > maxX ? maxX : v); };
@@ -553,7 +588,7 @@ void InputEngine::processDirectCursorScrollLocked(float normX, float normY, int 
     releaseCursorPinchLocked();
     releaseCursorTwoFingerPanLocked();
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     double dw = static_cast<double>(w > 0 ? w : 1920);
     double dh = static_cast<double>(h > 0 ? h : 1080);
 
@@ -608,7 +643,7 @@ void InputEngine::processDirectCursorPinchLocked(float normX, float normY, int w
     releaseCursorTwoFingerPanLocked();
 
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     double dw = static_cast<double>(w > 0 ? w : 1920);
     double dh = static_cast<double>(h > 0 ? h : 1080);
 
@@ -797,7 +832,7 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs, bool fr
     }
 
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
 
     // Cursor Mode: mouse buttons ONLY trigger NODE_CURSOR_TOGGLE, EXCEPT gamepad triggers (E2)!
     if (!isAim && !fromGamepad && mouseBtn) {
@@ -944,7 +979,7 @@ void InputEngine::processKeyEventLocked(int vk, bool down, double nowMs, bool fr
 
 void InputEngine::pressFireLocked(double /*nowMs*/) {
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     double dw = static_cast<double>(w);
     double dh = static_cast<double>(h);
 
@@ -1013,7 +1048,7 @@ void InputEngine::releaseAllLocked() {
     joystick_.release(packetsThisSec_);
     gamepad_.releaseAll(packetsThisSec_);
     if (gamepad_.isUhidCreated()) {
-        bridge_->sendUhidDestroy(3);
+        if (bridge_) bridge_->sendUhidDestroy(3);
         gamepad_.markUhidDestroyed();
     }
     joyOwner_ = JOY_NONE;
@@ -1072,7 +1107,7 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
     }
 
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
 
     for (size_t i = 0; i < localKeys.size(); ++i) {
         processKeyEventLocked(localKeys[i].vk, localKeys[i].down, nowMs);
@@ -1127,15 +1162,15 @@ bool InputEngine::processTick(double nowMs, bool runPeriodic) {
             }
             prevGpStickDeflected_ = gpOut.stickDeflected;
         }
-        if (gpOut.uhidNeedCreate) {
+        if (gpOut.uhidNeedCreate && bridge_) {
             uint16_t dSz = 0;
             const uint8_t* desc = GamepadController::hidReportDescriptor(dSz);
             bridge_->sendUhidCreate(3, 0x045E, 0x028E, "PhantomTouch Gamepad", desc, dSz);
         }
-        if (gpOut.uhidReportChanged) {
+        if (gpOut.uhidReportChanged && bridge_) {
             bridge_->sendUhidInput(3, gpOut.uhidReport, 15);
         }
-        if (gpOut.uhidNeedDestroy) {
+        if (gpOut.uhidNeedDestroy && bridge_) {
             bridge_->sendUhidDestroy(3);
         }
         navMask = gpOut.shellNavMask;
@@ -1405,7 +1440,7 @@ EngineTelemetry InputEngine::getTelemetry() const {
     EngineTelemetry t;
     EnterCriticalSection(&lock_);
     uint32_t w = 1920, h = 1080;
-    bridge_->getScreenSize(w, h);
+    if (bridge_) bridge_->getScreenSize(w, h);
     t.screenW = w;
     t.screenH = h;
     t.aimMode = (aimMode_ != 0);

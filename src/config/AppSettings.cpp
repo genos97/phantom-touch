@@ -250,6 +250,8 @@ LaunchOptions parseLaunchOptions(int argc, const char* const* argv) {
         } else if (arg == "--app" && i + 1 < argc && argv[i + 1]) {
             std::string pkg = sanitizePackageNameToken(argv[++i]);
             if (!pkg.empty()) o.launchAppPackage = pkg;
+        } else if (arg == "--multi-tab-test") {
+            o.multiTabTest = true;
         } else if (arg == "--help" || arg == "-h") {
             o.showHelp = true;
         } else if (arg == "--profile" && i + 1 < argc && argv[i + 1]) {
