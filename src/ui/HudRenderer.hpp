@@ -64,6 +64,9 @@ public:
     static void paintFullscreenStatus(Gdiplus::Graphics& g, int w,
                                       const Profile& profile, const EngineTelemetry& tel);
 
+    static void paintKeypressOverlay(Gdiplus::Graphics& g, int w, int h,
+                                     const Profile& profile, const EngineTelemetry& tel);
+
     static void paintRebindPrompt(Gdiplus::Graphics& g, int w, int h,
                                   const std::string& targetName, bool specialAimKey);
 

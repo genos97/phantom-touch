@@ -525,3 +525,32 @@ void HudRenderer::paintToastWithAction(Gdiplus::Graphics& g, int w, int h,
 void HudRenderer::paintToast(Gdiplus::Graphics& g, int w, int h, const std::string& msg) {
     paintToastWithAction(g, w, h, msg, "", nullptr, TOAST_INFO);
 }
+
+void HudRenderer::paintKeypressOverlay(Gdiplus::Graphics& g, int w, int h,
+                                       const Profile& profile, const EngineTelemetry& tel) {
+    std::vector<std::string> chips;
+    if (tel.joyDown) chips.push_back("WASD");
+    if (tel.fireHeld) chips.push_back("FIRE");
+    if (tel.scopeActive) chips.push_back("SCOPE");
+    if (tel.holdViewActive) chips.push_back("LOOK");
+    for (size_t i = 0; i < profile.buttons.size() && i < 64 && chips.size() < 8; ++i) {
+        if ((tel.activeButtonMask & (1ULL << i)) != 0) {
+            std::string lbl = shortKeyLabel(profile.buttons[i].comboVk, profile.buttons[i].vk);
+            if (!lbl.empty()) chips.push_back(lbl);
+        }
+    }
+    if (chips.empty()) return;
+
+    float x = 14.0f;
+    float y = static_cast<float>(h) - 44.0f;
+    if (y < 14.0f) y = 14.0f;
+    for (size_t i = 0; i < chips.size(); ++i) {
+        float cw = 22.0f + static_cast<float>(chips[i].size()) * 7.2f;
+        if (cw < 36.0f) cw = 36.0f;
+        if (x + cw > static_cast<float>(w - 14)) break;
+        drawFrostedCap(g, x + cw * 0.5f, y + 13.0f, cw, 26.0f, 8.0f,
+                       0xC8101824u, Theme::ACCENT_CYAN, 1.2f);
+        drawSubtleText(g, chips[i], x + cw * 0.5f, y + 13.0f, 10.5f, true, Theme::TEXT_PRIMARY);
+        x += cw + 6.0f;
+    }
+}

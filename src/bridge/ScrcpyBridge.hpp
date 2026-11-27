@@ -133,6 +133,7 @@ struct BridgeStreamConfig {
     std::string videoCodecOptions;  // LATENCY 2.2: MediaCodec key=val pairs
     std::string videoEncoder;       // LATENCY 2.3: preferred HW H.264 encoder name
     std::string audioCodec;         // F7: "raw" (USB) or "aac" (Wi-Fi); empty = auto from serial
+    bool showTouches = false;       // F13: scrcpy show_touches=true (restored on exit by cleanup=true)
 };
 
 class ScrcpyBridge {
@@ -174,6 +175,13 @@ public:
     static size_t serializeScanFile(uint8_t* buf, size_t cap, const std::string& remotePathUtf8);
     static std::string shellSingleQuote(const std::string& raw);
     static std::vector<RemoteFileEntry> parseLsLaOutput(const std::string& raw, const std::string& baseDir);
+    static size_t serializeBackOrScreenOn(uint8_t* buf, size_t cap, uint8_t action);
+    static size_t serializeExpandNotificationPanel(uint8_t* buf, size_t cap);
+    static size_t serializeExpandSettingsPanel(uint8_t* buf, size_t cap);
+    static size_t serializeCollapsePanels(uint8_t* buf, size_t cap);
+    static size_t serializeRotateDevice(uint8_t* buf, size_t cap);
+    static size_t serializeResetVideo(uint8_t* buf, size_t cap);
+    static std::string buildShowTouchesServerArg(bool showTouches, bool cleanupEnabled);
 
     bool listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial, std::vector<VideoEncoderInfo>& outEncoders);
     bool listInstalledApps(const ToolPaths& tools, const std::string& deviceSerial, std::vector<DeviceAppInfo>& outApps);
@@ -215,6 +223,13 @@ public:
     bool sendResetVideo();
     bool sendResizeDisplay(uint16_t width, uint16_t height);
     bool sendScanFile(const std::string& remotePathUtf8);
+    bool sendBackOrScreenOn();
+    bool sendExpandNotificationPanel();
+    bool sendExpandSettingsPanel();
+    bool sendCollapsePanels();
+    bool sendRotateDevice();
+    bool sendPowerButton();
+    bool sendVolumeMute();
     bool sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,
                         const std::string& name, const uint8_t* reportDesc, uint16_t reportDescSize);
     bool sendUhidInput(uint16_t id, const uint8_t* data, uint16_t size);

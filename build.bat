@@ -44,6 +44,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\video\H264Decoder.cpp ^
     src\video\D3D11Renderer.cpp ^
     src\video\LatencyTelemetry.cpp ^
+    src\video\Recorder.cpp ^
     src\config\KeyCodes.cpp ^
     src\config\Profile.cpp ^
     src\config\ProfileStore.cpp ^
@@ -72,7 +73,7 @@ if %ERRORLEVEL% NEQ 0 (
     resources\phantom_touch.res ^
     -o PhantomTouch.exe ^
     -static ^
-    -ld3d11 -ldxgi -lmfplat -lmfuuid -lgdiplus -lcomdlg32 -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -limm32 -lgdi32 -luser32
+    -ld3d11 -ldxgi -lmfplat -lmfreadwrite -lmfuuid -lgdiplus -lcomdlg32 -lole32 -loleaut32 -luuid -lshell32 -lws2_32 -lwinmm -limm32 -lgdi32 -luser32
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

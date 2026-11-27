@@ -445,11 +445,13 @@ LRESULT InputHookThread::handleKeyHook(int nCode, WPARAM wParam, LPARAM lParam) 
         return CallNextHookEx(keyHook_, nCode, wParam, lParam);
     }
 
-    // Sprint 1 diagnostic hotkeys (Ctrl+Shift+D/L/T) always available in foreground
+    // Sprint 1 & Sprint 6 global hotkeys (Ctrl+Shift+D/L/T/R/S) always available in foreground
     if (down && !isRepeat && ctrlDown && shiftDown && !altDown && s.shellHwnd) {
         if (vk == 'D') { PostMessageW(s.shellHwnd, MSG_TOGGLE_DEBUG_HUD, 0, 0); return 1; }
         if (vk == 'L') { PostMessageW(s.shellHwnd, MSG_RUN_LATENCY_PROBE, 0, 0); return 1; }
         if (vk == 'T') { PostMessageW(s.shellHwnd, MSG_INJECT_VIDEO_STALL, 0, 0); return 1; }
+        if (vk == 'R') { PostMessageW(s.shellHwnd, MSG_TOGGLE_RECORD, 0, 0); return 1; }
+        if (vk == 'S') { PostMessageW(s.shellHwnd, MSG_SAVE_REPLAY, 0, 0); return 1; }
     }
 
     if (!s.connected && !s.demoMode) {

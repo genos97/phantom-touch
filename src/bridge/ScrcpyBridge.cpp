@@ -1365,7 +1365,8 @@ bool ScrcpyBridge::connectSession(const ToolPaths& tools, const BridgeStreamConf
                          " clipboard_autosync=" + std::string(cfg.clipboardAutosync ? "true" : "false") +
                          " power_on=true"
                          " stay_awake=" + std::string(cfg.stayAwake ? "true" : "false") +
-                         " cleanup=true";
+                         " cleanup=true" +
+                         buildShowTouchesServerArg(cfg.showTouches, true);
     if (cfg.maxSize > 0) {
         char szBuf[32];
         std::snprintf(szBuf, sizeof(szBuf), " max_size=%d", cfg.maxSize);
@@ -1837,6 +1838,99 @@ bool ScrcpyBridge::sendScanFile(const std::string& remotePathUtf8) {
     if (len == 0) return false;
     msg.resize(len);
     return enqueueControlPacket(std::move(msg), false);
+}
+
+size_t ScrcpyBridge::serializeBackOrScreenOn(uint8_t* buf, size_t cap, uint8_t action) {
+    if (!buf || cap < 2) return 0;
+    buf[0] = 4; // SC_CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON
+    buf[1] = action;
+    return 2;
+}
+
+size_t ScrcpyBridge::serializeExpandNotificationPanel(uint8_t* buf, size_t cap) {
+    if (!buf || cap < 1) return 0;
+    buf[0] = 5; // SC_CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL
+    return 1;
+}
+
+size_t ScrcpyBridge::serializeExpandSettingsPanel(uint8_t* buf, size_t cap) {
+    if (!buf || cap < 1) return 0;
+    buf[0] = 6; // SC_CONTROL_MSG_TYPE_EXPAND_SETTINGS_PANEL
+    return 1;
+}
+
+size_t ScrcpyBridge::serializeCollapsePanels(uint8_t* buf, size_t cap) {
+    if (!buf || cap < 1) return 0;
+    buf[0] = 7; // SC_CONTROL_MSG_TYPE_COLLAPSE_PANELS
+    return 1;
+}
+
+size_t ScrcpyBridge::serializeRotateDevice(uint8_t* buf, size_t cap) {
+    if (!buf || cap < 1) return 0;
+    buf[0] = 11; // SC_CONTROL_MSG_TYPE_ROTATE_DEVICE
+    return 1;
+}
+
+size_t ScrcpyBridge::serializeResetVideo(uint8_t* buf, size_t cap) {
+    if (!buf || cap < 1) return 0;
+    buf[0] = 17; // SC_CONTROL_MSG_TYPE_RESET_VIDEO
+    return 1;
+}
+
+std::string ScrcpyBridge::buildShowTouchesServerArg(bool showTouches, bool cleanupEnabled) {
+    // LATENCY B1: never leave show_touches enabled on the phone without server cleanup=true
+    if (!showTouches || !cleanupEnabled) return "";
+    return " show_touches=true";
+}
+
+bool ScrcpyBridge::sendBackOrScreenOn() {
+    if (!connected_) return false;
+    std::vector<uint8_t> dn(2), up(2);
+    serializeBackOrScreenOn(dn.data(), dn.size(), 0);
+    serializeBackOrScreenOn(up.data(), up.size(), 1);
+    bool a = enqueueControlPacket(std::move(dn), true);
+    bool b = enqueueControlPacket(std::move(up), true);
+    return a && b;
+}
+
+bool ScrcpyBridge::sendExpandNotificationPanel() {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(1);
+    serializeExpandNotificationPanel(msg.data(), msg.size());
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendExpandSettingsPanel() {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(1);
+    serializeExpandSettingsPanel(msg.data(), msg.size());
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendCollapsePanels() {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(1);
+    serializeCollapsePanels(msg.data(), msg.size());
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendRotateDevice() {
+    if (!connected_) return false;
+    std::vector<uint8_t> msg(1);
+    serializeRotateDevice(msg.data(), msg.size());
+    return enqueueControlPacket(std::move(msg), true);
+}
+
+bool ScrcpyBridge::sendPowerButton() {
+    if (!connected_) return false;
+    sendAndroidNav(26); // AKEYCODE_POWER
+    return true;
+}
+
+bool ScrcpyBridge::sendVolumeMute() {
+    if (!connected_) return false;
+    sendAndroidNav(164); // AKEYCODE_VOLUME_MUTE
+    return true;
 }
 
 bool ScrcpyBridge::sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,

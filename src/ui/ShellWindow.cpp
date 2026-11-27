@@ -203,6 +203,8 @@ ShellWindow::ShellWindow(ScrcpyBridge* bridge, InputEngine* engine,
     initCommandPalette();
     bridge_->setClipboardCallback(ShellWindow::onDeviceClipboard, this);
     bridge_->setConnectStepCallback(ShellWindow::onConnectStep, this);
+    recorder_.setDoneCallback(ShellWindow::onRecorderDone, this);
+    recorder_.setReplayEnabled(settings_.replayBufferEnabled, static_cast<uint32_t>(settings_.replayBufferSec));
 }
 
 ShellWindow::~ShellWindow() {
@@ -216,6 +218,8 @@ ShellWindow::~ShellWindow() {
         asyncCtx_->hwnd = NULL;
         LeaveCriticalSection(&asyncCtx_->lock);
     }
+    closeCleanFeedWindow();
+    recorder_.resetSession();
     tooltipPopup_.destroy();
     modalPopup_.destroy();
     if (clipboardListenerActive_ && hwnd_ && IsWindow(hwnd_)) {
@@ -945,6 +949,10 @@ void ShellWindow::onVideoPacket(void* ctx, const uint8_t* data, size_t size,
     ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
     if (!self || !self->nativeVideoSession_ || !data || size == 0) return;
 
+    // F12 zero-reencode MP4 / instant replay packet tap (<5us copy under lock; 0 disk/MF work here)
+    self->recorder_.onVideoPacket(data, size, ptsUs, isConfig, isKeyFrame,
+                                  self->lastPhoneW_, self->lastPhoneH_);
+
     if (InterlockedCompareExchange(&self->reinitDecoderFlag_, 0, 1) == 1) {
         self->h264Decoder_.shutdown();
     }
@@ -1040,6 +1048,7 @@ void ShellWindow::onAudioPacket(void* ctx, AudioCodecId codec,
         }
     }
     self->audioPlayer_.onAudioPacket(codec, data, size, ptsUs, isConfig);
+    self->recorder_.onAudioPacket(codec, data, size, ptsUs, isConfig);
 }
 
 void ShellWindow::onHudBitmapReady(void* ctx, const void* bgraPremulPixels, int w, int h) {
@@ -1145,7 +1154,9 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
         cfg.videoCodecOptions = self->settings_.videoCodecOptions;
         cfg.videoEncoder = chosenEnc;
+        cfg.showTouches = self->settings_.streamerShowTouches;
         self->clipGuard_.reset();
+        self->recorder_.resetSession();
 
         ok = self->bridge_->connectSession(self->tools_, cfg, err, job->arg);
         if (ok) {
@@ -1548,8 +1559,11 @@ DWORD WINAPI ShellWindow::screenshotThreadProc(LPVOID param) {
     return 0;
 }
 
-void ShellWindow::takeScreenshot() {
-    if (!bridge_->isConnected()) return;
+void ShellWindow::takeScreenshot(bool toClipboardToo) {
+    if (!bridge_->isConnected() && !viewportHost_.isNativeVideoActive()) {
+        showToast("Connect your phone before capturing screenshot", 2000);
+        return;
+    }
     std::string dir = exeDir_ + "\\screenshots";
     CreateDirectoryA(dir.c_str(), NULL);
     std::time_t now = std::time(NULL);
@@ -1561,12 +1575,249 @@ void ShellWindow::takeScreenshot() {
     std::string fullPath = dir + "\\" + fname;
 
     // N36: offload GPU readback + PNG encoding / adb screencap to worker thread!
-    showToast("Saving screenshot...", 1200);
+    showToast(toClipboardToo ? "Saving screenshot & copying..." : "Saving screenshot...", 1200);
     asyncCtx_->addRef();
     HANDLE hShot = CreateThread(NULL, 0, screenshotThreadProc,
-                                new SimpleAsyncJob{ this, asyncCtx_, fullPath, 0 }, 0, NULL);
+                                new SimpleAsyncJob{ this, asyncCtx_, fullPath, toClipboardToo ? 1 : 0 }, 0, NULL);
     if (hShot) CloseHandle(hShot);
     else asyncCtx_->release();
+}
+
+void ShellWindow::onRecorderDone(void* ctx, const RecordingResult& result) {
+    ShellWindow* self = reinterpret_cast<ShellWindow*>(ctx);
+    if (!self || !self->asyncCtx_) return;
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingRecResults_.push_back(result);
+    LeaveCriticalSection(&self->auxLock_);
+    self->asyncCtx_->postMsg(MSG_RECORDING_DONE, 0, 0);
+}
+
+void ShellWindow::toggleRecording() {
+    if (recorder_.isRecording()) {
+        recorder_.stopRecording();
+        showToast("Finalizing MP4 recording...", 1600, TOAST_INFO);
+        invalidateShell();
+        return;
+    }
+    if (!bridge_->isConnected() || !nativeVideoSession_) {
+        showToast("Connect phone in Native D3D11 mode to record MP4", 2200);
+        return;
+    }
+    std::string dir = exeDir_ + "\\recordings";
+    CreateDirectoryA(dir.c_str(), NULL);
+    std::time_t now = std::time(NULL);
+    std::tm* tmv = std::localtime(&now);
+    char fname[72];
+    std::snprintf(fname, sizeof(fname), "rec_%04d%02d%02d_%02d%02d%02d.mp4",
+                  tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
+                  tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+    std::string outPath = dir + "\\" + fname;
+    std::string err;
+    uint32_t pw = lastPhoneW_, ph = lastPhoneH_;
+    bridge_->getScreenSize(pw, ph);
+    if (!recorder_.startRecording(outPath, pw, ph, err)) {
+        showToast("Record failed: " + err, 2600, TOAST_ERROR);
+        return;
+    }
+    // F12: request immediate IDR keyframe so recording starts cleanly at t=0
+    bridge_->sendResetVideo();
+    showToast("Recording MP4 (Ctrl+Shift+R to stop)...", 2000, TOAST_INFO);
+    lastTopBarSig_.valid = false;
+    invalidateShell();
+}
+
+void ShellWindow::saveReplayClip() {
+    if (!bridge_->isConnected() || !nativeVideoSession_) {
+        showToast("Connect phone in Native D3D11 mode to save replay", 2200);
+        return;
+    }
+    if (!settings_.replayBufferEnabled) {
+        showToast("Instant Replay ring buffer is OFF (enable in DEV tab)", 2200);
+        return;
+    }
+    std::string dir = exeDir_ + "\\recordings";
+    CreateDirectoryA(dir.c_str(), NULL);
+    std::time_t now = std::time(NULL);
+    std::tm* tmv = std::localtime(&now);
+    char fname[72];
+    std::snprintf(fname, sizeof(fname), "replay_%04d%02d%02d_%02d%02d%02d.mp4",
+                  tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
+                  tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+    std::string outPath = dir + "\\" + fname;
+    std::string err;
+    if (!recorder_.saveReplayAsync(outPath, err)) {
+        showToast("Replay unavailable: " + err, 2400, TOAST_WARNING);
+        return;
+    }
+    showToast("Saving instant replay clip...", 1600, TOAST_INFO);
+}
+
+LRESULT CALLBACK ShellWindow::cleanFeedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    ShellWindow* self = nullptr;
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        self = reinterpret_cast<ShellWindow*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    } else {
+        self = reinterpret_cast<ShellWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+    if (self) {
+        switch (msg) {
+            case WM_NCCALCSIZE:
+                if (wParam) return 0; // Borderless clean video frame (F13)
+                break;
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_NCHITTEST: {
+                LRESULT hit = DefWindowProcW(hwnd, msg, wParam, lParam);
+                if (hit != HTCLIENT) return hit;
+                POINT pt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                const int b = 6;
+                bool l = pt.x < wr.left + b;
+                bool r = pt.x >= wr.right - b;
+                bool t = pt.y < wr.top + b;
+                bool bt = pt.y >= wr.bottom - b;
+                if (t && l) return HTTOPLEFT;
+                if (t && r) return HTTOPRIGHT;
+                if (bt && l) return HTBOTTOMLEFT;
+                if (bt && r) return HTBOTTOMRIGHT;
+                if (l) return HTLEFT;
+                if (r) return HTRIGHT;
+                if (t) return HTTOP;
+                if (bt) return HTBOTTOM;
+                return HTCAPTION;
+            }
+            case WM_SIZE: {
+                int w = LOWORD(lParam);
+                int h = HIWORD(lParam);
+                if (w >= 8 && h >= 8) {
+                    self->viewportHost_.resizeCleanFeed(w, h);
+                }
+                return 0;
+            }
+            case WM_CLOSE:
+                self->closeCleanFeedWindow();
+                return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool ShellWindow::toggleCleanFeedWindow() {
+    if (cleanFeedHwnd_ && IsWindow(cleanFeedHwnd_)) {
+        closeCleanFeedWindow();
+        showToast("OBS Clean Feed Window closed", 1600, TOAST_INFO);
+        return false;
+    }
+    static bool sRegCf = false;
+    if (!sRegCf) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = ShellWindow::cleanFeedWndProc;
+        wc.hInstance = hInst_;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        wc.lpszClassName = L"PhantomTouchCleanFeedClass";
+        if (!RegisterClassExW(&wc)) return false;
+        sRegCf = true;
+    }
+    int cw = 1280, ch = 720;
+    if (lastPhoneW_ >= 16 && lastPhoneH_ >= 16) {
+        if (lastPhoneH_ > lastPhoneW_) {
+            ch = 960;
+            cw = static_cast<int>((static_cast<double>(ch) * lastPhoneW_) / lastPhoneH_ + 0.5);
+        } else {
+            cw = 1280;
+            ch = static_cast<int>((static_cast<double>(cw) * lastPhoneH_) / lastPhoneW_ + 0.5);
+        }
+    }
+    if (cw < 320) cw = 320;
+    if (ch < 240) ch = 240;
+
+    HWND cf = CreateWindowExW(WS_EX_APPWINDOW,
+                              L"PhantomTouchCleanFeedClass",
+                              L"Phantom Touch — Clean Feed",
+                              WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_SYSMENU,
+                              CW_USEDEFAULT, CW_USEDEFAULT, cw, ch,
+                              NULL, NULL, hInst_, this);
+    if (!cf) return false;
+    cleanFeedHwnd_ = cf;
+    ShowWindow(cf, SW_SHOWNA);
+    UpdateWindow(cf);
+
+    RECT cr;
+    GetClientRect(cf, &cr);
+    viewportHost_.attachCleanFeed(cf, cr.right - cr.left, cr.bottom - cr.top);
+    lastTopBarSig_.valid = false;
+    invalidateShell();
+    showToast("OBS Clean Feed Window opened (capture 'Phantom Touch — Clean Feed')", 2600, TOAST_SUCCESS);
+    return true;
+}
+
+void ShellWindow::closeCleanFeedWindow() {
+    viewportHost_.detachCleanFeed();
+    if (cleanFeedHwnd_ && IsWindow(cleanFeedHwnd_)) {
+        HWND tmp = cleanFeedHwnd_;
+        cleanFeedHwnd_ = NULL;
+        DestroyWindow(tmp);
+    } else {
+        cleanFeedHwnd_ = NULL;
+    }
+    lastTopBarSig_.valid = false;
+}
+
+void ShellWindow::executeDeviceControl(int actionCode) {
+    if (!bridge_->isConnected()) {
+        showToast("Connect phone first to use device controls", 1800);
+        return;
+    }
+    switch (actionCode) {
+        case 1:
+            bridge_->sendRotateDevice();
+            showToast("Rotate Device", 1200, TOAST_INFO);
+            break;
+        case 2:
+            bridge_->sendExpandNotificationPanel();
+            showToast("Notification Shade", 1200, TOAST_INFO);
+            break;
+        case 3:
+            bridge_->sendExpandSettingsPanel();
+            showToast("Quick Settings Panel", 1200, TOAST_INFO);
+            break;
+        case 4:
+            bridge_->sendCollapsePanels();
+            showToast("Panels Collapsed", 1200, TOAST_INFO);
+            break;
+        case 5:
+            bridge_->sendBackOrScreenOn();
+            showToast("Back / Wake Screen", 1200, TOAST_INFO);
+            break;
+        case 6:
+            bridge_->sendPowerButton();
+            showToast("Power Button", 1200, TOAST_INFO);
+            break;
+        case 7:
+            bridge_->sendAndroidNav(25);
+            showToast("Volume Down", 1000, TOAST_INFO);
+            break;
+        case 8:
+            bridge_->sendAndroidNav(24);
+            showToast("Volume Up", 1000, TOAST_INFO);
+            break;
+        case 9:
+            bridge_->sendVolumeMute();
+            showToast("Volume Mute Toggle", 1200, TOAST_INFO);
+            break;
+        case 10:
+            takeScreenshot(true);
+            break;
+        default:
+            break;
+    }
 }
 
 DWORD WINAPI ShellWindow::probeThreadProc(LPVOID param) {
@@ -2972,6 +3223,26 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         drawerPanel_.setEditTestLive(editTestLive_);
         showToast(editTestLive_ ? "Live Test active — play directly on phone!" : "Resumed Keymap Edit Mode", 1800);
     }
+    if (res.replayConfigChanged) {
+        recorder_.setReplayEnabled(settings_.replayBufferEnabled, static_cast<uint32_t>(settings_.replayBufferSec));
+    }
+    if (res.streamerModeChanged) {
+        lastHudSig_.valid = false;
+        lastTopBarSig_.valid = false;
+        hudOverlay_.invalidate();
+    }
+    if (res.requestToggleRecord) {
+        toggleRecording();
+    }
+    if (res.requestSaveReplay) {
+        saveReplayClip();
+    }
+    if (res.requestToggleCleanFeed) {
+        toggleCleanFeedWindow();
+    }
+    if (res.requestDeviceControl > 0) {
+        executeDeviceControl(res.requestDeviceControl);
+    }
     if (res.requestCreateTemplate) {
         Profile np = ProfileDefaults::createTemplate(static_cast<ProfileTemplateKind>(res.templateKind));
         std::string fname;
@@ -3675,6 +3946,48 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             invalidateShell();
             return 0;
         }
+        case MSG_TOGGLE_RECORD: {
+            toggleRecording();
+            return 0;
+        }
+        case MSG_SAVE_REPLAY: {
+            saveReplayClip();
+            return 0;
+        }
+        case MSG_RECORDING_DONE: {
+            std::vector<RecordingResult> doneList;
+            EnterCriticalSection(&auxLock_);
+            doneList.swap(pendingRecResults_);
+            LeaveCriticalSection(&auxLock_);
+            for (size_t i = 0; i < doneList.size(); ++i) {
+                const RecordingResult& rr = doneList[i];
+                if (recordTestStage_ > 0) {
+                    if (rr.isReplay) {
+                        recordTestReplayRes_ = rr;
+                        recordTestHasReplay_ = true;
+                    } else {
+                        recordTestLiveRes_ = rr;
+                        recordTestHasLive_ = true;
+                    }
+                }
+                if (rr.ok) {
+                    size_t sl = rr.outputPath.find_last_of("\\/");
+                    std::string base = (sl == std::string::npos) ? rr.outputPath : rr.outputPath.substr(sl + 1);
+                    char msgBuf[200];
+                    std::snprintf(msgBuf, sizeof(msgBuf), "%s %s (%.1fs%s%s)",
+                                  rr.isReplay ? "Replay saved:" : "Recorded:",
+                                  base.c_str(), rr.durationSec,
+                                  rr.hasAudio ? " +audio" : "",
+                                  rr.usedH264Fallback ? " [H.264 fallback]" : "");
+                    showToast(msgBuf, 3200, TOAST_SUCCESS);
+                } else if (!rr.error.empty()) {
+                    showToast((rr.isReplay ? "Replay failed: " : "Recording failed: ") + rr.error, 3000, TOAST_ERROR);
+                }
+            }
+            lastTopBarSig_.valid = false;
+            invalidateShell();
+            return 0;
+        }
         case MSG_THERMAL_UPDATE: {
             if (drawerOpen_ && drawerPanel_.activeTab() == 3) {
                 InvalidateRect(hwnd, &drawerRc_, FALSE);
@@ -3764,6 +4077,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     if (autoProbeOnConnect_ && probeRunCount_ == 0) {
                         autoProbeArmed_ = true;
                         autoProbeDueTick_ = GetTickCount() + 2000;
+                    }
+                    if (recordTestSec_ > 0 && recordTestStage_ == 0) {
+                        recordTestArmed_ = true;
+                        recordTestDueTick_ = GetTickCount() + 1500;
                     }
                 } else {
                     bridge_->appendLog("[D3D11] Fallback to scrcpy.exe: " + d3dErr);
@@ -4105,13 +4422,78 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     ++probeRunCount_;
                     startRoundTripProbe(autoProbeSamples_);
                 }
+                // Automated Sprint 6A live Creator verification (--record-test=<sec>)
+                if (recordTestArmed_ && recordTestStage_ == 0 && static_cast<LONG>(nowTick - recordTestDueTick_) >= 0 &&
+                    bridge_->isConnected() && viewportHost_.hasNativeVideoFrame()) {
+                    recordTestArmed_ = false;
+                    recordTestStage_ = 1;
+                    toggleCleanFeedWindow();
+                    std::string rdir = exeDir_ + "\\recordings";
+                    CreateDirectoryA(rdir.c_str(), NULL);
+                    std::string err;
+                    uint32_t pw = lastPhoneW_, ph = lastPhoneH_;
+                    bridge_->getScreenSize(pw, ph);
+                    if (recorder_.startRecording(rdir + "\\_test_rec.mp4", pw, ph, err)) {
+                        bridge_->sendResetVideo();
+                    }
+                    recordTestStopTick_ = nowTick + static_cast<DWORD>(recordTestSec_ * 1000);
+                } else if (recordTestStage_ == 1 && static_cast<LONG>(nowTick - recordTestStopTick_) >= 0) {
+                    recordTestStage_ = 2;
+                    recorder_.stopRecording();
+                    std::string rdir = exeDir_ + "\\recordings";
+                    std::string repErr;
+                    if (!recorder_.saveReplayAsync(rdir + "\\_test_replay.mp4", repErr)) {
+                        recordTestReplayRes_.ok = false;
+                        recordTestReplayRes_.error = repErr;
+                        recordTestHasReplay_ = true;
+                    }
+                } else if (recordTestStage_ == 2 && recordTestHasLive_ && recordTestHasReplay_) {
+                    recordTestStage_ = 3;
+                    bool cfActive = viewportHost_.isCleanFeedActive();
+                    bool recPlay = false, recVid = false, recAud = false;
+                    uint64_t recDur = 0;
+                    uint32_t recSamples = 0;
+                    if (recordTestLiveRes_.ok && !recordTestLiveRes_.usedH264Fallback) {
+                        recPlay = Recorder::verifyMp4Playable(recordTestLiveRes_.outputPath, recVid, recAud, recDur, &recSamples);
+                    }
+                    bool repPlay = false, repVid = false, repAud = false;
+                    uint64_t repDur = 0;
+                    uint32_t repSamples = 0;
+                    if (recordTestReplayRes_.ok && !recordTestReplayRes_.usedH264Fallback) {
+                        repPlay = Recorder::verifyMp4Playable(recordTestReplayRes_.outputPath, repVid, repAud, repDur, &repSamples);
+                    }
+                    char rtBuf[768];
+                    std::snprintf(rtBuf, sizeof(rtBuf),
+                                  "[RecordTest] recOk=%d recPlay=%d(v=%u,a=%d,smp=%u,fb=%d,vf=%u,ap=%u,dur=%.2fs,err='%s') | "
+                                  "repOk=%d repPlay=%d(v=%u,a=%d,smp=%u,fb=%d,vf=%u,ap=%u,dur=%.2fs,err='%s') | cleanFeed=%d | UI max=%.2fms stalls=%u | pres=%s",
+                                  recordTestLiveRes_.ok ? 1 : 0, recPlay ? 1 : 0, recVid ? 1 : 0, recAud ? 1 : 0, recSamples,
+                                  recordTestLiveRes_.usedH264Fallback ? 1 : 0, recordTestLiveRes_.videoFramesWritten,
+                                  recordTestLiveRes_.audioPacketsWritten, recordTestLiveRes_.durationSec,
+                                  recordTestLiveRes_.error.c_str(),
+                                  recordTestReplayRes_.ok ? 1 : 0, repPlay ? 1 : 0, repVid ? 1 : 0, repAud ? 1 : 0, repSamples,
+                                  recordTestReplayRes_.usedH264Fallback ? 1 : 0, recordTestReplayRes_.videoFramesWritten,
+                                  recordTestReplayRes_.audioPacketsWritten, recordTestReplayRes_.durationSec,
+                                  recordTestReplayRes_.error.c_str(),
+                                  cfActive ? 1 : 0, maxUiMsgMs_, uiStallCount_,
+                                  viewportHost_.presentationModeLabel().c_str());
+                    std::ofstream lf((exeDir_ + "\\latency_probe.log").c_str(), std::ios::app);
+                    if (lf.is_open()) lf << rtBuf << "\n";
+                    if (!recordTestLiveRes_.outputPath.empty()) DeleteFileW(utf8ToWide(recordTestLiveRes_.outputPath).c_str());
+                    if (!recordTestReplayRes_.outputPath.empty()) DeleteFileW(utf8ToWide(recordTestReplayRes_.outputPath).c_str());
+                    DeleteFileW(utf8ToWide(exeDir_ + "\\recordings\\_test_rec.mp4").c_str());
+                    DeleteFileW(utf8ToWide(exeDir_ + "\\recordings\\_test_rec.h264").c_str());
+                    DeleteFileW(utf8ToWide(exeDir_ + "\\recordings\\_test_replay.mp4").c_str());
+                    DeleteFileW(utf8ToWide(exeDir_ + "\\recordings\\_test_replay.h264").c_str());
+                    closeCleanFeedWindow();
+                    PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+                }
                 bool connected = bridge_->isConnected();
                 if (viewportHost_.isNativeVideoActive()) {
                     EngineTelemetry tel = engine_->getTelemetry();
                     DynamicHudMarkers dm;
-                    dm.active = (!editMode_ && !showOnboarding_ && profile_.keymapEnabled &&
+                    dm.active = (!editMode_ && !showOnboarding_ && !settings_.streamerMode && profile_.keymapEnabled &&
                                  (profile_.showHudInPlay || demoMode_));
-                    dm.showCrosshair = (aimMode_ && profile_.showHudInPlay);
+                    dm.showCrosshair = (aimMode_ && profile_.showHudInPlay && !settings_.streamerMode);
                     dm.aimFingerDown = tel.aimFingerDown;
                     dm.aimX = tel.aimFingerNormX;
                     dm.aimY = tel.aimFingerNormY;
@@ -4130,8 +4512,9 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     if (!editMode_ && (connected || demoMode_)) {
                         // Dirty-check visual HUD state: ZERO GDI+ bitmap redraws when nothing changed!
                         // S5: Moving aim/joystick markers are rendered by D3D11 Pass 3 when native video is active.
-                        bool hudUsesTelemetry = profile_.keymapEnabled &&
-                                                (profile_.showHudInPlay || demoMode_ || (fullscreen_ && !aimMode_));
+                        bool hudUsesTelemetry = (profile_.keymapEnabled &&
+                                                (profile_.showHudInPlay || demoMode_ || (fullscreen_ && !aimMode_))) ||
+                                                settings_.streamerKeypressOverlay;
                         if (hudUsesTelemetry) {
                             EngineTelemetry tel = engine_->getTelemetry();
                             bool nativeVid = viewportHost_.isNativeVideoActive();
@@ -4188,6 +4571,10 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     cur.latP50Q10 = static_cast<int>(vsum.rxToPresentP50Ms * 10.0 + 0.5);
                     cur.latP95Q10 = static_cast<int>(vsum.rxToPresentP95Ms * 10.0 + 0.5);
                     cur.skipped = vsum.skippedCount;
+                    cur.recording = recorder_.isRecording();
+                    cur.recSec = cur.recording ? static_cast<int>(recorder_.recordingElapsedSec()) : 0;
+                    cur.cleanFeed = (cleanFeedHwnd_ != NULL && IsWindow(cleanFeedHwnd_));
+                    cur.streamerMode = settings_.streamerMode;
 
                     bool tbChanged = !lastTopBarSig_.valid ||
                         cur.connected != lastTopBarSig_.connected ||
@@ -4199,7 +4586,11 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         cur.touchRateHz != lastTopBarSig_.touchRateHz ||
                         cur.latP50Q10 != lastTopBarSig_.latP50Q10 ||
                         cur.latP95Q10 != lastTopBarSig_.latP95Q10 ||
-                        cur.skipped != lastTopBarSig_.skipped;
+                        cur.skipped != lastTopBarSig_.skipped ||
+                        cur.recording != lastTopBarSig_.recording ||
+                        cur.recSec != lastTopBarSig_.recSec ||
+                        cur.cleanFeed != lastTopBarSig_.cleanFeed ||
+                        cur.streamerMode != lastTopBarSig_.streamerMode;
                     if (tbChanged) {
                         lastTopBarSig_ = cur;
                         InvalidateRect(hwnd, &topBarRc_, FALSE);
@@ -4711,6 +5102,8 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 LeaveCriticalSection(&asyncCtx_->lock);
             }
             flushOnExit();
+            closeCleanFeedWindow();
+            recorder_.resetSession();
             setAimMode(false);
             viewportHost_.detachMirror();
             tooltipPopup_.destroy();
@@ -5044,6 +5437,10 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                 else if (demoMode_) tbConn = TB_CONN_DEMO;
                 else if (reconnecting_) tbConn = TB_CONN_RECONNECTING;
                 else if (!lastConnectError_.empty()) tbConn = TB_CONN_LOST;
+                topBar_.setCreatorStatus(recorder_.isRecording(),
+                                         static_cast<int>(recorder_.recordingElapsedSec()),
+                                         (cleanFeedHwnd_ != NULL && IsWindow(cleanFeedHwnd_)),
+                                         settings_.streamerMode);
                 topBar_.paint(g, topBarRc_, devLabel, connected, demoMode_,
                               profile_, tel, settings_.alwaysOnTop,
                               (IsZoomed(hwnd_) != FALSE), hoverX_, hoverY_, vidTel, tbConn);
@@ -5081,6 +5478,10 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
                     pendingCnt = AppSettings::countPendingStreamChanges(settings_, appliedStreamSettings_, bridge_->activeSerial());
                 }
                 drawerPanel_.setPendingStreamChangeCount(pendingCnt);
+                drawerPanel_.setCreatorState(recorder_.isRecording(),
+                                             static_cast<int>(recorder_.recordingElapsedSec()),
+                                             (cleanFeedHwnd_ != NULL && IsWindow(cleanFeedHwnd_)),
+                                             recorder_.bufferedReplaySec());
                 int slideDx = animator_.isActive(ANIM_DRAWER_SLIDE)
                     ? static_cast<int>(animator_.value(ANIM_DRAWER_SLIDE, 0.0f) + 0.5f) : 0;
                 std::vector<std::string> logs = bridge_->getRecentLogs();
@@ -5339,6 +5740,14 @@ void ShellWindow::initCommandPalette() {
     addCmd("diag.debug",      "Toggle Latency & UI Debug Strip",   "debug overlay stats s6",       "Ctrl+Shift+D","Debug");
     addCmd("diag.probe",      "Run Round-Trip Latency Probe",      "probe latency benchmark",      "Ctrl+Shift+L","Debug");
     addCmd("app.screenshot",  "Capture Phone Screenshot",          "screenshot png camera",        "",            "Device");
+    addCmd("rec.toggle",      "Start / Stop MP4 Recording",        "record video mp4 h264 clip",   "Ctrl+Shift+R","Creator");
+    addCmd("rec.replay",      "Save Instant Replay Clip",          "replay highlight save buffer", "Ctrl+Shift+S","Creator");
+    addCmd("streamer.toggle", "Toggle Streamer Mode (Clean View)", "streamer hide hud obs",        "",            "Creator");
+    addCmd("streamer.feed",   "Open / Close OBS Clean Feed Window","obs clean feed capture window","",            "Creator");
+    addCmd("dev.rotate",      "Rotate Phone Orientation",          "rotate landscape portrait",    "",            "Device");
+    addCmd("dev.notifs",      "Open Phone Notifications Shade",    "notification shade pull",      "",            "Device");
+    addCmd("dev.quickset",    "Open Phone Quick Settings",         "quick settings panel",         "",            "Device");
+    addCmd("dev.collapse",    "Collapse Notification Panels",      "collapse close shade",         "",            "Device");
     addCmd("app.reconnect",   "Apply Settings & Reconnect Stream", "reconnect restart stream",     "",            "Device");
     addCmd("app.onboarding",  "Open Setup Guide / Onboarding",     "onboarding guide wizard help", "",            "Help");
 }
@@ -5543,7 +5952,24 @@ void ShellWindow::executeCommandById(const std::string& cmdId) {
         startRoundTripProbe(autoProbeSamples_);
         return;
     }
-    if (cmdId == "app.screenshot") { takeScreenshot(); return; }
+    if (cmdId == "app.screenshot")  { takeScreenshot(true); return; }
+    if (cmdId == "rec.toggle")      { toggleRecording(); return; }
+    if (cmdId == "rec.replay")      { saveReplayClip(); return; }
+    if (cmdId == "streamer.toggle") {
+        settings_.streamerMode = !settings_.streamerMode;
+        scheduleSettingsSave();
+        lastHudSig_.valid = false;
+        lastTopBarSig_.valid = false;
+        hudOverlay_.invalidate();
+        invalidateShell();
+        showToast(settings_.streamerMode ? "Streamer Mode ON" : "Streamer Mode OFF", 1600, TOAST_INFO);
+        return;
+    }
+    if (cmdId == "streamer.feed")   { toggleCleanFeedWindow(); return; }
+    if (cmdId == "dev.rotate")      { executeDeviceControl(1); return; }
+    if (cmdId == "dev.notifs")      { executeDeviceControl(2); return; }
+    if (cmdId == "dev.quickset")    { executeDeviceControl(3); return; }
+    if (cmdId == "dev.collapse")    { executeDeviceControl(4); return; }
     if (cmdId == "app.reconnect") {
         scheduleSettingsSave();
         if (bridge_->isConnected()) startAsyncConnect(bridge_->activeSerial());

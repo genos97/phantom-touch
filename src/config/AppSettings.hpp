@@ -26,6 +26,7 @@ struct LaunchOptions {
     int forceAudioBufferMs = 0;
     std::string profilePath;
     std::string launchAppPackage;
+    int recordTestSec = 0; // F12/F13 automated live MP4 + replay + clean-feed verification
 };
 
 std::string sanitizePackageNameToken(const std::string& raw);
@@ -68,6 +69,13 @@ struct AppSettings {
     std::string lastWirelessAddr = "192.168.1.100:5555";
     std::string lastGameProfile;    // Remembers preferred game profile across Desktop auto-switch & restarts
     std::vector<std::string> pinnedApps; // F8: Pinned Android package names for Apps Launcher
+
+    // F12 / F13 Creator & Streamer settings
+    bool replayBufferEnabled = true;
+    int replayBufferSec = 30;
+    bool streamerMode = false;
+    bool streamerShowTouches = false;
+    bool streamerKeypressOverlay = false;
 
     bool isAppPinned(const std::string& pkg) const;
     void togglePinApp(const std::string& pkg);

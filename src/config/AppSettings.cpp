@@ -171,6 +171,7 @@ int AppSettings::countPendingStreamChanges(const AppSettings& live, const AppSet
     if (live.mirrorAudio && live.audioRawCodec != applied.audioRawCodec) ++count;
     if (live.clipboardSync != applied.clipboardSync) ++count;
     if (live.stayAwake != applied.stayAwake) ++count;
+    if (live.streamerShowTouches != applied.streamerShowTouches) ++count;
     return count;
 }
 
@@ -240,6 +241,9 @@ LaunchOptions parseLaunchOptions(int argc, const char* const* argv) {
         } else if (arg.find("--probe-samples=") == 0) {
             int n = std::atoi(arg.c_str() + 16);
             if (n >= 5 && n <= 200) o.probeSamples = n;
+        } else if (arg.find("--record-test=") == 0) {
+            int rs = std::atoi(arg.c_str() + 14);
+            if (rs >= 2 && rs <= 15) o.recordTestSec = rs;
         } else if (arg.find("--app=") == 0) {
             std::string pkg = sanitizePackageNameToken(arg.substr(6));
             if (!pkg.empty()) o.launchAppPackage = pkg;
@@ -314,6 +318,11 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "last_phone_h") s.lastPhoneH = clampInt(std::atoi(v.c_str()), 320, 4096);
         else if (k == "last_wireless_addr" && !v.empty()) s.lastWirelessAddr = v;
         else if (k == "last_game_profile" && !v.empty()) s.lastGameProfile = v;
+        else if (k == "replay_buffer_enabled") s.replayBufferEnabled = (v == "1");
+        else if (k == "replay_buffer_sec") s.replayBufferSec = clampInt(std::atoi(v.c_str()), 10, 60);
+        else if (k == "streamer_mode") s.streamerMode = (v == "1");
+        else if (k == "streamer_show_touches") s.streamerShowTouches = (v == "1");
+        else if (k == "streamer_keypress_overlay") s.streamerKeypressOverlay = (v == "1");
         else if (k == "pinned_apps" && !v.empty()) {
             s.pinnedApps.clear();
             size_t start = 0;
@@ -380,6 +389,11 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         if (!s.lastGameProfile.empty()) {
             out << "last_game_profile = " << s.lastGameProfile << "\n";
         }
+        out << "replay_buffer_enabled = " << (s.replayBufferEnabled ? 1 : 0) << "\n";
+        out << "replay_buffer_sec = " << clampInt(s.replayBufferSec, 10, 60) << "\n";
+        out << "streamer_mode = " << (s.streamerMode ? 1 : 0) << "\n";
+        out << "streamer_show_touches = " << (s.streamerShowTouches ? 1 : 0) << "\n";
+        out << "streamer_keypress_overlay = " << (s.streamerKeypressOverlay ? 1 : 0) << "\n";
         if (!s.pinnedApps.empty()) {
             out << "pinned_apps = ";
             bool first = true;

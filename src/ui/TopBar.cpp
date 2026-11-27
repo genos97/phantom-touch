@@ -27,6 +27,9 @@ void TopBar::layout(const RECT& bounds,
     showTelPill_ = false;
     ZeroMemory(&rLat_, sizeof(rLat_));
     ZeroMemory(&rTel_, sizeof(rTel_));
+    ZeroMemory(&rRec_, sizeof(rRec_));
+    ZeroMemory(&rObs_, sizeof(rObs_));
+    recTxt_.clear();
 
     const int x0 = bounds.left;
     const int y0 = bounds.top;
@@ -83,8 +86,21 @@ void TopBar::layout(const RECT& bounds,
     buttons_.push_back(Btn{ maxBtnRc_, TB_MAXIMIZE });
     buttons_.push_back(Btn{ rClose_, TB_CLOSE });
 
-    // Live Telemetry Pill + Video Pipeline Latency Pill (0.1 + U4)
+    // Live Telemetry Pill + Video Pipeline Latency Pill (0.1 + U4) + Creator Badges (F12/F13)
     int availRight = rHelp_.left - dp(12);
+    if (recording_ && (availRight - curX) >= dp(320)) {
+        int s = (recElapsedSec_ < 0) ? 0 : recElapsedSec_;
+        char rbuf[32];
+        std::snprintf(rbuf, sizeof(rbuf), "REC %02d:%02d", s / 60, s % 60);
+        recTxt_ = rbuf;
+        rRec_ = { curX, y0 + dp(7), curX + dp(82), y1 - dp(7) };
+        curX = rRec_.right + dp(6);
+    }
+    if ((cleanFeedOpen_ || streamerMode_) && (availRight - curX) >= dp(280)) {
+        int ow = dp(cleanFeedOpen_ ? 44 : 52);
+        rObs_ = { curX, y0 + dp(7), curX + ow, y1 - dp(7) };
+        curX = rObs_.right + dp(6);
+    }
     if (connected && videoTel.presentedCount > 0 && (availRight - curX) >= dp(400)) {
         char latBuf[80];
         std::snprintf(latBuf, sizeof(latBuf), "%.0ffps · p50 %.1f/%.1fms",
@@ -193,7 +209,18 @@ void TopBar::paint(Gdiplus::Graphics& g, const RECT& bounds,
     GdiPlusDraw::drawIcon(g, ICON_CLOSE,    static_cast<float>(rClose_.left + rClose_.right) * 0.5f,   cy, GdiPlusDraw::dpf(11.0f),
                           ptIn(rClose_, hoverX, hoverY) ? 0xFFFFFFFFu : Theme::TEXT_SECONDARY);
 
-    // 5. Telemetry Pills
+    // 5. Telemetry & Creator Pills
+    if (rRec_.right > rRec_.left) {
+        GdiPlusDraw::roundedCard(g, rRec_, GdiPlusDraw::dpf(12.0f), Theme::ACCENT_RED_BG, Theme::ACCENT_RED, 1.2f);
+        GdiPlusDraw::textCenter(g, recTxt_, static_cast<float>(rRec_.left + rRec_.right) * 0.5f, cy,
+                                10.5f, true, Theme::ACCENT_RED);
+    }
+    if (rObs_.right > rObs_.left) {
+        GdiPlusDraw::roundedCard(g, rObs_, GdiPlusDraw::dpf(12.0f), Theme::ACCENT_PURPLE_BG, Theme::ACCENT_PURPLE, 1.1f);
+        GdiPlusDraw::textCenter(g, cleanFeedOpen_ ? "OBS" : "CLEAN",
+                                static_cast<float>(rObs_.left + rObs_.right) * 0.5f, cy,
+                                10.0f, true, Theme::ACCENT_PURPLE);
+    }
     if (showLatPill_) {
         GdiPlusDraw::roundedCard(g, rLat_, GdiPlusDraw::dpf(12.0f), Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
         GdiPlusDraw::textCenter(g, latTxt_, static_cast<float>(rLat_.left + rLat_.right) * 0.5f, cy,

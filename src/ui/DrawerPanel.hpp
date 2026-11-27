@@ -138,7 +138,27 @@ enum DrawerActionId {
     DA_FILES_PUSH_PICKER,
     DA_FILE_OPEN_DIR,         // extra = index in remoteEntries_
     DA_FILE_PULL,             // extra = index in remoteEntries_
-    DA_OPEN_FILES_TAB
+    DA_OPEN_FILES_TAB,
+
+    // F12 Recording & Replay, F13 Streamer & Clean Feed, F14 Device Controls
+    DA_TOGGLE_RECORD,
+    DA_SAVE_REPLAY,
+    DA_TOGGLE_REPLAY_BUF,
+    DA_SET_REPLAY_SEC,        // extra = 15 / 30 / 60
+    DA_TOGGLE_STREAMER_MODE,
+    DA_TOGGLE_CLEAN_FEED,
+    DA_TOGGLE_SHOW_TOUCHES,
+    DA_TOGGLE_KEYPRESS_OVERLAY,
+    DA_DEV_ROTATE,
+    DA_DEV_NOTIFS,
+    DA_DEV_SETTINGS_PANEL,
+    DA_DEV_COLLAPSE_PANELS,
+    DA_DEV_WAKE_BACK,
+    DA_DEV_POWER,
+    DA_DEV_VOL_DN,
+    DA_DEV_VOL_UP,
+    DA_DEV_VOL_MUTE,
+    DA_DEV_SHOT_CLIP
 };
 
 struct DrawerActionResult {
@@ -168,6 +188,12 @@ struct DrawerActionResult {
     bool requestOpenOnboarding = false;
     bool requestToggleEditTest = false;
     bool requestCreateTemplate = false;
+    bool requestToggleRecord = false;
+    bool requestSaveReplay = false;
+    bool requestToggleCleanFeed = false;
+    bool replayConfigChanged = false;
+    bool streamerModeChanged = false;
+    int requestDeviceControl = 0; // 1=Rotate..10=ShotClip
     int templateKind = 0;
     bool requestImportProfile = false;
     bool requestExportProfile = false;
@@ -229,6 +255,12 @@ public:
     void setRemoteFiles(const std::string& currentDir, const std::vector<RemoteFileEntry>& entries,
                         bool loading, const std::string& statusMsg);
     const std::string& remoteCurrentDir() const { return remoteCurrentDir_; }
+    void setCreatorState(bool recording, int recSec, bool cleanFeedOpen, double replayBufSec) {
+        creatorRecording_ = recording;
+        creatorRecSec_ = recSec;
+        creatorCleanFeedOpen_ = cleanFeedOpen;
+        creatorReplayBufSec_ = replayBufSec;
+    }
 
     bool isTypingText() const {
         return editingNewProfileName_ || editingNodeLabel_ || editingWireless_ ||
@@ -411,4 +443,9 @@ private:
     PhoneThermalInfo thermalInfo_;
     std::string activeEncoder_;
     std::vector<VideoEncoderInfo> deviceEncoders_;
+
+    bool creatorRecording_ = false;
+    int creatorRecSec_ = 0;
+    bool creatorCleanFeedOpen_ = false;
+    double creatorReplayBufSec_ = 0.0;
 };

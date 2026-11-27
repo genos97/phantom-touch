@@ -29,6 +29,13 @@ enum TopBarConnState {
 
 class TopBar {
 public:
+    void setCreatorStatus(bool recording, int recElapsedSec, bool cleanFeedOpen, bool streamerMode) {
+        recording_ = recording;
+        recElapsedSec_ = recElapsedSec;
+        cleanFeedOpen_ = cleanFeedOpen;
+        streamerMode_ = streamerMode;
+    }
+
     void layout(const RECT& bounds,
                 const std::string& deviceLabel, bool connected, bool demoMode,
                 const Profile& profile, const EngineTelemetry& tel,
@@ -75,4 +82,11 @@ private:
     uint32_t telFg_ = 0;
     bool showLatPill_ = false;
     bool showTelPill_ = false;
+    bool recording_ = false;
+    int recElapsedSec_ = 0;
+    bool cleanFeedOpen_ = false;
+    bool streamerMode_ = false;
+    RECT rRec_ = { 0, 0, 0, 0 };
+    RECT rObs_ = { 0, 0, 0, 0 };
+    std::string recTxt_;
 };

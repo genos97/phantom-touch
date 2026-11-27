@@ -48,7 +48,10 @@ enum ShellAppMsg {
     MSG_PAD_NAV            = WM_APP + 36,
     MSG_APPS_LIST_DONE     = WM_APP + 37,
     MSG_FILES_LIST_DONE    = WM_APP + 38,
-    MSG_FILE_TRANSFER_DONE = WM_APP + 39
+    MSG_FILE_TRANSFER_DONE = WM_APP + 39,
+    MSG_TOGGLE_RECORD      = WM_APP + 40,
+    MSG_SAVE_REPLAY        = WM_APP + 41,
+    MSG_RECORDING_DONE     = WM_APP + 42
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread

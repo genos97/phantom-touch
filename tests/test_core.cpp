@@ -31,6 +31,7 @@
 #include "video/D3D11Renderer.hpp"
 #include "video/H264Decoder.hpp"
 #include "video/LatencyTelemetry.hpp"
+#include "video/Recorder.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -2644,6 +2645,199 @@ void testSprint5bAppsFilesAndShortcuts() {
     std::printf("[Test] Sprint 5B (F8 Apps/2ndPhone + F9 Files/CF_DIB) OK!\n");
 }
 
+static void testSprint6aCreatorAndDeviceControls() {
+    std::printf("[Test] Sprint 6A (F12 Recorder/Replay + F13 CleanFeed/Streamer + F14 Controls)...\n");
+
+    // 1. F14 R-msg wire byte verification & B1 show_touches safety
+    {
+        uint8_t b[8] = {0};
+        assert(ScrcpyBridge::serializeBackOrScreenOn(b, sizeof(b), 0) == 2 && b[0] == 4 && b[1] == 0);
+        assert(ScrcpyBridge::serializeBackOrScreenOn(b, sizeof(b), 1) == 2 && b[0] == 4 && b[1] == 1);
+        assert(ScrcpyBridge::serializeBackOrScreenOn(b, 1, 0) == 0);
+        assert(ScrcpyBridge::serializeExpandNotificationPanel(b, sizeof(b)) == 1 && b[0] == 5);
+        assert(ScrcpyBridge::serializeExpandSettingsPanel(b, sizeof(b)) == 1 && b[0] == 6);
+        assert(ScrcpyBridge::serializeCollapsePanels(b, sizeof(b)) == 1 && b[0] == 7);
+        assert(ScrcpyBridge::serializeRotateDevice(b, sizeof(b)) == 1 && b[0] == 11);
+        assert(ScrcpyBridge::serializeResetVideo(b, sizeof(b)) == 1 && b[0] == 17);
+
+        assert(ScrcpyBridge::buildShowTouchesServerArg(false, true).empty());
+        assert(ScrcpyBridge::buildShowTouchesServerArg(true, false).empty());
+        assert(ScrcpyBridge::buildShowTouchesServerArg(true, true) == " show_touches=true");
+    }
+
+    // 2. F12 ReplayRingBuffer multi-GOP windowing & keyframe alignment
+    const uint8_t kSpsPps1280x720[] = {
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x1F,
+        0xD9, 0x00, 0x50, 0x05, 0xBB, 0x01, 0x10, 0x00,
+        0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03,
+        0xC0, 0xF1, 0x83, 0x19, 0x60,
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80
+    };
+    const uint8_t kIdrSlice[] = { 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xA0, 0x11, 0x22, 0x33 };
+    const uint8_t kPSlice[]   = { 0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x21, 0x00, 0x44, 0x55, 0x66 };
+    {
+        ReplayRingBuffer ring;
+        ring.configure(5, 16u * 1024u * 1024u);
+        ring.pushVideo(kSpsPps1280x720, sizeof(kSpsPps1280x720), 0, true, false, 1280, 720);
+
+        // Push 3 GOPs across t=0s..12s (keyframes at 0s, 4s, 8s)
+        for (int g = 0; g < 3; ++g) {
+            uint64_t gPts = static_cast<uint64_t>(g) * 4000000ULL;
+            ring.pushVideo(kIdrSlice, sizeof(kIdrSlice), gPts, false, true, 1280, 720);
+            ring.pushVideo(kPSlice, sizeof(kPSlice), gPts + 500000ULL, false, false, 1280, 720);
+            std::vector<uint8_t> pcm(3840, 0); // 20ms @ 48kHz stereo S16
+            ring.pushAudio(AUDIO_CODEC_RAW, pcm.data(), pcm.size(), gPts + 20000ULL, false);
+        }
+        ring.pushVideo(kPSlice, sizeof(kPSlice), 11500000ULL, false, false, 1280, 720);
+
+        ReplaySnapshot snap;
+        assert(ring.buildSnapshot(snap));
+        assert(snap.width == 1280 && snap.height == 720);
+        assert(!snap.videoConfig.empty());
+        assert(snap.packets.size() >= 3);
+        assert(snap.packets.front().isVideo && snap.packets.front().isKeyFrame);
+        assert(snap.packets.front().ptsUs >= 4000000ULL);
+    }
+
+    // 3. F12 Media Foundation SinkWriter MP4 passthrough + PCM->AAC mux + SourceReader verify
+    {
+        ReplaySnapshot snap;
+        snap.width = 1280;
+        snap.height = 720;
+        snap.videoConfig.assign(kSpsPps1280x720, kSpsPps1280x720 + sizeof(kSpsPps1280x720));
+        snap.audioCodec = AUDIO_CODEC_RAW;
+
+        for (int f = 0; f < 10; ++f) {
+            RecordedPacket vp;
+            vp.isVideo = true;
+            vp.ptsUs = static_cast<uint64_t>(f) * 33333ULL;
+            vp.isKeyFrame = (f == 0 || f == 5);
+            const uint8_t* src = vp.isKeyFrame ? kIdrSlice : kPSlice;
+            size_t slen = vp.isKeyFrame ? sizeof(kIdrSlice) : sizeof(kPSlice);
+            vp.data.assign(src, src + slen);
+            snap.packets.push_back(std::move(vp));
+
+            RecordedPacket ap;
+            ap.isVideo = false;
+            ap.audioCodec = AUDIO_CODEC_RAW;
+            ap.ptsUs = static_cast<uint64_t>(f) * 33333ULL;
+            ap.data.assign(6400, 0);
+            snap.packets.push_back(std::move(ap));
+        }
+
+        char tmpBuf[MAX_PATH] = {0};
+        DWORD tlen = GetTempPathA(MAX_PATH, tmpBuf);
+        assert(tlen > 0 && tlen < MAX_PATH);
+        std::string testMp4 = std::string(tmpBuf) + "pt_sprint6a_test.mp4";
+        DeleteFileA(testMp4.c_str());
+
+        RecordingResult rr = Recorder::writeSnapshotToFile(snap, testMp4);
+        std::printf("[Test] Sprint 6A MP4 mux: ok=%d fb=%d hasAud=%d vf=%u ap=%u err='%s'\n",
+                    rr.ok ? 1 : 0, rr.usedH264Fallback ? 1 : 0, rr.hasAudio ? 1 : 0,
+                    rr.videoFramesWritten, rr.audioPacketsWritten, rr.error.c_str());
+        assert(rr.ok && !rr.usedH264Fallback);
+        assert(rr.videoFramesWritten >= 8);
+        assert(!rr.outputPath.empty());
+        assert(GetFileAttributesA(rr.outputPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+        bool hasVid = false, hasAud = false;
+        uint64_t dur100 = 0;
+        uint32_t vidSamples = 0;
+        assert(Recorder::verifyMp4Playable(rr.outputPath, hasVid, hasAud, dur100, &vidSamples));
+        assert(hasVid && hasAud && vidSamples >= 5);
+        DeleteFileA(rr.outputPath.c_str());
+        DeleteFileA(testMp4.c_str());
+    }
+
+    // 4. AppSettings F12/F13 persistence + pending change detection
+    {
+        char tmpBuf[MAX_PATH] = {0};
+        GetTempPathA(MAX_PATH, tmpBuf);
+        std::string cfgPath = std::string(tmpBuf) + "pt_sprint6a_settings.cfg";
+        DeleteFileA(cfgPath.c_str());
+
+        AppSettings s;
+        s.replayBufferEnabled = false;
+        s.replayBufferSec = 60;
+        s.streamerMode = true;
+        s.streamerShowTouches = true;
+        s.streamerKeypressOverlay = true;
+        assert(AppSettingsStore::save(cfgPath, s));
+
+        AppSettings loaded;
+        assert(AppSettingsStore::load(cfgPath, loaded));
+        assert(!loaded.replayBufferEnabled);
+        assert(loaded.replayBufferSec == 60);
+        assert(loaded.streamerMode);
+        assert(loaded.streamerShowTouches);
+        assert(loaded.streamerKeypressOverlay);
+
+        AppSettings applied = loaded;
+        applied.streamerShowTouches = false;
+        assert(AppSettings::countPendingStreamChanges(loaded, applied, "SER1") == 1);
+        DeleteFileA(cfgPath.c_str());
+    }
+
+    // 5. DrawerPanel DEV tab F12/F13/F14 hit-test & action dispatch
+    {
+        DrawerPanel dp;
+        dp.setCreatorState(false, 0, false, 12.0);
+        Profile p = ProfileDefaults::createFreeFire();
+        AppSettings s;
+        std::vector<std::string> logs;
+        RECT bounds = { 0, 0, 356, 1800 };
+
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 356, 1800);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        {
+            Gdiplus::Graphics g(mDC);
+            dp.setActiveTab(3);
+            dp.paint(g, bounds, p, s, "", -1, false, true, "SM-G990E", "", logs, -1, -1, 0);
+        }
+        RECT rcRec = {0,0,0,0}, rcRep = {0,0,0,0}, rcCf = {0,0,0,0}, rcRot = {0,0,0,0}, rcNotif = {0,0,0,0}, rcPow = {0,0,0,0};
+        assert(dp.rectForAction(DA_TOGGLE_RECORD, -1, rcRec));
+        assert(dp.rectForAction(DA_SAVE_REPLAY, -1, rcRep));
+        assert(dp.rectForAction(DA_TOGGLE_CLEAN_FEED, -1, rcCf));
+        assert(dp.rectForAction(DA_DEV_ROTATE, -1, rcRot));
+        assert(dp.rectForAction(DA_DEV_NOTIFS, -1, rcNotif));
+        assert(dp.rectForAction(DA_DEV_POWER, -1, rcPow));
+
+        int sel = -1;
+        DrawerActionResult res;
+        assert(dp.onMouseDown((rcRec.left + rcRec.right) / 2, (rcRec.top + rcRec.bottom) / 2, p, s, sel, res));
+        assert(res.requestToggleRecord);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcRep.left + rcRep.right) / 2, (rcRep.top + rcRep.bottom) / 2, p, s, sel, res));
+        assert(res.requestSaveReplay);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcCf.left + rcCf.right) / 2, (rcCf.top + rcCf.bottom) / 2, p, s, sel, res));
+        assert(res.requestToggleCleanFeed);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcRot.left + rcRot.right) / 2, (rcRot.top + rcRot.bottom) / 2, p, s, sel, res));
+        assert(res.requestDeviceControl == 1);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcNotif.left + rcNotif.right) / 2, (rcNotif.top + rcNotif.bottom) / 2, p, s, sel, res));
+        assert(res.requestDeviceControl == 2);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcPow.left + rcPow.right) / 2, (rcPow.top + rcPow.bottom) / 2, p, s, sel, res));
+        assert(res.requestDeviceControl == 6);
+
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    std::printf("[Test] Sprint 6A (F12/F13/F14) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -2671,6 +2865,8 @@ int main() {
     testSprint5aLanguageAndClipboard();
     std::fflush(stdout);
     testSprint5bAppsFilesAndShortcuts();
-    std::printf("ALL SPRINT 5B + SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint6aCreatorAndDeviceControls();
+    std::printf("ALL SPRINT 6A + SPRINT 5B + SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

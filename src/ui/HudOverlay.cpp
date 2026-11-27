@@ -368,15 +368,18 @@ void HudOverlay::renderLayered() {
     bool editMode = host_->hudIsEditMode();
     bool demoMode = host_->hudIsDemoMode();
     bool aimMode  = host_->hudIsAimMode();
+    const bool streamerHide = host_->hudIsStreamerMode();
+    const bool keypressOverlay = host_->hudShowKeypressOverlay();
     const bool hasToast = (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0);
     if (!editMode) {
         std::memset(pixels, 0, pixelBytes);
     }
     const bool needPlayPaint =
-        (p.keymapEnabled && (p.showHudInPlay || demoMode)) ||
-        (!embeddedD3DMode_ && modePulseAlpha_ > 0.01f) ||
-        (p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) ||
-        (host_->hudIsFullscreen() && !aimMode) ||
+        (!streamerHide && p.keymapEnabled && (p.showHudInPlay || demoMode)) ||
+        (!streamerHide && !embeddedD3DMode_ && modePulseAlpha_ > 0.01f) ||
+        (!streamerHide && p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) ||
+        (!streamerHide && host_->hudIsFullscreen() && !aimMode) ||
+        keypressOverlay ||
         hasToast;
     if (!editMode && !hasToast) {
         ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
@@ -435,21 +438,24 @@ void HudOverlay::renderLayered() {
             ex.modePulseAlpha = modePulseAlpha_;
             ex.modePulseAim = modePulseAim_;
 
-            if (p.keymapEnabled && (p.showHudInPlay || demoMode)) {
+            if (!streamerHide && p.keymapEnabled && (p.showHudInPlay || demoMode)) {
                 HudRenderer::paintKeymapNodes(g, w, h, p, tel, false, demoMode,
                                               -1, -1, false, false, p.hudOpacity, &ex);
             }
-            if (!embeddedD3DMode_ && modePulseAlpha_ > 0.01f) {
+            if (!streamerHide && !embeddedD3DMode_ && modePulseAlpha_ > 0.01f) {
                 uint8_t pa = static_cast<uint8_t>(modePulseAlpha_ * 220.0f);
                 uint32_t col = (static_cast<uint32_t>(pa) << 24) |
                     ((modePulseAim_ ? Theme::ACCENT_GREEN : Theme::ACCENT_AMBER) & 0x00FFFFFFu);
                 GdiPlusDraw::fillRoundedRect(g, 0.0f, 0.0f, static_cast<float>(w), 4.0f, 2.0f, col);
             }
-            if (p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) {
+            if (!streamerHide && p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) {
                 HudRenderer::paintCrosshairDot(g, w, h);
             }
-            if (host_->hudIsFullscreen() && !aimMode) {
+            if (!streamerHide && host_->hudIsFullscreen() && !aimMode) {
                 HudRenderer::paintFullscreenStatus(g, w, p, tel);
+            }
+            if (keypressOverlay) {
+                HudRenderer::paintKeypressOverlay(g, w, h, p, tel);
             }
         }
 

@@ -27,6 +27,8 @@ struct IHudOverlayHost {
     virtual bool hudIsSpecialDrawerRebind() const = 0;
     virtual std::string hudSpecialRebindLabel() const = 0;
     virtual bool hudIsSpecialAimRebind() const = 0;
+    virtual bool hudIsStreamerMode() const { return false; }
+    virtual bool hudShowKeypressOverlay() const { return false; }
 
     virtual void hudOnSelectionChanged(int newSelectedIdx) = 0;
     virtual void hudOnProfileChanged(bool commitSaveNow) = 0;

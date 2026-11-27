@@ -18,6 +18,7 @@
 #include "ui/ViewportHost.hpp"
 #include "video/H264Decoder.hpp"
 #include "video/LatencyTelemetry.hpp"
+#include "video/Recorder.hpp"
 
 #include <map>
 #include <string>
@@ -42,7 +43,8 @@ public:
                           bool forceAudio = false,
                           const std::string& forceAudioCodec = "",
                           int forceAudioBufferMs = 0,
-                          const std::string& launchAppPackage = "") {
+                          const std::string& launchAppPackage = "",
+                          int recordTestSec = 0) {
         consoleEnabled_ = consoleEnabled;
         autoProbeOnConnect_ = probeOnConnect;
         autoProbeSamples_ = probeSamples;
@@ -52,11 +54,12 @@ public:
         forceAudioBufferMs_ = forceAudioBufferMs;
         launchAppPackage_ = launchAppPackage;
         pendingLaunchApp_ = launchAppPackage;
+        recordTestSec_ = recordTestSec;
         if (!launchAppPackage_.empty()) {
             forceVirtualDisplayOnce_ = true;
             showOnboarding_ = false;
         }
-        if (autoProbeOnConnect_) showOnboarding_ = false;
+        if (autoProbeOnConnect_ || recordTestSec_ > 0) showOnboarding_ = false;
     }
 
     bool create(HINSTANCE hInst);
@@ -72,6 +75,8 @@ public:
     bool hudIsSpecialDrawerRebind() const override { return drawerOpen_ && drawerPanel_.isWaitingSpecialRebind(); }
     std::string hudSpecialRebindLabel() const override;
     bool hudIsSpecialAimRebind() const override { return drawerOpen_ && drawerPanel_.isRebindingToggleAim(); }
+    bool hudIsStreamerMode() const override { return settings_.streamerMode; }
+    bool hudShowKeypressOverlay() const override { return settings_.streamerKeypressOverlay; }
 
     void hudOnSelectionChanged(int newSelectedIdx) override;
     void hudOnProfileChanged(bool commitSaveNow) override;
@@ -88,6 +93,8 @@ public:
 
 private:
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK cleanFeedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static void onRecorderDone(void* ctx, const RecordingResult& result);
     static DWORD WINAPI startupToolsThreadProc(LPVOID param);
     static DWORD WINAPI refreshDevicesThreadProc(LPVOID param);
     static DWORD WINAPI deviceMonitorThreadProc(LPVOID param);
@@ -154,7 +161,12 @@ private:
     void startRoundTripProbe(int numTrials = 60);
     void refreshAdbDevices();
     void disconnectDevice(bool returnToHub, bool userInitiated = true);
-    void takeScreenshot();
+    void takeScreenshot(bool toClipboardToo = true);
+    void toggleRecording();
+    void saveReplayClip();
+    bool toggleCleanFeedWindow();
+    void closeCleanFeedWindow();
+    void executeDeviceControl(int actionCode);
     void applyOnboardingProfileChoice(OnboardingProfileChoice choice);
     void finishOnboarding();
     void buildHubViewState(HubViewState& out) const;
@@ -413,6 +425,18 @@ private:
     volatile LONG fallbackPending_ = 0;
     H264Decoder h264Decoder_;
     AudioPlayer audioPlayer_;
+    Recorder recorder_;
+    HWND cleanFeedHwnd_ = NULL;
+    std::vector<RecordingResult> pendingRecResults_;
+    int recordTestSec_ = 0;
+    bool recordTestArmed_ = false;
+    DWORD recordTestDueTick_ = 0;
+    int recordTestStage_ = 0;
+    DWORD recordTestStopTick_ = 0;
+    bool recordTestHasLive_ = false;
+    bool recordTestHasReplay_ = false;
+    RecordingResult recordTestLiveRes_;
+    RecordingResult recordTestReplayRes_;
 
     struct HudVisualSig {
         bool valid = false;
@@ -443,6 +467,10 @@ private:
         int latP50Q10 = -1;
         int latP95Q10 = -1;
         uint64_t skipped = 0;
+        bool recording = false;
+        int recSec = 0;
+        bool cleanFeed = false;
+        bool streamerMode = false;
     };
     TopBarVisualSig lastTopBarSig_;
 

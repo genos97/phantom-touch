@@ -143,7 +143,8 @@ int Application::run(int argc, char** argv) {
 
     ShellWindow shell(&bridge, &engine, exeDir, profilesDir, profilePath, settingsPath, demoMode, noMirror);
     shell.setLaunchOptions(showConsole, probeOnConnect, probeSamples, startFullscreen,
-                           forceAudio, forceAudioCodec, forceAudioBufferMs, opts.launchAppPackage);
+                           forceAudio, forceAudioCodec, forceAudioBufferMs, opts.launchAppPackage,
+                           opts.recordTestSec);
     int exitCode = 1;
     if (shell.create(GetModuleHandleA(NULL))) {
         exitCode = shell.runMessageLoop();

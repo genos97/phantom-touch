@@ -93,6 +93,12 @@ public:
                                  std::vector<uint8_t>* outDib = nullptr) const;
     bool hasNativeVideoFrame() const { return d3d_.hasVideoFrame(); }
 
+    // F13: Clean Feed secondary swapchain forwarding
+    bool attachCleanFeed(HWND hwnd, int width, int height) { return d3d_.attachCleanFeed(hwnd, width, height); }
+    void resizeCleanFeed(int width, int height) { d3d_.resizeCleanFeed(width, height); }
+    void detachCleanFeed() { d3d_.detachCleanFeed(); }
+    bool isCleanFeedActive() const { return d3d_.isCleanFeedActive(); }
+
     // Round-trip probe forwarding (LATENCY_PLAN 0.2)
     void setProbeFrameEvent(HANDLE evt) { d3d_.setProbeFrameEvent(evt); }
     void setProbeSampleRect(bool active, float normX, float normY) { d3d_.setProbeSampleRect(active, normX, normY); }

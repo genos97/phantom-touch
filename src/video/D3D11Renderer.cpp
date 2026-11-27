@@ -576,6 +576,12 @@ void D3D11Renderer::shutdown() {
     safeRelease(rtv_);
     closeWaitableObjectLocked();
     safeRelease(swapChain_);
+    safeRelease(cleanFeedRtv_);
+    safeRelease(cleanFeedSwapChain_);
+    cleanFeedHwnd_ = NULL;
+    cleanFeedW_ = 0;
+    cleanFeedH_ = 0;
+    cleanFeedFlags_ = 0;
     safeRelease(ctx_);
     safeRelease(device_);
     texVideoW_ = 0;
@@ -602,6 +608,9 @@ bool D3D11Renderer::rebuildDevice(std::string& outError) {
     int wCopy = savedW_;
     int hCopy = savedH_;
     bool vsyncCopy = vsyncEnabled_;
+    HWND cfHwndCopy = cleanFeedHwnd_;
+    int cfWCopy = cleanFeedW_;
+    int cfHCopy = cleanFeedH_;
     if (!hwndCopy || !IsWindow(hwndCopy)) {
         outError = "Cannot rebuild D3D11 device: window destroyed.";
         return false;
@@ -628,7 +637,160 @@ bool D3D11Renderer::rebuildDevice(std::string& outError) {
     if (hadHud) {
         updateHudBitmap(hudCopy.data(), hw, hh);
     }
+    if (cfHwndCopy && IsWindow(cfHwndCopy)) {
+        attachCleanFeed(cfHwndCopy, cfWCopy, cfHCopy);
+    }
     return true;
+}
+
+bool D3D11Renderer::attachCleanFeed(HWND hwnd, int width, int height) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (width < 8) width = 640;
+    if (height < 8) height = 360;
+
+    EnterCriticalSection(&d3dLock_);
+    if (!device_) {
+        cleanFeedHwnd_ = hwnd;
+        cleanFeedW_ = width;
+        cleanFeedH_ = height;
+        LeaveCriticalSection(&d3dLock_);
+        return false;
+    }
+
+    safeRelease(cleanFeedRtv_);
+    safeRelease(cleanFeedSwapChain_);
+    cleanFeedHwnd_ = NULL;
+    cleanFeedW_ = 0;
+    cleanFeedH_ = 0;
+    cleanFeedFlags_ = 0;
+
+    IDXGIDevice* dxgiDev = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory* factory = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
+        if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
+            adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory));
+            adapter->Release();
+        }
+        dxgiDev->Release();
+    }
+    if (!factory) {
+        LeaveCriticalSection(&d3dLock_);
+        return false;
+    }
+
+    IDXGIFactory2* factory2 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(kIID_IDXGIFactory2, reinterpret_cast<void**>(&factory2))) && factory2) {
+        DXGI_SWAP_CHAIN_DESC1 scd1;
+        ZeroMemory(&scd1, sizeof(scd1));
+        scd1.Width = static_cast<UINT>(width);
+        scd1.Height = static_cast<UINT>(height);
+        scd1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd1.SampleDesc.Count = 1;
+        scd1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd1.BufferCount = 2;
+        scd1.Scaling = DXGI_SCALING_STRETCH;
+        scd1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scd1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        scd1.Flags = tearingSupported_ ? static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
+
+        IDXGISwapChain1* sc1 = nullptr;
+        HRESULT hr = factory2->CreateSwapChainForHwnd(device_, hwnd, &scd1, NULL, NULL, &sc1);
+        if (FAILED(hr) && scd1.Flags != 0) {
+            scd1.Flags = 0;
+            hr = factory2->CreateSwapChainForHwnd(device_, hwnd, &scd1, NULL, NULL, &sc1);
+        }
+        if (SUCCEEDED(hr) && sc1) {
+            cleanFeedSwapChain_ = sc1;
+            cleanFeedFlags_ = scd1.Flags;
+        }
+        factory2->Release();
+    }
+
+    if (!cleanFeedSwapChain_) {
+        DXGI_SWAP_CHAIN_DESC scd;
+        ZeroMemory(&scd, sizeof(scd));
+        scd.BufferCount = 2;
+        scd.BufferDesc.Width = static_cast<UINT>(width);
+        scd.BufferDesc.Height = static_cast<UINT>(height);
+        scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.OutputWindow = hwnd;
+        scd.SampleDesc.Count = 1;
+        scd.Windowed = TRUE;
+        scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        factory->CreateSwapChain(device_, &scd, &cleanFeedSwapChain_);
+        cleanFeedFlags_ = 0;
+    }
+
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    factory->Release();
+
+    bool ok = false;
+    if (cleanFeedSwapChain_) {
+        ID3D11Texture2D* backBuf = nullptr;
+        if (SUCCEEDED(cleanFeedSwapChain_->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                                    reinterpret_cast<void**>(&backBuf))) && backBuf) {
+            ok = SUCCEEDED(device_->CreateRenderTargetView(backBuf, NULL, &cleanFeedRtv_));
+            backBuf->Release();
+        }
+    }
+
+    if (ok) {
+        cleanFeedHwnd_ = hwnd;
+        cleanFeedW_ = width;
+        cleanFeedH_ = height;
+    } else {
+        safeRelease(cleanFeedRtv_);
+        safeRelease(cleanFeedSwapChain_);
+        cleanFeedFlags_ = 0;
+    }
+    LeaveCriticalSection(&d3dLock_);
+    return ok;
+}
+
+void D3D11Renderer::resizeCleanFeed(int width, int height) {
+    if (width < 8 || height < 8) return;
+    EnterCriticalSection(&d3dLock_);
+    if (!cleanFeedSwapChain_ || !ctx_ || (width == cleanFeedW_ && height == cleanFeedH_)) {
+        LeaveCriticalSection(&d3dLock_);
+        return;
+    }
+    ctx_->OMSetRenderTargets(0, NULL, NULL);
+    safeRelease(cleanFeedRtv_);
+    HRESULT hr = cleanFeedSwapChain_->ResizeBuffers(0, static_cast<UINT>(width), static_cast<UINT>(height),
+                                                    DXGI_FORMAT_UNKNOWN, cleanFeedFlags_);
+    if (SUCCEEDED(hr)) {
+        ID3D11Texture2D* backBuf = nullptr;
+        if (SUCCEEDED(cleanFeedSwapChain_->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                                    reinterpret_cast<void**>(&backBuf))) && backBuf) {
+            if (SUCCEEDED(device_->CreateRenderTargetView(backBuf, NULL, &cleanFeedRtv_))) {
+                cleanFeedW_ = width;
+                cleanFeedH_ = height;
+            }
+            backBuf->Release();
+        }
+    }
+    LeaveCriticalSection(&d3dLock_);
+}
+
+void D3D11Renderer::detachCleanFeed() {
+    EnterCriticalSection(&d3dLock_);
+    if (ctx_) ctx_->OMSetRenderTargets(0, NULL, NULL);
+    safeRelease(cleanFeedRtv_);
+    safeRelease(cleanFeedSwapChain_);
+    cleanFeedHwnd_ = NULL;
+    cleanFeedW_ = 0;
+    cleanFeedH_ = 0;
+    cleanFeedFlags_ = 0;
+    LeaveCriticalSection(&d3dLock_);
+}
+
+bool D3D11Renderer::isCleanFeedActive() const {
+    EnterCriticalSection(&d3dLock_);
+    bool active = (cleanFeedSwapChain_ != nullptr && cleanFeedRtv_ != nullptr && cleanFeedHwnd_ != NULL);
+    LeaveCriticalSection(&d3dLock_);
+    return active;
 }
 
 void D3D11Renderer::resize(int width, int height) {
@@ -1337,6 +1499,58 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
                 if (evt) SetEvent(evt);
             }
         }
+    }
+
+    // 7. F13: Render OBS Clean Feed second swapchain (strictly pure NV12 video, zero chrome/HUD/markers)
+    if (cleanFeedSwapChain_ && cleanFeedRtv_ && cleanFeedW_ >= 8 && cleanFeedH_ >= 8) {
+        const float blackBg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        ctx_->OMSetRenderTargets(1, &cleanFeedRtv_, NULL);
+        ctx_->ClearRenderTargetView(cleanFeedRtv_, blackBg);
+
+        if (readyVideo && activeY && activeUV) {
+            uint32_t vw = gpuVideoActive_ ? gpuCropW_ : texVideoW_;
+            uint32_t vh = gpuVideoActive_ ? gpuCropH_ : texVideoH_;
+            if (vw < 16 || vh < 16) {
+                vw = 1920;
+                vh = 1080;
+            }
+            int fitW = cleanFeedW_;
+            int fitH = static_cast<int>((static_cast<double>(cleanFeedW_) * static_cast<double>(vh)) / static_cast<double>(vw) + 0.5);
+            if (fitH > cleanFeedH_) {
+                fitH = cleanFeedH_;
+                fitW = static_cast<int>((static_cast<double>(cleanFeedH_) * static_cast<double>(vw)) / static_cast<double>(vh) + 0.5);
+            }
+            if (fitW < 8) fitW = 8;
+            if (fitH < 8) fitH = 8;
+            int fitX = (cleanFeedW_ - fitW) / 2;
+            int fitY = (cleanFeedH_ - fitH) / 2;
+
+            D3D11_VIEWPORT cfVp;
+            cfVp.TopLeftX = 0.0f;
+            cfVp.TopLeftY = 0.0f;
+            cfVp.Width = static_cast<float>(cleanFeedW_);
+            cfVp.Height = static_cast<float>(cleanFeedH_);
+            cfVp.MinDepth = 0.0f;
+            cfVp.MaxDepth = 1.0f;
+            ctx_->RSSetViewports(1, &cfVp);
+
+            float cx0 = (static_cast<float>(fitX) / static_cast<float>(cleanFeedW_)) * 2.0f - 1.0f;
+            float cx1 = (static_cast<float>(fitX + fitW) / static_cast<float>(cleanFeedW_)) * 2.0f - 1.0f;
+            float cyT = 1.0f - (static_cast<float>(fitY) / static_cast<float>(cleanFeedH_)) * 2.0f;
+            float cyB = 1.0f - (static_cast<float>(fitY + fitH) / static_cast<float>(cleanFeedH_)) * 2.0f;
+
+            updateConstantBufferLocked(cx0, cyB, cx1, cyT, vidU0, vidV0, vidU1, vidV1);
+            ctx_->OMSetBlendState(NULL, NULL, 0xFFFFFFFFu);
+            ID3D11ShaderResourceView* srvs[2] = { activeY, activeUV };
+            ctx_->PSSetShader(psNV12_, NULL, 0);
+            ctx_->PSSetShaderResources(0, 2, srvs);
+            ctx_->Draw(4, 0);
+            ID3D11ShaderResourceView* nullSrvs[2] = { NULL, NULL };
+            ctx_->PSSetShaderResources(0, 2, nullSrvs);
+        }
+
+        UINT cfFlags = ((cleanFeedFlags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        cleanFeedSwapChain_->Present(0, cfFlags);
     }
 }
 

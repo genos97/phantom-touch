@@ -71,6 +71,12 @@ public:
     bool supportsGpuNv12() const { return supportsGpuNv12Srv_; }
     bool isDeviceLost() const { return deviceLost_ != 0; }
     bool rebuildDevice(std::string& outError);
+
+    // F13: OBS Clean Feed second swapchain (renders pure phone NV12 video without HUD/markers)
+    bool attachCleanFeed(HWND hwnd, int width, int height);
+    void resizeCleanFeed(int width, int height);
+    void detachCleanFeed();
+    bool isCleanFeedActive() const;
     ID3D11Device* d3dDevice() const { return device_; }
 
     // Resizes swap chain backbuffer to match ViewportHost client dimensions (thread-safe)
@@ -164,6 +170,14 @@ private:
     ID3D11DeviceContext* ctx_ = nullptr;
     IDXGISwapChain* swapChain_ = nullptr;
     ID3D11RenderTargetView* rtv_ = nullptr;
+
+    // F13: Clean Feed secondary swapchain on the same D3D11 device
+    HWND cleanFeedHwnd_ = NULL;
+    IDXGISwapChain* cleanFeedSwapChain_ = nullptr;
+    ID3D11RenderTargetView* cleanFeedRtv_ = nullptr;
+    int cleanFeedW_ = 0;
+    int cleanFeedH_ = 0;
+    UINT cleanFeedFlags_ = 0;
 
     ID3D11VertexShader* vsQuad_ = nullptr;
     ID3D11PixelShader* psNV12_ = nullptr;

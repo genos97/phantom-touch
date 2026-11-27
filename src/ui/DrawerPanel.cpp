@@ -1361,6 +1361,92 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         y += 64;
     }
 
+    // 5c. CREATOR STUDIO (F12 Recording/Replay + F13 Streamer/Clean Feed)
+    drawSectionHdr(ICON_RECORD, "CREATOR STUDIO (F12 / F13)", Theme::ACCENT_RED);
+    {
+        int hw2 = (w - 6) / 2;
+        RECT rRecBtn = { x, y, x + hw2, y + 30 };
+        RECT rRepBtn = { x + hw2 + 6, y, x + w, y + 30 };
+        bool hRec = ptIn(rRecBtn, hoverX, hoverY);
+        bool hRep = ptIn(rRepBtn, hoverX, hoverY);
+        char recLbl[32];
+        if (creatorRecording_) {
+            std::snprintf(recLbl, sizeof(recLbl), "STOP REC %02d:%02d", creatorRecSec_ / 60, creatorRecSec_ % 60);
+        } else {
+            std::snprintf(recLbl, sizeof(recLbl), "RECORD MP4");
+        }
+        GdiPlusDraw::roundedCard(g, rRecBtn, 6.0f,
+                                 creatorRecording_ ? Theme::ACCENT_RED : (hRec ? Theme::ACCENT_RED_BG : Theme::BG_CARD),
+                                 Theme::ACCENT_RED, 1.2f);
+        GdiPlusDraw::textCenter(g, recLbl, static_cast<float>(rRecBtn.left + rRecBtn.right) * 0.5f,
+                                static_cast<float>(y + 15), 10.5f, true,
+                                creatorRecording_ ? 0xFFFFFFFFu : Theme::ACCENT_RED);
+
+        char repLbl[40];
+        if (s.replayBufferEnabled && creatorReplayBufSec_ >= 1.0) {
+            std::snprintf(repLbl, sizeof(repLbl), "REPLAY (%.0fs)", creatorReplayBufSec_);
+        } else {
+            std::snprintf(repLbl, sizeof(repLbl), "SAVE REPLAY");
+        }
+        GdiPlusDraw::roundedCard(g, rRepBtn, 6.0f,
+                                 hRep ? Theme::ACCENT_AMBER : Theme::ACCENT_AMBER_BG,
+                                 Theme::ACCENT_AMBER, 1.1f);
+        GdiPlusDraw::textCenter(g, repLbl, static_cast<float>(rRepBtn.left + rRepBtn.right) * 0.5f,
+                                static_cast<float>(y + 15), 10.5f, true,
+                                hRep ? 0xFF08121Au : Theme::ACCENT_AMBER);
+        if (rRecBtn.bottom > bodyClip_.top && rRecBtn.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rRecBtn, DA_TOGGLE_RECORD, 0 });
+            hotspots_.push_back(Hotspot{ rRepBtn, DA_SAVE_REPLAY, 0 });
+        }
+        y += 36;
+
+        drawToggleRow(g, x, y, w, "Instant Replay Ring Buffer", s.replayBufferEnabled, Theme::ACCENT_AMBER, DA_TOGGLE_REPLAY_BUF, hoverX, hoverY); y += 34;
+        if (s.replayBufferEnabled) {
+            drawSeg3("REPLAY WINDOW", "15s", "30s", "60s", 15, 30, 60, s.replayBufferSec, DA_SET_REPLAY_SEC);
+        }
+        drawToggleRow(g, x, y, w, "Streamer Mode (Hide HUD/Chrome)", s.streamerMode, Theme::ACCENT_PURPLE, DA_TOGGLE_STREAMER_MODE, hoverX, hoverY); y += 34;
+        drawToggleRow(g, x, y, w, "OBS Clean Feed Window", creatorCleanFeedOpen_, Theme::ACCENT_CYAN, DA_TOGGLE_CLEAN_FEED, hoverX, hoverY); y += 34;
+        drawToggleRow(g, x, y, w, "Keypress Overlay (Main Window)", s.streamerKeypressOverlay, Theme::ACCENT_CYAN, DA_TOGGLE_KEYPRESS_OVERLAY, hoverX, hoverY); y += 34;
+        drawToggleRow(g, x, y, w, "Show Android Touches (Safe Cleanup)", s.streamerShowTouches, Theme::ACCENT_AMBER, DA_TOGGLE_SHOW_TOUCHES, hoverX, hoverY); y += 36;
+    }
+
+    // 5d. DEVICE CONTROLS (F14)
+    drawSectionHdr(ICON_SETTINGS, "DEVICE CONTROLS (F14)", Theme::ACCENT_CYAN);
+    {
+        struct DevBtnSpec { const char* lbl; int act; uint32_t col; };
+        const DevBtnSpec row1[5] = {
+            { "Rotate",   DA_DEV_ROTATE,         Theme::ACCENT_CYAN },
+            { "Notifs",   DA_DEV_NOTIFS,         Theme::ACCENT_CYAN },
+            { "Quick",    DA_DEV_SETTINGS_PANEL, Theme::ACCENT_CYAN },
+            { "Collapse", DA_DEV_COLLAPSE_PANELS,Theme::ACCENT_CYAN },
+            { "Wake",     DA_DEV_WAKE_BACK,      Theme::ACCENT_GREEN }
+        };
+        const DevBtnSpec row2[5] = {
+            { "Power",    DA_DEV_POWER,     Theme::ACCENT_RED },
+            { "Vol -",    DA_DEV_VOL_DN,    Theme::TEXT_SECONDARY },
+            { "Vol +",    DA_DEV_VOL_UP,    Theme::TEXT_SECONDARY },
+            { "Mute",     DA_DEV_VOL_MUTE,  Theme::ACCENT_AMBER },
+            { "Shot->Clip", DA_DEV_SHOT_CLIP, Theme::ACCENT_PURPLE }
+        };
+        int bw = (w - 16) / 5;
+        for (int r = 0; r < 2; ++r) {
+            const DevBtnSpec* items = (r == 0) ? row1 : row2;
+            int ry = y + r * 30;
+            for (int c = 0; c < 5; ++c) {
+                int bx = x + c * (bw + 4);
+                RECT rb = { bx, ry, bx + bw, ry + 26 };
+                bool hov = ptIn(rb, hoverX, hoverY);
+                GdiPlusDraw::roundedCard(g, rb, 6.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD, items[c].col, 1.0f);
+                GdiPlusDraw::textCenter(g, items[c].lbl, static_cast<float>(rb.left + rb.right) * 0.5f,
+                                        static_cast<float>(ry + 13), 9.5f, true, items[c].col);
+                if (rb.bottom > bodyClip_.top && rb.top < bodyClip_.bottom) {
+                    hotspots_.push_back(Hotspot{ rb, items[c].act, 0 });
+                }
+            }
+        }
+        y += 64;
+    }
+
     // 6. ADVANCED (F16 - collapsible)
     RECT rAdv = { x, y, x + w, y + 28 };
     GdiPlusDraw::roundedCard(g, rAdv, 7.0f, ptIn(rAdv, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_STRONG, 1.0f);
@@ -1395,11 +1481,24 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
 
         if (s.virtualDisplayMode) {
             int curVd = 0;
-            if (s.virtualDisplaySpec == "1280x720/240") curVd = 1;
-            else if (s.virtualDisplaySpec == "auto") curVd = 2;
-            drawSeg3("VIRTUAL DISPLAY SIZE", "1080p PC", "720p Fast", "Auto", 0, 1, 2, curVd, DA_VD_PRESET);
-            GdiPlusDraw::textLeft(g, "Note: Android virtual displays may cap games at 60 fps (2.6).", static_cast<float>(x + 4), static_cast<float>(y - 2), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
-            y += 14;
+            if (s.virtualDisplaySpec == "1600x900/280") curVd = 1;
+            else if (s.virtualDisplaySpec == "1280x720/240") curVd = 2;
+            else if (s.virtualDisplaySpec == "1080x1920/420") curVd = 3;
+            else if (s.virtualDisplaySpec == "auto") curVd = 4;
+            GdiPlusDraw::textLeft(g, "VIRTUAL DISPLAY SIZE & DPI (F14)", static_cast<float>(x), static_cast<float>(y + 6), 10.5f, true, Theme::TEXT_MUTED);
+            y += 18;
+            const char* vdLbls[5] = { "1080p", "900p", "720p", "Port", "Auto" };
+            int vw = (w - 16) / 5;
+            for (int vi = 0; vi < 5; ++vi) {
+                RECT r = { x + vi * (vw + 4), y, x + vi * (vw + 4) + vw, y + 26 };
+                bool on = (curVd == vi);
+                GdiPlusDraw::roundedCard(g, r, 6.0f, on ? Theme::ACCENT_PURPLE_BG : Theme::BG_CARD, on ? Theme::ACCENT_PURPLE : Theme::BORDER_SUBTLE, on ? 1.4f : 1.0f);
+                GdiPlusDraw::textCenter(g, vdLbls[vi], static_cast<float>(r.left + r.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, on ? Theme::ACCENT_PURPLE : Theme::TEXT_SECONDARY);
+                if (r.bottom > bodyClip_.top && r.top < bodyClip_.bottom) hotspots_.push_back(Hotspot{ r, DA_VD_PRESET, vi });
+            }
+            y += 32;
+            GdiPlusDraw::textLeft(g, "Note: Android virtual displays may cap games at 60 fps (2.6).", static_cast<float>(x + 4), static_cast<float>(y), 9.5f, false, Theme::TEXT_MUTED, static_cast<float>(w - 8));
+            y += 16;
         }
     }
 
@@ -2335,10 +2434,67 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
                     : "Second-Phone Virtual Display OFF (mirror main screen)";
                 return true;
             case DA_VD_PRESET:
-                settings.virtualDisplaySpec = (hs.extra == 1) ? "1280x720/240"
-                                            : (hs.extra == 2) ? "auto" : "1920x1080/320";
+                settings.virtualDisplaySpec = (hs.extra == 1) ? "1600x900/280"
+                                            : (hs.extra == 2) ? "1280x720/240"
+                                            : (hs.extra == 3) ? "1080x1920/420"
+                                            : (hs.extra == 4) ? "auto" : "1920x1080/320";
                 out.settingsModified = true;
                 return true;
+            case DA_TOGGLE_RECORD:
+                out.requestToggleRecord = true;
+                return true;
+            case DA_SAVE_REPLAY:
+                out.requestSaveReplay = true;
+                return true;
+            case DA_TOGGLE_REPLAY_BUF:
+                settings.replayBufferEnabled = !settings.replayBufferEnabled;
+                out.settingsModified = true;
+                out.replayConfigChanged = true;
+                out.toastMessage = settings.replayBufferEnabled
+                    ? "Instant Replay Buffer ON"
+                    : "Instant Replay Buffer OFF";
+                return true;
+            case DA_SET_REPLAY_SEC:
+                settings.replayBufferSec = (hs.extra == 15 || hs.extra == 60) ? hs.extra : 30;
+                out.settingsModified = true;
+                out.replayConfigChanged = true;
+                return true;
+            case DA_TOGGLE_STREAMER_MODE:
+                settings.streamerMode = !settings.streamerMode;
+                out.settingsModified = true;
+                out.streamerModeChanged = true;
+                out.toastMessage = settings.streamerMode
+                    ? "Streamer Mode ON (HUD & overlays hidden)"
+                    : "Streamer Mode OFF";
+                return true;
+            case DA_TOGGLE_CLEAN_FEED:
+                out.requestToggleCleanFeed = true;
+                return true;
+            case DA_TOGGLE_KEYPRESS_OVERLAY:
+                settings.streamerKeypressOverlay = !settings.streamerKeypressOverlay;
+                out.settingsModified = true;
+                out.streamerModeChanged = true;
+                out.toastMessage = settings.streamerKeypressOverlay
+                    ? "Keypress Overlay ON (main window only)"
+                    : "Keypress Overlay OFF";
+                return true;
+            case DA_TOGGLE_SHOW_TOUCHES:
+                settings.streamerShowTouches = !settings.streamerShowTouches;
+                out.settingsModified = true;
+                out.toastMessage = settings.streamerShowTouches
+                    ? "Show Android Touches ON (Apply & Reconnect; auto-cleans on exit)"
+                    : "Show Android Touches OFF (Apply & Reconnect)";
+                return true;
+            case DA_DEV_ROTATE:         out.requestDeviceControl = 1; return true;
+            case DA_DEV_NOTIFS:         out.requestDeviceControl = 2; return true;
+            case DA_DEV_SETTINGS_PANEL: out.requestDeviceControl = 3; return true;
+            case DA_DEV_COLLAPSE_PANELS:out.requestDeviceControl = 4; return true;
+            case DA_DEV_WAKE_BACK:      out.requestDeviceControl = 5; return true;
+            case DA_DEV_POWER:          out.requestDeviceControl = 6; return true;
+            case DA_DEV_VOL_DN:         out.requestDeviceControl = 7; return true;
+            case DA_DEV_VOL_UP:         out.requestDeviceControl = 8; return true;
+            case DA_DEV_VOL_MUTE:       out.requestDeviceControl = 9; return true;
+            case DA_DEV_SHOT_CLIP:      out.requestDeviceControl = 10; return true;
             case DA_TOGGLE_GAMEPAD:
                 settings.gamepadEnabled = !settings.gamepadEnabled;
                 out.settingsModified = true;
