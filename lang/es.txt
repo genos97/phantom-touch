@@ -4,6 +4,8 @@ tab.sens = SENS
 tab.cfg = PERFIL
 tab.dev = DISP
 tab.pad = MANDO
+tab.apps = APPS
+tab.files = ARCHIVOS
 
 sec.connection = CONEXIÓN
 sec.stream = TRANSMISIÓN

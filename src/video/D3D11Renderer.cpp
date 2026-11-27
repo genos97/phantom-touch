@@ -296,6 +296,13 @@ bool D3D11Renderer::init(HWND targetHwnd, int initialW, int initialH, std::strin
                 frameLatencyWaitable_ ? 1 : 0, supportsGpuNv12Srv_ ? 1 : 0);
     std::fflush(stdout);
 
+    EnterCriticalSection(&frameLock_);
+    const size_t preallocHudBytes = 16u * 1024u * 1024u;
+    if (stagedHud_.size() < preallocHudBytes) {
+        stagedHud_.assign(preallocHudBytes, 0);
+    }
+    LeaveCriticalSection(&frameLock_);
+
     LeaveCriticalSection(&d3dLock_);
     return true;
 }
@@ -607,8 +614,8 @@ bool D3D11Renderer::rebuildDevice(std::string& outError) {
     int hw = 0, hh = 0;
     bool hadHud = false;
     EnterCriticalSection(&frameLock_);
-    if (hasHud_ && !stagedHud_.empty()) {
-        hudCopy = stagedHud_;
+    if (hasHud_ && stagedHudBytes_ > 0 && stagedHud_.size() >= stagedHudBytes_) {
+        hudCopy.assign(stagedHud_.data(), stagedHud_.data() + stagedHudBytes_);
         hw = stagedHudW_;
         hh = stagedHudH_;
         hadHud = true;
@@ -684,8 +691,11 @@ void D3D11Renderer::updateHudBitmap(const void* bgraPremulPixels, int width, int
     if (!bgraPremulPixels || width < 8 || height < 8) return;
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
     EnterCriticalSection(&frameLock_);
-    stagedHud_.resize(bytes);
+    if (stagedHud_.size() < bytes) {
+        stagedHud_.resize(bytes);
+    }
     std::memcpy(stagedHud_.data(), bgraPremulPixels, bytes);
+    stagedHudBytes_ = bytes;
     stagedHudW_ = width;
     stagedHudH_ = height;
     hudDirty_ = true;
@@ -695,7 +705,7 @@ void D3D11Renderer::updateHudBitmap(const void* bgraPremulPixels, int width, int
 
 void D3D11Renderer::clearHudBitmap() {
     EnterCriticalSection(&frameLock_);
-    stagedHud_.clear();
+    stagedHudBytes_ = 0;
     stagedHudW_ = 0;
     stagedHudH_ = 0;
     hudDirty_ = false;
@@ -1159,7 +1169,8 @@ void D3D11Renderer::renderLocked(const ViewportRect& videoRectInHost, bool drawH
     // 2. Upload fresh frosted-glass HUD bitmap ONLY when modified!
     bool canDrawHud = false;
     if (drawHudOverlay && hasHud_) {
-        if (hudDirty_ && stagedHudW_ >= 8 && stagedHudH_ >= 8 && !stagedHud_.empty()) {
+        if (hudDirty_ && stagedHudW_ >= 8 && stagedHudH_ >= 8 &&
+            stagedHudBytes_ >= static_cast<size_t>(stagedHudW_) * static_cast<size_t>(stagedHudH_) * 4u) {
             if (ensureHudTextureLocked(stagedHudW_, stagedHudH_)) {
                 D3D11_MAPPED_SUBRESOURCE msH;
                 if (SUCCEEDED(ctx_->Map(texHud_, 0, D3D11_MAP_WRITE_DISCARD, 0, &msH))) {
@@ -1363,7 +1374,73 @@ bool D3D11Renderer::convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<
     return true;
 }
 
-bool D3D11Renderer::saveLatestFramePng(const std::string& savePath, std::string& outError) const {
+bool D3D11Renderer::buildDibFromBgra(const uint8_t* bgraTopDown, uint32_t w, uint32_t h,
+                                     std::vector<uint8_t>& outDib) {
+    outDib.clear();
+    if (!bgraTopDown || w == 0 || h == 0 || w > 16384 || h > 16384) return false;
+    const size_t rowBytes = static_cast<size_t>(w) * 4u;
+    const size_t imgBytes = rowBytes * static_cast<size_t>(h);
+    outDib.resize(sizeof(BITMAPINFOHEADER) + imgBytes);
+
+    BITMAPINFOHEADER* bih = reinterpret_cast<BITMAPINFOHEADER*>(outDib.data());
+    ZeroMemory(bih, sizeof(BITMAPINFOHEADER));
+    bih->biSize = sizeof(BITMAPINFOHEADER);
+    bih->biWidth = static_cast<LONG>(w);
+    bih->biHeight = static_cast<LONG>(h); // Positive = bottom-up DIB expected by CF_DIB readers
+    bih->biPlanes = 1;
+    bih->biBitCount = 32;
+    bih->biCompression = BI_RGB;
+    bih->biSizeImage = static_cast<DWORD>(imgBytes);
+
+    uint8_t* dstBase = outDib.data() + sizeof(BITMAPINFOHEADER);
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* srcRow = bgraTopDown + static_cast<size_t>(h - 1u - y) * rowBytes;
+        uint8_t* dstRow = dstBase + static_cast<size_t>(y) * rowBytes;
+        std::memcpy(dstRow, srcRow, rowBytes);
+        for (uint32_t x = 0; x < w; ++x) {
+            dstRow[x * 4u + 3u] = 255u;
+        }
+    }
+    return true;
+}
+
+bool D3D11Renderer::buildDibFromPngFile(const std::string& pngPathUtf8, std::vector<uint8_t>& outDib) {
+    outDib.clear();
+    if (pngPathUtf8.empty()) return false;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, pngPathUtf8.c_str(), -1, NULL, 0);
+    if (wlen <= 1) return false;
+    std::wstring wpath(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, pngPathUtf8.c_str(), -1, &wpath[0], wlen);
+
+    Gdiplus::Bitmap bmp(wpath.c_str());
+    if (bmp.GetLastStatus() != Gdiplus::Ok) return false;
+    const UINT w = bmp.GetWidth();
+    const UINT h = bmp.GetHeight();
+    if (w == 0 || h == 0) return false;
+
+    Gdiplus::Rect lockRc(0, 0, static_cast<INT>(w), static_cast<INT>(h));
+    Gdiplus::BitmapData bd;
+    ZeroMemory(&bd, sizeof(bd));
+    if (bmp.LockBits(&lockRc, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) != Gdiplus::Ok) {
+        return false;
+    }
+
+    std::vector<uint8_t> topDown(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
+    const uint8_t* src = static_cast<const uint8_t*>(bd.Scan0);
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* row = (bd.Stride >= 0)
+            ? (src + static_cast<size_t>(y) * static_cast<size_t>(bd.Stride))
+            : (src + static_cast<size_t>(h - 1u - y) * static_cast<size_t>(-bd.Stride));
+        std::memcpy(topDown.data() + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u,
+                    row, static_cast<size_t>(w) * 4u);
+    }
+    bmp.UnlockBits(&bd);
+    return buildDibFromBgra(topDown.data(), static_cast<uint32_t>(w), static_cast<uint32_t>(h), outDib);
+}
+
+bool D3D11Renderer::saveLatestFramePng(const std::string& savePath, std::string& outError,
+                                       std::vector<uint8_t>* outDib) const {
+    if (outDib) outDib->clear();
     DecodedNV12Frame snap;
     bool gotSnap = false;
 
@@ -1501,6 +1578,9 @@ bool D3D11Renderer::saveLatestFramePng(const std::string& savePath, std::string&
     if (st != Gdiplus::Ok) {
         outError = "Failed encoding PNG screenshot.";
         return false;
+    }
+    if (outDib) {
+        buildDibFromBgra(bgra.data(), snap.width, snap.height, *outDib);
     }
     return true;
 }

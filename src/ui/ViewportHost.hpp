@@ -89,7 +89,8 @@ public:
     void updateEmbeddedHud(const void* bgraPremulPixels, int width, int height);
     void setDynamicHudMarkers(const DynamicHudMarkers& markers) { d3d_.setDynamicHudMarkers(markers); }
     void renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
-    bool captureNativeScreenshot(const std::string& savePath, std::string& outError) const;
+    bool captureNativeScreenshot(const std::string& savePath, std::string& outError,
+                                 std::vector<uint8_t>* outDib = nullptr) const;
     bool hasNativeVideoFrame() const { return d3d_.hasVideoFrame(); }
 
     // Round-trip probe forwarding (LATENCY_PLAN 0.2)

@@ -4,6 +4,8 @@ tab.sens = SENS
 tab.cfg = PROFIL
 tab.dev = ALAT
 tab.pad = PAD
+tab.apps = APLIKASI
+tab.files = BERKAS
 
 sec.connection = KONEKSI
 sec.stream = STREAMING

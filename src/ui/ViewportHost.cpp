@@ -292,12 +292,13 @@ void ViewportHost::renderNativeFrame(bool drawHudOverlay, FrameTiming* ioTiming)
     }
 }
 
-bool ViewportHost::captureNativeScreenshot(const std::string& savePath, std::string& outError) const {
+bool ViewportHost::captureNativeScreenshot(const std::string& savePath, std::string& outError,
+                                           std::vector<uint8_t>* outDib) const {
     if (!isNativeVideoActive()) {
         outError = "Native D3D11 video not active.";
         return false;
     }
-    return d3d_.saveLatestFramePng(savePath, outError);
+    return d3d_.saveLatestFramePng(savePath, outError, outDib);
 }
 
 void ViewportHost::setBounds(const RECT& boundsInParent) {
@@ -439,7 +440,7 @@ void ViewportHost::paint(Gdiplus::Graphics& g, const RECT& clientRc,
     hotspots_.clear();
     ZeroMemory(&hubDeviceListRc_, sizeof(hubDeviceListRc_));
     hubDeviceMaxScrollY_ = 0;
-    GdiPlusDraw::fillRect(g, clientRc, Theme::BG_CANVAS);
+    // ShellWindow::onPaint() already cleared cacheDC_ to Theme::BG_CANVAS via native GDI FillRect.
 
     if (connected) {
         // Subtle bezel frame around the embedded phone screen

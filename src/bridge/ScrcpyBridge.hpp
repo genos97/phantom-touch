@@ -96,6 +96,21 @@ struct PhoneThermalInfo {
     std::string thermalLabel;
 };
 
+struct DeviceAppInfo {
+    std::string name;
+    std::string packageName;
+    bool isSystem = false;
+};
+
+struct RemoteFileEntry {
+    std::string name;
+    std::string fullPath;
+    bool isDir = false;
+    bool isSymlink = false;
+    uint64_t sizeBytes = 0;
+    std::string modified;
+};
+
 typedef void (*DeviceClipboardFn)(void* ctx, const std::string& utf8Text);
 typedef void (*ConnectStepFn)(void* ctx, int step);
 typedef void (*VideoPacketFn)(void* ctx, const uint8_t* data, size_t size,
@@ -155,8 +170,13 @@ public:
     static AudioCodecId parseAudioCodecId(uint32_t rawBeId);
     static bool parseAudioPacketHeader(const uint8_t hdr[12], bool isV4Proto,
                                        uint64_t& outPtsUs, uint32_t& outSize, bool& outIsConfig);
+    static std::vector<DeviceAppInfo> parseAppListOutput(const std::string& raw);
+    static size_t serializeScanFile(uint8_t* buf, size_t cap, const std::string& remotePathUtf8);
+    static std::string shellSingleQuote(const std::string& raw);
+    static std::vector<RemoteFileEntry> parseLsLaOutput(const std::string& raw, const std::string& baseDir);
 
     bool listH264Encoders(const ToolPaths& tools, const std::string& deviceSerial, std::vector<VideoEncoderInfo>& outEncoders);
+    bool listInstalledApps(const ToolPaths& tools, const std::string& deviceSerial, std::vector<DeviceAppInfo>& outApps);
     bool queryThermalTelemetry(PhoneThermalInfo& outInfo);
 
     bool launchMirrorWindow(const ToolPaths& tools, const std::string& extraArgs,
@@ -194,6 +214,7 @@ public:
     bool sendStartApp(const std::string& appName);
     bool sendResetVideo();
     bool sendResizeDisplay(uint16_t width, uint16_t height);
+    bool sendScanFile(const std::string& remotePathUtf8);
     bool sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,
                         const std::string& name, const uint8_t* reportDesc, uint16_t reportDescSize);
     bool sendUhidInput(uint16_t id, const uint8_t* data, uint16_t size);
@@ -206,11 +227,14 @@ public:
     void setVideoPacketCallback(VideoPacketFn fn, void* ctx);
     void setAudioPacketCallback(AudioPacketFn fn, void* ctx);
 
-    // Foreground app inspection & Drag-and-Drop file/APK helpers
+    // Foreground app inspection & Two-Way file/APK helpers
     bool queryForegroundInfo(std::string& outPackage, bool& outSecure);
     std::string queryForegroundPackage();
     bool installApk(const std::string& localApkPath, std::string& outMsg);
+    bool pushFileToRemoteDir(const std::string& localFilePath, const std::string& remoteDir, std::string& outMsg);
     bool pushFileToDownloads(const std::string& localFilePath, std::string& outMsg);
+    bool listRemoteDirectory(const std::string& remoteDir, std::vector<RemoteFileEntry>& outEntries, std::string& outErr);
+    bool pullRemoteFile(const std::string& remotePath, const std::string& localDestPath, std::string& outMsg);
 
     // Captures a native device PNG screenshot via adb exec-out screencap -p
     bool captureScreenshot(const std::string& savePath, std::string& outError);

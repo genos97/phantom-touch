@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 enum StreamPresetId {
     PRESET_CUSTOM = 0,
@@ -10,6 +11,25 @@ enum StreamPresetId {
     PRESET_QUALITY = 3,
     PRESET_WIFI = 4
 };
+
+struct LaunchOptions {
+    bool demoMode = false;
+    bool noMirror = false;
+    bool showConsole = false;
+    bool explicitProfile = false;
+    bool probeOnConnect = false;
+    bool startFullscreen = false;
+    bool showHelp = false;
+    int probeSamples = 60;
+    bool forceAudio = false;
+    std::string forceAudioCodec;
+    int forceAudioBufferMs = 0;
+    std::string profilePath;
+    std::string launchAppPackage;
+};
+
+std::string sanitizePackageNameToken(const std::string& raw);
+LaunchOptions parseLaunchOptions(int argc, const char* const* argv);
 
 // Persists desktop emulator shell layout & scrcpy mirror stream preferences
 // in <profilesDir>\.shell_settings.cfg (independent from per-game keymap profiles).
@@ -47,6 +67,10 @@ struct AppSettings {
     int lastPhoneH = 1080;
     std::string lastWirelessAddr = "192.168.1.100:5555";
     std::string lastGameProfile;    // Remembers preferred game profile across Desktop auto-switch & restarts
+    std::vector<std::string> pinnedApps; // F8: Pinned Android package names for Apps Launcher
+
+    bool isAppPinned(const std::string& pkg) const;
+    void togglePinApp(const std::string& pkg);
 
     std::string buildScrcpyArgs() const;
     void applyStreamPreset(StreamPresetId id);

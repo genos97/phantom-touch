@@ -41,7 +41,8 @@ public:
                           bool startFullscreen = false,
                           bool forceAudio = false,
                           const std::string& forceAudioCodec = "",
-                          int forceAudioBufferMs = 0) {
+                          int forceAudioBufferMs = 0,
+                          const std::string& launchAppPackage = "") {
         consoleEnabled_ = consoleEnabled;
         autoProbeOnConnect_ = probeOnConnect;
         autoProbeSamples_ = probeSamples;
@@ -49,6 +50,12 @@ public:
         forceAudioOn_ = forceAudio;
         forceAudioCodec_ = forceAudioCodec;
         forceAudioBufferMs_ = forceAudioBufferMs;
+        launchAppPackage_ = launchAppPackage;
+        pendingLaunchApp_ = launchAppPackage;
+        if (!launchAppPackage_.empty()) {
+            forceVirtualDisplayOnce_ = true;
+            showOnboarding_ = false;
+        }
         if (autoProbeOnConnect_) showOnboarding_ = false;
     }
 
@@ -96,6 +103,9 @@ private:
     static DWORD WINAPI settingsSaveWorkerProc(LPVOID param);
     static DWORD WINAPI screenshotThreadProc(LPVOID param);
     static DWORD WINAPI probeThreadProc(LPVOID param);
+    static DWORD WINAPI listAppsThreadProc(LPVOID param);
+    static DWORD WINAPI listFilesThreadProc(LPVOID param);
+    static DWORD WINAPI pullFileThreadProc(LPVOID param);
     static void onConnectStep(void* ctx, int step);
     static void onDeviceClipboard(void* ctx, const std::string& utf8Text);
     static void onPadNav(void* ctx, uint8_t navMask);
@@ -134,6 +144,11 @@ private:
     void startAsyncWirelessConnect(const std::string& ipPort);
     void startAsyncRepairTools();
     void startAsyncDropTransfer(const std::vector<std::string>& files);
+    void startAsyncPushFiles(const std::vector<std::string>& files, const std::string& targetDir);
+    void startAsyncPullRemoteFile(const std::string& remotePath, const std::string& fileName);
+    void requestInstalledApps(bool forceRefresh);
+    void requestBrowseRemoteDir(const std::string& dir);
+    void openAppInSecondPhone(const std::string& pkg, const std::string& label);
     void startQrWirelessPairing();
     void stopQrWirelessPairing();
     void startRoundTripProbe(int numTrials = 60);
@@ -155,6 +170,7 @@ private:
     void sendPhoneText(const std::string& utf8);
     std::string readWindowsClipboardUtf8() const;
     void writeWindowsClipboardUtf8(const std::string& utf8Text, bool fromPhone = true);
+    bool writeWindowsClipboardDib(const std::vector<uint8_t>& dibBytes);
 
     void setAimMode(bool enabled);
     void setDrawerState(bool open, int tab);
@@ -264,6 +280,9 @@ private:
     volatile LONG probing_ = 0;
     volatile LONG stopProbe_ = 0;
     volatile LONG settingsSaveInFlight_ = 0;
+    volatile LONG listingApps_ = 0;
+    volatile LONG listingFiles_ = 0;
+    volatile LONG pullingFile_ = 0;
     bool showingQrPair_ = false;
     std::string qrServiceName_;
     std::string qrPairPassword_;
@@ -275,11 +294,30 @@ private:
     std::string asyncResultMsg_;
     bool asyncResultOk_ = false;
     std::string pendingScreenshotToast_;
+    std::vector<uint8_t> pendingScreenshotDib_;
     std::vector<AdbDeviceInfo> pendingAdbDevices_;
     ToolPaths pendingTools_;
     std::string pendingToolsErr_;
     bool pendingToolsOk_ = false;
     bool pendingDevicesRefreshOk_ = false;
+
+    std::string launchAppPackage_;
+    std::string pendingLaunchApp_;
+    bool forceVirtualDisplayOnce_ = false;
+    std::string appsListSerial_;
+    std::vector<DeviceAppInfo> pendingAppsList_;
+    bool pendingAppsOk_ = false;
+    std::map<std::string, std::vector<DeviceAppInfo>> appListCache_;
+    std::string pendingBrowseDir_;
+    std::string remoteCurrentDir_ = "/sdcard";
+    std::vector<RemoteFileEntry> pendingRemoteFiles_;
+    bool pendingFilesOk_ = false;
+    std::string pendingFilesErr_;
+    std::string pendingPullRemote_;
+    std::string pendingPullLocal_;
+    std::string pendingFileTransferMsg_;
+    bool pendingFileTransferOk_ = false;
+    std::string pendingDropTargetDir_ = "/sdcard/Download";
 
     std::string activeAppPackage_;
     std::string pendingForegroundPkg_;

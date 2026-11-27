@@ -4,6 +4,8 @@ tab.sens = SENS
 tab.cfg = CFG
 tab.dev = DEV
 tab.pad = PAD
+tab.apps = APPS
+tab.files = FILES
 
 sec.connection = CONNECTION
 sec.stream = STREAM

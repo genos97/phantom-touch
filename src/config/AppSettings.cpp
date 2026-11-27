@@ -179,6 +179,86 @@ bool AppSettings::hasPendingStreamChanges(const AppSettings& live, const AppSett
     return countPendingStreamChanges(live, applied, serial) > 0;
 }
 
+bool AppSettings::isAppPinned(const std::string& pkg) const {
+    for (size_t i = 0; i < pinnedApps.size(); ++i) {
+        if (pinnedApps[i] == pkg) return true;
+    }
+    return false;
+}
+
+void AppSettings::togglePinApp(const std::string& pkg) {
+    std::string clean = sanitizePackageNameToken(pkg);
+    if (clean.empty()) return;
+    for (size_t i = 0; i < pinnedApps.size(); ++i) {
+        if (pinnedApps[i] == clean) {
+            pinnedApps.erase(pinnedApps.begin() + static_cast<ptrdiff_t>(i));
+            return;
+        }
+    }
+    pinnedApps.push_back(clean);
+}
+
+std::string sanitizePackageNameToken(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size() && out.size() < 160; ++i) {
+        unsigned char uc = static_cast<unsigned char>(raw[i]);
+        bool ok = std::isalnum(uc) || uc == '.' || uc == '_' || uc == '+' || uc == '-';
+        if (ok) out.push_back(static_cast<char>(uc));
+    }
+    return out;
+}
+
+LaunchOptions parseLaunchOptions(int argc, const char* const* argv) {
+    LaunchOptions o;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i]) continue;
+        std::string arg = argv[i];
+        if (arg == "--demo") {
+            o.demoMode = true;
+        } else if (arg == "--no-mirror") {
+            o.noMirror = true;
+        } else if (arg == "--console") {
+            o.showConsole = true;
+        } else if (arg == "--probe-on-connect") {
+            o.probeOnConnect = true;
+        } else if (arg == "--fullscreen") {
+            o.startFullscreen = true;
+        } else if (arg == "--audio") {
+            o.forceAudio = true;
+        } else if (arg.find("--audio-codec=") == 0) {
+            std::string ac = arg.substr(14);
+            if (ac == "raw" || ac == "aac") {
+                o.forceAudioCodec = ac;
+                o.forceAudio = true;
+            }
+        } else if (arg.find("--audio-buffer=") == 0) {
+            int ms = std::atoi(arg.c_str() + 15);
+            if (ms >= 15 && ms <= 100) {
+                o.forceAudioBufferMs = ms;
+            }
+        } else if (arg.find("--probe-samples=") == 0) {
+            int n = std::atoi(arg.c_str() + 16);
+            if (n >= 5 && n <= 200) o.probeSamples = n;
+        } else if (arg.find("--app=") == 0) {
+            std::string pkg = sanitizePackageNameToken(arg.substr(6));
+            if (!pkg.empty()) o.launchAppPackage = pkg;
+        } else if (arg == "--app" && i + 1 < argc && argv[i + 1]) {
+            std::string pkg = sanitizePackageNameToken(argv[++i]);
+            if (!pkg.empty()) o.launchAppPackage = pkg;
+        } else if (arg == "--help" || arg == "-h") {
+            o.showHelp = true;
+        } else if (arg == "--profile" && i + 1 < argc && argv[i + 1]) {
+            o.profilePath = argv[++i];
+            o.explicitProfile = true;
+        } else if (!arg.empty() && arg[0] != '-') {
+            o.profilePath = arg;
+            o.explicitProfile = true;
+        }
+    }
+    return o;
+}
+
 bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
     std::ifstream in(path.c_str());
     if (!in.is_open()) return false;
@@ -234,6 +314,20 @@ bool AppSettingsStore::load(const std::string& path, AppSettings& outSettings) {
         else if (k == "last_phone_h") s.lastPhoneH = clampInt(std::atoi(v.c_str()), 320, 4096);
         else if (k == "last_wireless_addr" && !v.empty()) s.lastWirelessAddr = v;
         else if (k == "last_game_profile" && !v.empty()) s.lastGameProfile = v;
+        else if (k == "pinned_apps" && !v.empty()) {
+            s.pinnedApps.clear();
+            size_t start = 0;
+            while (start <= v.size()) {
+                size_t comma = v.find(',', start);
+                std::string tok = (comma == std::string::npos) ? v.substr(start) : v.substr(start, comma - start);
+                tok = sanitizePackageNameToken(trimLine(tok));
+                if (!tok.empty() && !s.isAppPinned(tok)) {
+                    s.pinnedApps.push_back(tok);
+                }
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+        }
     }
 
     outSettings = s;
@@ -285,6 +379,18 @@ bool AppSettingsStore::save(const std::string& path, const AppSettings& s) {
         out << "last_wireless_addr = " << s.lastWirelessAddr << "\n";
         if (!s.lastGameProfile.empty()) {
             out << "last_game_profile = " << s.lastGameProfile << "\n";
+        }
+        if (!s.pinnedApps.empty()) {
+            out << "pinned_apps = ";
+            bool first = true;
+            for (size_t i = 0; i < s.pinnedApps.size(); ++i) {
+                std::string clean = sanitizePackageNameToken(s.pinnedApps[i]);
+                if (clean.empty()) continue;
+                if (!first) out << ",";
+                out << clean;
+                first = false;
+            }
+            out << "\n";
         }
         out.flush();
         if (!out.good()) return false;

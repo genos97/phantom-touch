@@ -116,10 +116,13 @@ public:
     void tryRender(const ViewportRect& videoRectInHost, bool drawHudOverlay, FrameTiming* ioTiming = nullptr);
 
     // Instant local PNG screenshot straight from the latest GPU/CPU NV12 frame (zero ADB lag!)
-    bool saveLatestFramePng(const std::string& savePath, std::string& outError) const;
+    bool saveLatestFramePng(const std::string& savePath, std::string& outError,
+                            std::vector<uint8_t>* outDib = nullptr) const;
 
-    // Pure helper for unit tests: converts an NV12 frame into tightly packed 32-bit BGRA
+    // Pure helpers for unit tests and screenshot clipboard (CF_DIB)
     static bool convertNV12ToBGRA(const DecodedNV12Frame& nv12, std::vector<uint8_t>& outBgra);
+    static bool buildDibFromBgra(const uint8_t* bgraTopDown, uint32_t w, uint32_t h, std::vector<uint8_t>& outDib);
+    static bool buildDibFromPngFile(const std::string& pngPathUtf8, std::vector<uint8_t>& outDib);
 
 private:
     bool createSwapChainLocked(HWND hwnd, int w, int h, bool vsync);
@@ -202,6 +205,7 @@ private:
     bool hasFrame_ = false;
 
     std::vector<uint8_t> stagedHud_;
+    size_t stagedHudBytes_ = 0;
     int stagedHudW_ = 0;
     int stagedHudH_ = 0;
     bool hudDirty_ = false;

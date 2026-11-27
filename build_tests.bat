@@ -56,6 +56,7 @@ if defined MINGW64_BIN (
     src\ui\SideRail.cpp ^
     src\ui\ViewportHost.cpp ^
     src\ui\OnboardingView.cpp ^
+    src\ui\DesktopShortcut.cpp ^
     src\ui\DrawerPanel.cpp ^
     -o tests\test_core.exe ^
     -static ^

@@ -16,6 +16,8 @@ enum DrawerActionId {
     DA_TAB_2,
     DA_TAB_3,
     DA_TAB_4,
+    DA_TAB_5,
+    DA_TAB_6,
     DA_CLOSE,
     DA_SAVE,
 
@@ -116,7 +118,27 @@ enum DrawerActionId {
     DA_PAD_MODE,          // extra = 0 (TOUCH) / 1 (NATIVE)
     DA_PAD_BIND_BTN,      // extra = PadButtonId (0..15)
     DA_PAD_ASSIGN_TARGET, // extra = -1 (Clear), -2 (FIRE), -3 (SCOPE), >=0 (button idx)
-    DA_PAD_RESET_MAP
+    DA_PAD_RESET_MAP,
+
+    // Apps & Second Phone tab (F8)
+    DA_APPS_FOCUS_SEARCH,
+    DA_APPS_CLEAR_SEARCH,
+    DA_APPS_REFRESH,
+    DA_APPS_TOGGLE_SYSTEM,
+    DA_APP_TOGGLE_PIN,        // extra = index in installedApps_
+    DA_APP_OPEN_SECOND_PHONE, // extra = index in installedApps_
+    DA_APP_LAUNCH_CURRENT,    // extra = index in installedApps_
+    DA_APP_CREATE_SHORTCUT,   // extra = index in installedApps_
+    DA_OPEN_APPS_TAB,
+
+    // Two-Way Files tab (F9)
+    DA_FILES_UP,
+    DA_FILES_REFRESH,
+    DA_FILES_JUMP_DIR,        // extra = 0:/sdcard, 1:/sdcard/Download, 2:/sdcard/DCIM, 3:/sdcard/Pictures
+    DA_FILES_PUSH_PICKER,
+    DA_FILE_OPEN_DIR,         // extra = index in remoteEntries_
+    DA_FILE_PULL,             // extra = index in remoteEntries_
+    DA_OPEN_FILES_TAB
 };
 
 struct DrawerActionResult {
@@ -154,6 +176,19 @@ struct DrawerActionResult {
     bool requestDeleteProfileTrash = false;
     std::string deleteProfilePath;
     std::string deleteProfileName;
+    bool requestRefreshApps = false;
+    bool requestOpenAppSecondPhone = false;
+    bool requestLaunchAppCurrent = false;
+    bool requestCreateAppShortcut = false;
+    std::string appPackage;
+    std::string appName;
+    bool requestBrowseRemoteDir = false;
+    std::string browseRemoteDir;
+    bool requestPullRemoteFile = false;
+    std::string pullRemotePath;
+    std::string pullFileName;
+    bool requestPushFilePicker = false;
+    std::string pushTargetDir;
     std::string toastMessage;
 };
 
@@ -190,8 +225,15 @@ public:
         pendingStreamChanges_ = (pendingStreamChangeCount_ > 0);
     }
     void setEditTestLive(bool live) { editTestLive_ = live; }
+    void setInstalledApps(const std::vector<DeviceAppInfo>& apps, bool loading, const std::string& statusMsg);
+    void setRemoteFiles(const std::string& currentDir, const std::vector<RemoteFileEntry>& entries,
+                        bool loading, const std::string& statusMsg);
+    const std::string& remoteCurrentDir() const { return remoteCurrentDir_; }
 
-    bool isTypingText() const { return editingNewProfileName_ || editingNodeLabel_ || editingWireless_ || editingPaletteSearch_; }
+    bool isTypingText() const {
+        return editingNewProfileName_ || editingNodeLabel_ || editingWireless_ ||
+               editingPaletteSearch_ || editingAppsSearch_;
+    }
     bool isWaitingSpecialRebind() const { return specialRebind_ != SRB_NONE; }
     bool isRebindingToggleAim() const { return specialRebind_ == SRB_TOGGLE_AIM; }
     bool isRebindingHoldUnlock() const { return specialRebind_ == SRB_HOLD_UNLOCK; }
@@ -208,6 +250,7 @@ public:
         editingNodeLabel_ = false;
         editingWireless_ = false;
         editingPaletteSearch_ = false;
+        editingAppsSearch_ = false;
         focusedIdx_ = -1;
         specialRebind_ = SRB_NONE;
     }
@@ -299,11 +342,15 @@ private:
                        const std::vector<std::string>& logs, int hoverX, int hoverY);
     int paintTabGamepad(Gdiplus::Graphics& g, int x, int y, int w,
                         const Profile& p, const AppSettings& s, int hoverX, int hoverY);
+    int paintTabApps(Gdiplus::Graphics& g, int x, int y, int w,
+                     const AppSettings& s, bool connected, int hoverX, int hoverY);
+    int paintTabFiles(Gdiplus::Graphics& g, int x, int y, int w,
+                      bool connected, int hoverX, int hoverY);
 
     RECT bounds_;
     RECT bodyClip_;
     int activeTab_ = 0;
-    int scrollY_[5];
+    int scrollY_[7];
     int maxScrollY_ = 0;
 
     std::vector<Hotspot> hotspots_;
@@ -337,8 +384,19 @@ private:
     bool editingNodeLabel_ = false;
     bool editingWireless_ = false;
     bool editingPaletteSearch_ = false;
+    bool editingAppsSearch_ = false;
     bool editTestLive_ = false;
     std::string paletteSearch_;
+    std::string appsSearch_;
+    bool showSystemApps_ = false;
+    bool appsLoading_ = false;
+    std::string appsStatusMsg_;
+    std::vector<DeviceAppInfo> installedApps_;
+
+    std::string remoteCurrentDir_ = "/sdcard";
+    bool filesLoading_ = false;
+    std::string filesStatusMsg_;
+    std::vector<RemoteFileEntry> remoteEntries_;
     bool advancedExpanded_ = false;
     bool devAdvancedExpanded_ = false;
     bool pendingStreamChanges_ = false;

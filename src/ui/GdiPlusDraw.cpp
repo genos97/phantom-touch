@@ -834,36 +834,42 @@ ViewportRect GdiPlusDraw::computeAspectFit(int hostW, int hostH, uint32_t phoneW
     return out;
 }
 
+typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
+
+static DwmSetWindowAttributeFn getDwmSetWindowAttributeFn() {
+    static bool sResolved = false;
+    static DwmSetWindowAttributeFn sFn = NULL;
+    if (!sResolved) {
+        sResolved = true;
+        HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+        if (!hDwm) {
+            hDwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
+        if (hDwm) {
+            sFn = reinterpret_cast<DwmSetWindowAttributeFn>(
+                reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
+        }
+    }
+    return sFn;
+}
+
 bool GdiPlusDraw::enableDarkDwmFrame(HWND hwnd) {
     if (!hwnd) return false;
-    HMODULE hDwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hDwm) return false;
-    bool roundedOk = false;
-    typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
-    DwmSetWindowAttributeFn fn = reinterpret_cast<DwmSetWindowAttributeFn>(
-        reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
-    if (fn) {
-        BOOL dark = TRUE;
-        fn(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
-        DWORD cornerPref = 2 /* DWMWCP_ROUND */;
-        roundedOk = SUCCEEDED(fn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref)));
-        COLORREF borderCol = RGB(48, 74, 108);
-        fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
-    }
-    FreeLibrary(hDwm);
+    DwmSetWindowAttributeFn fn = getDwmSetWindowAttributeFn();
+    if (!fn) return false;
+    BOOL dark = TRUE;
+    fn(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    DWORD cornerPref = 2 /* DWMWCP_ROUND */;
+    bool roundedOk = SUCCEEDED(fn(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref)));
+    COLORREF borderCol = RGB(48, 74, 108);
+    fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
     return roundedOk;
 }
 
 void GdiPlusDraw::setDwmBorderActive(HWND hwnd, bool active) {
     if (!hwnd) return;
-    HMODULE hDwm = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hDwm) return;
-    typedef HRESULT (WINAPI *DwmSetWindowAttributeFn)(HWND, DWORD, LPCVOID, DWORD);
-    DwmSetWindowAttributeFn fn = reinterpret_cast<DwmSetWindowAttributeFn>(
-        reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
-    if (fn) {
-        COLORREF borderCol = active ? RGB(48, 74, 108) : RGB(28, 38, 56);
-        fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
-    }
-    FreeLibrary(hDwm);
+    DwmSetWindowAttributeFn fn = getDwmSetWindowAttributeFn();
+    if (!fn) return;
+    COLORREF borderCol = active ? RGB(48, 74, 108) : RGB(28, 38, 56);
+    fn(hwnd, 34 /* DWMWA_BORDER_COLOR */, &borderCol, sizeof(borderCol));
 }

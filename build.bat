@@ -65,6 +65,7 @@ if %ERRORLEVEL% NEQ 0 (
     src\ui\SideRail.cpp ^
     src\ui\ViewportHost.cpp ^
     src\ui\OnboardingView.cpp ^
+    src\ui\DesktopShortcut.cpp ^
     src\ui\DrawerPanel.cpp ^
     src\ui\HudOverlay.cpp ^
     src\ui\ShellWindow.cpp ^

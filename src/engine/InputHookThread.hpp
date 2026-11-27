@@ -45,7 +45,10 @@ enum ShellAppMsg {
     MSG_REPAIR_TOOLS_DONE  = WM_APP + 33,
     MSG_TOGGLE_CMD_PALETTE = WM_APP + 34,
     MSG_TOGGLE_CHEAT_SHEET = WM_APP + 35,
-    MSG_PAD_NAV            = WM_APP + 36
+    MSG_PAD_NAV            = WM_APP + 36,
+    MSG_APPS_LIST_DONE     = WM_APP + 37,
+    MSG_FILES_LIST_DONE    = WM_APP + 38,
+    MSG_FILE_TRANSFER_DONE = WM_APP + 39
 };
 
 // Lockless/microsecond snapshot pushed from ShellWindow to the dedicated input thread

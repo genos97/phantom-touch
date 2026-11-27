@@ -16,6 +16,7 @@
 #include "engine/JoystickController.hpp"
 #include "engine/ThreadScheduling.hpp"
 #include "ui/Animator.hpp"
+#include "ui/DesktopShortcut.hpp"
 #include "ui/DrawerPanel.hpp"
 #include "ui/EditorState.hpp"
 #include "ui/GdiPlusDraw.hpp"
@@ -2441,6 +2442,208 @@ static void testSprint5aLanguageAndClipboard() {
     std::printf("[Test] Sprint 5A (F10 IME/Unicode/i18n + F11 Clipboard v2) OK!\n");
 }
 
+void testSprint5bAppsFilesAndShortcuts() {
+    std::printf("[Test] Sprint 5B (F8 Apps/2ndPhone + F9 Files/CF_DIB)...\n");
+
+    // 1. ScrcpyBridge::parseAppListOutput (system '*', user '-', wrapped >30-char app name)
+    {
+        const std::string fixture =
+            "[server] INFO: Device: [samsung] samsung SM-G990E (Android 16)\n"
+            "[server] INFO: Processing Android apps... (this may take some time)\n"
+            "[server] INFO: List of apps:\n"
+            " * Calendar                       com.samsung.android.calendar\n"
+            " * Live Transcribe & Sound Notifications\n"
+            "                                  com.google.audio.hearing.visualization.accessibility.scribe\n"
+            " * Maps                           com.google.android.apps.maps\n"
+            " - Free Fire MAX                  com.dts.freefiremax\n"
+            " - WhatsApp                       com.whatsapp\n";
+        std::vector<DeviceAppInfo> apps = ScrcpyBridge::parseAppListOutput(fixture);
+        assert(apps.size() == 5);
+        assert(apps[0].isSystem && apps[0].name == "Calendar" && apps[0].packageName == "com.samsung.android.calendar");
+        assert(apps[1].isSystem && apps[1].name == "Live Transcribe & Sound Notifications");
+        assert(apps[1].packageName == "com.google.audio.hearing.visualization.accessibility.scribe");
+        assert(apps[2].isSystem && apps[2].name == "Maps" && apps[2].packageName == "com.google.android.apps.maps");
+        assert(!apps[3].isSystem && apps[3].name == "Free Fire MAX" && apps[3].packageName == "com.dts.freefiremax");
+        assert(!apps[4].isSystem && apps[4].name == "WhatsApp" && apps[4].packageName == "com.whatsapp");
+    }
+
+    // 2. LaunchOptions CLI --app=<package> and --app <package> parsing
+    {
+        const char* argv1[] = { "PhantomTouch.exe", "--app=com.whatsapp", "--probe-on-connect", "--probe-samples=12" };
+        LaunchOptions o1 = parseLaunchOptions(4, argv1);
+        assert(o1.launchAppPackage == "com.whatsapp");
+        assert(o1.probeOnConnect && o1.probeSamples == 12);
+
+        const char* argv2[] = { "PhantomTouch.exe", "--app", "com.dts.freefiremax;rm -rf /", "--console" };
+        LaunchOptions o2 = parseLaunchOptions(4, argv2);
+        assert(o2.launchAppPackage == "com.dts.freefiremaxrm-rf");
+        assert(o2.showConsole);
+    }
+
+    // 3. AppSettings pinned_apps persistence + togglePinApp
+    {
+        AppSettings a1;
+        a1.togglePinApp("com.whatsapp");
+        a1.togglePinApp("com.dts.freefiremax");
+        assert(a1.isAppPinned("com.whatsapp") && a1.isAppPinned("com.dts.freefiremax"));
+        const std::string tmpCfg = "profiles\\_test_sprint5b_settings.cfg";
+        assert(AppSettingsStore::save(tmpCfg, a1));
+        AppSettings a2;
+        assert(AppSettingsStore::load(tmpCfg, a2));
+        std::remove(tmpCfg.c_str());
+        assert(a2.pinnedApps.size() == 2);
+        assert(a2.isAppPinned("com.whatsapp") && a2.isAppPinned("com.dts.freefiremax"));
+        a2.togglePinApp("com.whatsapp");
+        assert(!a2.isAppPinned("com.whatsapp") && a2.pinnedApps.size() == 1);
+    }
+
+    // 4. DesktopShortcut::createAppShortcutFile writes a real Windows .lnk in %TEMP%
+    {
+        assert(DesktopShortcut::sanitizeTitle("App: <Test>/1?", "com.example.app") == "App   Test  1");
+        wchar_t tempDir[MAX_PATH] = {0};
+        DWORD n = GetTempPathW(MAX_PATH, tempDir);
+        assert(n > 0);
+        int u8n = WideCharToMultiByte(CP_UTF8, 0, tempDir, -1, NULL, 0, NULL, NULL);
+        std::string tempUtf8(static_cast<size_t>(u8n - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, tempDir, -1, &tempUtf8[0], u8n - 1, NULL, NULL);
+        const std::string lnkPath = tempUtf8 + "pt_test_5b_app.lnk";
+        std::string err;
+        assert(DesktopShortcut::createAppShortcutFile(
+            lnkPath, "C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\System32",
+            "WhatsApp", "com.whatsapp", err));
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        assert(GetFileAttributesExA(lnkPath.c_str(), GetFileExInfoStandard, &fad));
+        assert(fad.nFileSizeLow > 64);
+        DeleteFileA(lnkPath.c_str());
+    }
+
+    // 5. ScrcpyBridge::serializeScanFile (type 22 + 4B BE length + UTF-8 path, <= 256 bytes)
+    {
+        uint8_t buf[300];
+        const std::string path = "/sdcard/Download/photo_caf\xC3\xA9.jpg";
+        size_t n = ScrcpyBridge::serializeScanFile(buf, sizeof(buf), path);
+        assert(n == 5 + path.size());
+        assert(buf[0] == 22);
+        uint32_t beLen = (static_cast<uint32_t>(buf[1]) << 24) |
+                         (static_cast<uint32_t>(buf[2]) << 16) |
+                         (static_cast<uint32_t>(buf[3]) << 8) |
+                         static_cast<uint32_t>(buf[4]);
+        assert(beLen == path.size());
+        assert(std::memcmp(buf + 5, path.data(), path.size()) == 0);
+
+        std::string longUtf8(255, 'a');
+        longUtf8 += "\xC3\xA9"; // 2-byte char crossing 256-byte cap -> truncates before \xC3
+        size_t nCap = ScrcpyBridge::serializeScanFile(buf, sizeof(buf), longUtf8);
+        assert(nCap == 5 + 255);
+    }
+
+    // 6. ScrcpyBridge::parseLsLaOutput + shellSingleQuote (UTF-8, spaces, symlinks, dirs-first sorting)
+    {
+        assert(ScrcpyBridge::shellSingleQuote("/sdcard/a'b dir") == "'/sdcard/a'\\''b dir'");
+        const std::string lsRaw =
+            "total 42\n"
+            "drwxrws--- 2 u0_a291 media_rw 3452 2026-02-22 21:14 .\n"
+            "drwxrws--- 2 u0_a291 media_rw 3452 2026-02-22 21:14 ..\n"
+            "-rwxrwx--- 1 u0_a291 media_rw 14694693 2026-06-15 13:37 uptodown file (1).apk\n"
+            "-rw-rw---- 1 u0_a291 media_rw 128 2026-11-27 05:57 pt_test_caf\xC3\xA9_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E.txt\n"
+            "drwxrws--- 5 u0_a291 media_rw 3452 2026-06-14 17:56 DCIM\n"
+            "lrwxrwxrwx 1 root root 11 2026-01-01 00:00 LinkFolder -> /sdcard/Download\n";
+        std::vector<RemoteFileEntry> entries = ScrcpyBridge::parseLsLaOutput(lsRaw, "/sdcard");
+        assert(entries.size() == 4);
+        assert(entries[0].isDir && entries[0].name == "DCIM" && entries[0].fullPath == "/sdcard/DCIM");
+        assert(entries[1].isSymlink && entries[1].name == "LinkFolder" && entries[1].fullPath == "/sdcard/LinkFolder");
+        assert(!entries[2].isDir && entries[2].name == "pt_test_caf\xC3\xA9_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E.txt" && entries[2].sizeBytes == 128);
+        assert(!entries[3].isDir && entries[3].name == "uptodown file (1).apk" && entries[3].sizeBytes == 14694693u);
+    }
+
+    // 7. D3D11Renderer::buildDibFromBgra CF_DIB bottom-up header & row flip
+    {
+        uint8_t bgra[2 * 2 * 4] = {
+            10, 20, 30, 0,   40, 50, 60, 0,   // Top row
+            70, 80, 90, 0,   11, 22, 33, 128  // Bottom row
+        };
+        std::vector<uint8_t> dib;
+        assert(D3D11Renderer::buildDibFromBgra(bgra, 2, 2, dib));
+        assert(dib.size() == sizeof(BITMAPINFOHEADER) + 16);
+        const BITMAPINFOHEADER* bih = reinterpret_cast<const BITMAPINFOHEADER*>(dib.data());
+        assert(bih->biSize == sizeof(BITMAPINFOHEADER) && bih->biWidth == 2 && bih->biHeight == 2 && bih->biBitCount == 32);
+        const uint8_t* px = dib.data() + sizeof(BITMAPINFOHEADER);
+        assert(px[0] == 70 && px[1] == 80 && px[2] == 90 && px[3] == 255); // Bottom row first in DIB
+        assert(px[8] == 10 && px[9] == 20 && px[10] == 30 && px[11] == 255);
+    }
+
+    // 8. DrawerPanel Tab 5 (APPS) & Tab 6 (FILES) render and actions
+    {
+        DrawerPanel dp;
+        Profile p = ProfileDefaults::createDesktop("Desktop");
+        AppSettings s;
+        RECT bounds = { 0, 0, 356, 780 };
+        std::vector<std::string> logs;
+
+        std::vector<DeviceAppInfo> apps;
+        DeviceAppInfo a1; a1.name = "WhatsApp"; a1.packageName = "com.whatsapp"; a1.isSystem = false;
+        apps.push_back(a1);
+        dp.setInstalledApps(apps, false, "1 app loaded");
+
+        std::vector<RemoteFileEntry> files;
+        RemoteFileEntry f1; f1.name = "photo.jpg"; f1.fullPath = "/sdcard/Download/photo.jpg"; f1.sizeBytes = 2048; f1.modified = "2026-11-27 06:00";
+        files.push_back(f1);
+        dp.setRemoteFiles("/sdcard/Download", files, false, "1 item");
+
+        HDC scDC = GetDC(NULL);
+        HDC mDC = CreateCompatibleDC(scDC);
+        HBITMAP bmp = CreateCompatibleBitmap(scDC, 356, 780);
+        HGDIOBJ old = SelectObject(mDC, bmp);
+        {
+            Gdiplus::Graphics g(mDC);
+            dp.setActiveTab(5);
+            dp.paint(g, bounds, p, s, "", -1, false, true, "SM-G990E", "", logs, -1, -1, 0);
+        }
+
+        RECT rcPin = {0,0,0,0}, rcSec = {0,0,0,0}, rcLnk = {0,0,0,0};
+        assert(dp.rectForAction(DA_APP_TOGGLE_PIN, 0, rcPin));
+        assert(dp.rectForAction(DA_APP_OPEN_SECOND_PHONE, 0, rcSec));
+        assert(dp.rectForAction(DA_APP_CREATE_SHORTCUT, 0, rcLnk));
+
+        int sel = -1;
+        DrawerActionResult res;
+        assert(dp.onMouseDown((rcPin.left + rcPin.right) / 2, (rcPin.top + rcPin.bottom) / 2, p, s, sel, res));
+        assert(s.isAppPinned("com.whatsapp") && res.settingsModified);
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcSec.left + rcSec.right) / 2, (rcSec.top + rcSec.bottom) / 2, p, s, sel, res));
+        assert(res.requestOpenAppSecondPhone && res.appPackage == "com.whatsapp");
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcLnk.left + rcLnk.right) / 2, (rcLnk.top + rcLnk.bottom) / 2, p, s, sel, res));
+        assert(res.requestCreateAppShortcut && res.appPackage == "com.whatsapp");
+
+        {
+            Gdiplus::Graphics g(mDC);
+            dp.setActiveTab(6);
+            dp.paint(g, bounds, p, s, "", -1, false, true, "SM-G990E", "", logs, -1, -1, 0);
+        }
+        RECT rcPush = {0,0,0,0}, rcPull = {0,0,0,0};
+        assert(dp.rectForAction(DA_FILES_PUSH_PICKER, -1, rcPush));
+        assert(dp.rectForAction(DA_FILE_PULL, 0, rcPull));
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcPush.left + rcPush.right) / 2, (rcPush.top + rcPush.bottom) / 2, p, s, sel, res));
+        assert(res.requestPushFilePicker && res.pushTargetDir == "/sdcard/Download");
+
+        res = DrawerActionResult{};
+        assert(dp.onMouseDown((rcPull.left + rcPull.right) / 2, (rcPull.top + rcPull.bottom) / 2, p, s, sel, res));
+        assert(res.requestPullRemoteFile && res.pullRemotePath == "/sdcard/Download/photo.jpg");
+
+        SelectObject(mDC, old);
+        DeleteObject(bmp);
+        DeleteDC(mDC);
+        ReleaseDC(NULL, scDC);
+    }
+
+    std::printf("[Test] Sprint 5B (F8 Apps/2ndPhone + F9 Files/CF_DIB) OK!\n");
+}
+
 int main() {
     GdiPlusSession gdiplus;
     testSpsParser();
@@ -2466,6 +2669,8 @@ int main() {
     testSprint4bInAppAudio();
     std::fflush(stdout);
     testSprint5aLanguageAndClipboard();
-    std::printf("ALL SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
+    std::fflush(stdout);
+    testSprint5bAppsFilesAndShortcuts();
+    std::printf("ALL SPRINT 5B + SPRINT 5A + SPRINT 4B + SPRINT 4A + SPRINT 3B + SPRINT 3A + SPRINT 2B + SPRINT 2A + SPRINT 1b + SPRINT 1 + SPRINT 0 + STAGE 1-3 TESTS PASSED!\n");
     return 0;
 }

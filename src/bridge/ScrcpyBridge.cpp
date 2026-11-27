@@ -3,6 +3,8 @@
 #include "engine/ThreadScheduling.hpp"
 #include "video/LatencyTelemetry.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -790,6 +792,253 @@ bool ScrcpyBridge::listH264Encoders(const ToolPaths& tools, const std::string& d
     runCommandCapture(cmd, raw, ec, 8000);
     outEncoders = parseH264Encoders(raw);
     return !outEncoders.empty();
+}
+
+std::vector<DeviceAppInfo> ScrcpyBridge::parseAppListOutput(const std::string& raw) {
+    // Format from scrcpy v5.0.1 LogUtils.java:248-295 (`list_apps=true`):
+    //   [server] INFO: List of apps:
+    //    * Maps                           com.google.android.apps.maps
+    //    * Live Transcribe & Sound Notifications
+    //                                     com.google.audio.hearing.visualization.accessibility.scribe
+    //    - WhatsApp                       com.whatsapp
+    std::vector<DeviceAppInfo> out;
+    const bool hasHeader = (raw.find("List of apps:") != std::string::npos);
+    bool inList = !hasHeader;
+    bool hasPending = false;
+    DeviceAppInfo pending;
+
+    auto trimSpaces = [](const std::string& s) -> std::string {
+        size_t a = 0;
+        while (a < s.size() && (s[a] == ' ' || s[a] == '\t')) ++a;
+        size_t b = s.size();
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r')) --b;
+        return s.substr(a, b - a);
+    };
+
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!inList) {
+            if (line.find("List of apps:") != std::string::npos) inList = true;
+            continue;
+        }
+        if (line.size() >= 3 && line[0] == ' ' && (line[1] == '*' || line[1] == '-') && line[2] == ' ') {
+            hasPending = false;
+            const bool isSys = (line[1] == '*');
+            std::string body = line.substr(3);
+            while (!body.empty() && (body.back() == ' ' || body.back() == '\t')) body.pop_back();
+            if (body.empty()) continue;
+
+            // Find trailing non-whitespace package token separated by >= 2 spaces
+            size_t tokStart = body.size();
+            while (tokStart > 0 && body[tokStart - 1] != ' ' && body[tokStart - 1] != '\t') {
+                --tokStart;
+            }
+            std::string tail = body.substr(tokStart);
+            size_t gapCount = 0;
+            size_t gapPos = tokStart;
+            while (gapPos > 0 && (body[gapPos - 1] == ' ' || body[gapPos - 1] == '\t')) {
+                --gapPos;
+                ++gapCount;
+            }
+            if (gapCount >= 2 && gapPos > 0 && tail.find('.') != std::string::npos) {
+                DeviceAppInfo app;
+                app.name = trimSpaces(body.substr(0, gapPos));
+                app.packageName = tail;
+                app.isSystem = isSys;
+                if (!app.name.empty() && !app.packageName.empty()) {
+                    out.push_back(app);
+                }
+            } else {
+                pending.name = trimSpaces(body);
+                pending.packageName.clear();
+                pending.isSystem = isSys;
+                hasPending = !pending.name.empty();
+            }
+        } else if (hasPending) {
+            size_t lead = 0;
+            while (lead < line.size() && line[lead] == ' ') ++lead;
+            std::string pkg = trimSpaces(line);
+            if (lead >= 4 && !pkg.empty() && pkg.find(' ') == std::string::npos && pkg.find('.') != std::string::npos) {
+                pending.packageName = pkg;
+                out.push_back(pending);
+            }
+            hasPending = false;
+        }
+    }
+    return out;
+}
+
+bool ScrcpyBridge::listInstalledApps(const ToolPaths& tools, const std::string& deviceSerial,
+                                       std::vector<DeviceAppInfo>& outApps) {
+    outApps.clear();
+    const std::string adbPath = tools.adbExe.empty() ? adbExe_ : tools.adbExe;
+    if (adbPath.empty() || tools.scrcpyServer.empty() || tools.scrcpyVersion.empty()) return false;
+
+    std::string ser = deviceSerial;
+    if (ser.empty()) ser = activeSerial();
+    const std::string prefix = ser.empty()
+        ? ("\"" + adbPath + "\"")
+        : ("\"" + adbPath + "\" -s \"" + ser + "\"");
+
+    const std::string remoteJar = "/data/local/tmp/km-scrcpy-listapps.jar";
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture(prefix + " push \"" + tools.scrcpyServer + "\" " + remoteJar, raw, ec, 15000) || ec != 0) {
+        return false;
+    }
+
+    std::string srvOut;
+    bool ran = runCommandCapture(prefix + " shell \"CLASSPATH=" + remoteJar +
+                                 " app_process / com.genymobile.scrcpy.Server " +
+                                 tools.scrcpyVersion + " list_apps=true\"",
+                                 srvOut, ec, 25000);
+    std::string cleanupOut;
+    DWORD cleanEc = 0;
+    runCommandCapture(prefix + " shell \"rm -f " + remoteJar + "\"", cleanupOut, cleanEc, 5000);
+
+    outApps = parseAppListOutput(srvOut);
+    char lbuf[64];
+    std::snprintf(lbuf, sizeof(lbuf), "[Apps] Loaded %zu installed Android apps", outApps.size());
+    appendLog(lbuf);
+    return ran && !outApps.empty();
+}
+
+size_t ScrcpyBridge::serializeScanFile(uint8_t* buf, size_t cap, const std::string& remotePathUtf8) {
+    if (!buf || remotePathUtf8.empty()) return 0;
+    // SC_CONTROL_MSG_TYPE_SCAN_FILE (type=22 in scrcpy v5.0.1 control_msg.c:192-196):
+    //   [22:1][len:4 BE][utf8 path <= 256 bytes]
+    std::string capped = ControlPacketQueue::truncateUtf8Cap(remotePathUtf8, 256);
+    if (capped.empty()) return 0;
+    const size_t total = 5 + capped.size();
+    if (cap < total) return 0;
+    buf[0] = 22;
+    writeU32BE(buf + 1, static_cast<uint32_t>(capped.size()));
+    std::memcpy(buf + 5, capped.data(), capped.size());
+    return total;
+}
+
+std::string ScrcpyBridge::shellSingleQuote(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size() + 4);
+    out.push_back('\'');
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\'') out += "'\\''";
+        else out.push_back(raw[i]);
+    }
+    out.push_back('\'');
+    return out;
+}
+
+std::vector<RemoteFileEntry> ScrcpyBridge::parseLsLaOutput(const std::string& raw, const std::string& baseDir) {
+    std::string normBase = baseDir.empty() ? std::string("/sdcard") : baseDir;
+    if (normBase[0] != '/') normBase.insert(normBase.begin(), '/');
+    while (normBase.size() > 1 && normBase.back() == '/') normBase.pop_back();
+
+    auto isDateTok = [](const std::string& s) -> bool {
+        if (s.size() != 10) return false;
+        if (s[4] != '-' || s[7] != '-') return false;
+        for (size_t i = 0; i < 10; ++i) {
+            if (i == 4 || i == 7) continue;
+            if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+        }
+        return true;
+    };
+
+    auto parseUintTok = [](const std::string& s, uint64_t& outVal) -> bool {
+        if (s.empty()) return false;
+        uint64_t v = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            unsigned char ch = static_cast<unsigned char>(s[i]);
+            if (!std::isdigit(ch)) return false;
+            v = v * 10u + static_cast<uint64_t>(ch - '0');
+        }
+        outVal = v;
+        return true;
+    };
+
+    std::vector<RemoteFileEntry> out;
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        if (line.compare(0, 6, "total ") == 0 || line.compare(0, 3, "ls:") == 0) continue;
+        const char mode0 = line[0];
+        if (mode0 != 'd' && mode0 != '-' && mode0 != 'l') continue;
+
+        struct TokSpan { size_t start; size_t end; std::string text; };
+        std::vector<TokSpan> toks;
+        size_t pos = 0;
+        while (pos < line.size() && toks.size() < 12) {
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+            if (pos >= line.size()) break;
+            size_t end = pos;
+            while (end < line.size() && line[end] != ' ' && line[end] != '\t') ++end;
+            toks.push_back(TokSpan{ pos, end, line.substr(pos, end - pos) });
+            pos = end;
+        }
+        if (toks.size() < 6) continue;
+
+        int dateIdx = -1;
+        for (size_t ti = 2; ti + 2 < toks.size(); ++ti) {
+            if (isDateTok(toks[ti].text)) {
+                dateIdx = static_cast<int>(ti);
+                break;
+            }
+        }
+
+        size_t nameOff = std::string::npos;
+        uint64_t sz = 0;
+        std::string mod;
+        if (dateIdx >= 0 && static_cast<size_t>(dateIdx + 1) < toks.size()) {
+            const int timeIdx = dateIdx + 1;
+            if (dateIdx >= 1) parseUintTok(toks[dateIdx - 1].text, sz);
+            mod = toks[dateIdx].text + " " + toks[timeIdx].text;
+            nameOff = toks[timeIdx].end;
+            while (nameOff < line.size() && (line[nameOff] == ' ' || line[nameOff] == '\t')) ++nameOff;
+        } else if (toks.size() >= 8) {
+            parseUintTok(toks[4].text, sz);
+            nameOff = toks[6].end;
+            while (nameOff < line.size() && (line[nameOff] == ' ' || line[nameOff] == '\t')) ++nameOff;
+        }
+        if (nameOff == std::string::npos || nameOff >= line.size()) continue;
+
+        std::string name = line.substr(nameOff);
+        if (mode0 == 'l') {
+            size_t arrow = name.find(" -> ");
+            if (arrow != std::string::npos) name = name.substr(0, arrow);
+        }
+        while (!name.empty() && (name.back() == '\r' || name.back() == '\n')) name.pop_back();
+        if (name.empty() || name == "." || name == "..") continue;
+
+        RemoteFileEntry e;
+        e.name = name;
+        e.fullPath = (normBase == "/") ? ("/" + name) : (normBase + "/" + name);
+        e.isDir = (mode0 == 'd');
+        e.isSymlink = (mode0 == 'l');
+        e.sizeBytes = e.isDir ? 0u : sz;
+        e.modified = mod;
+        out.push_back(e);
+    }
+
+    auto ciLess = [](const std::string& a, const std::string& b) -> bool {
+        const size_t n = (a.size() < b.size()) ? a.size() : b.size();
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char ca = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i])));
+            unsigned char cb = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b[i])));
+            if (ca != cb) return ca < cb;
+        }
+        return a.size() < b.size();
+    };
+    std::sort(out.begin(), out.end(), [&](const RemoteFileEntry& a, const RemoteFileEntry& b) {
+        bool aFolder = (a.isDir || a.isSymlink);
+        bool bFolder = (b.isDir || b.isSymlink);
+        if (aFolder != bFolder) return aFolder;
+        return ciLess(a.name, b.name);
+    });
+    return out;
 }
 
 bool ScrcpyBridge::queryThermalTelemetry(PhoneThermalInfo& outInfo) {
@@ -1581,6 +1830,15 @@ bool ScrcpyBridge::sendResizeDisplay(uint16_t width, uint16_t height) {
     return enqueueControlPacket(std::move(msg), true);
 }
 
+bool ScrcpyBridge::sendScanFile(const std::string& remotePathUtf8) {
+    if (!connected_ || remotePathUtf8.empty()) return false;
+    std::vector<uint8_t> msg(5 + 256);
+    size_t len = serializeScanFile(msg.data(), msg.size(), remotePathUtf8);
+    if (len == 0) return false;
+    msg.resize(len);
+    return enqueueControlPacket(std::move(msg), false);
+}
+
 bool ScrcpyBridge::sendUhidCreate(uint16_t id, uint16_t vendorId, uint16_t productId,
                                   const std::string& name, const uint8_t* reportDesc,
                                   uint16_t reportDescSize) {
@@ -1714,21 +1972,81 @@ bool ScrcpyBridge::installApk(const std::string& localApkPath, std::string& outM
     return ok;
 }
 
-bool ScrcpyBridge::pushFileToDownloads(const std::string& localFilePath, std::string& outMsg) {
+bool ScrcpyBridge::pushFileToRemoteDir(const std::string& localFilePath, const std::string& remoteDir, std::string& outMsg) {
     outMsg.clear();
     if (adbExe_.empty()) { outMsg = "ADB not ready"; return false; }
     size_t slash = localFilePath.find_last_of("\\/");
     std::string fname = (slash == std::string::npos) ? localFilePath : localFilePath.substr(slash + 1);
-    std::string remote = "/sdcard/Download/" + fname;
+    if (fname.empty()) { outMsg = "Invalid file path"; return false; }
+    std::string dir = remoteDir.empty() ? std::string("/sdcard/Download") : remoteDir;
+    if (dir[0] != '/') dir.insert(dir.begin(), '/');
+    while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+    std::string remote = (dir == "/") ? ("/" + fname) : (dir + "/" + fname);
     std::string raw;
     DWORD ec = 0;
-    if (!runCommandCapture(adbPrefix() + " push \"" + localFilePath + "\" \"" + remote + "\"", raw, ec, 60000) || ec != 0) {
+    if (!runCommandCapture(adbPrefix() + " push \"" + localFilePath + "\" \"" + remote + "\"", raw, ec, 120000) || ec != 0) {
         outMsg = "Push failed for " + fname;
         appendLog("[Push] " + outMsg);
         return false;
     }
-    outMsg = "Sent " + fname + " -> /sdcard/Download/";
+    if (connected_) {
+        sendScanFile(remote);
+        appendLog("[Scan] SCAN_FILE queued -> " + remote);
+    }
+    outMsg = "Sent " + fname + " -> " + dir + "/";
     appendLog("[Push] " + outMsg);
+    return true;
+}
+
+bool ScrcpyBridge::pushFileToDownloads(const std::string& localFilePath, std::string& outMsg) {
+    return pushFileToRemoteDir(localFilePath, "/sdcard/Download", outMsg);
+}
+
+bool ScrcpyBridge::listRemoteDirectory(const std::string& remoteDir, std::vector<RemoteFileEntry>& outEntries, std::string& outErr) {
+    outEntries.clear();
+    outErr.clear();
+    if (adbExe_.empty()) {
+        outErr = "ADB not ready";
+        return false;
+    }
+    std::string dir = remoteDir.empty() ? std::string("/sdcard") : remoteDir;
+    if (dir[0] != '/') dir.insert(dir.begin(), '/');
+    while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+    std::string listTarget = (dir == "/") ? "/" : (dir + "/");
+    std::string raw;
+    DWORD ec = 0;
+    std::string cmd = adbPrefix() + " shell \"ls -la " + shellSingleQuote(listTarget) + " 2>&1\"";
+    if (!runCommandCapture(cmd, raw, ec, 10000)) {
+        outErr = "Timed out listing " + dir;
+        return false;
+    }
+    if (ec != 0 && raw.find("No such file") != std::string::npos) {
+        outErr = "Directory not found: " + dir;
+        return false;
+    }
+    if (ec != 0 && raw.find("Permission denied") != std::string::npos) {
+        outErr = "Permission denied: " + dir;
+        return false;
+    }
+    outEntries = parseLsLaOutput(raw, dir);
+    return true;
+}
+
+bool ScrcpyBridge::pullRemoteFile(const std::string& remotePath, const std::string& localDestPath, std::string& outMsg) {
+    outMsg.clear();
+    if (adbExe_.empty()) { outMsg = "ADB not ready"; return false; }
+    if (remotePath.empty() || localDestPath.empty()) { outMsg = "Invalid pull path"; return false; }
+    size_t slash = remotePath.find_last_of('/');
+    std::string fname = (slash == std::string::npos) ? remotePath : remotePath.substr(slash + 1);
+    std::string raw;
+    DWORD ec = 0;
+    if (!runCommandCapture(adbPrefix() + " pull \"" + remotePath + "\" \"" + localDestPath + "\"", raw, ec, 120000) || ec != 0) {
+        outMsg = "Save to PC failed for " + fname;
+        appendLog("[Pull] " + outMsg);
+        return false;
+    }
+    outMsg = "Saved " + fname + " to PC";
+    appendLog("[Pull] " + outMsg + " -> " + localDestPath);
     return true;
 }
 

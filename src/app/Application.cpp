@@ -9,6 +9,7 @@
 #include "ui/ShellWindow.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 std::string Application::getExeDir() {
@@ -48,6 +49,7 @@ void Application::printUsage() {
         "  PhantomTouch.exe [options]\n\n"
         "Options:\n"
         "  --profile <file>   Load a specific profile (default: last active or profiles\\desktop.cfg)\n"
+        "  --app=<package>    Connect in Second-Phone mode and open the Android app immediately\n"
         "  --demo             Launch directly into Offline Keymap Studio (no phone required)\n"
         "  --no-mirror        Connect control bridge without spawning embedded display\n"
         "  --console          Attach a debug console window for live stdout logs\n"
@@ -59,59 +61,25 @@ int Application::run(int argc, char** argv) {
     enableDpiAwareness();
     ThreadScheduling::disableProcessEcoQoS();
 
-    bool demoMode = false;
-    bool noMirror = false;
-    bool showConsole = false;
-    bool explicitProfile = false;
-    bool probeOnConnect = false;
-    bool startFullscreen = false;
-    int probeSamples = 60;
-    bool forceAudio = false;
-    std::string forceAudioCodec;
-    int forceAudioBufferMs = 0;
-    std::string profilePath;
+    const LaunchOptions opts = parseLaunchOptions(argc, argv);
+    bool demoMode = opts.demoMode;
+    bool noMirror = opts.noMirror;
+    bool showConsole = opts.showConsole;
+    bool explicitProfile = opts.explicitProfile;
+    bool probeOnConnect = opts.probeOnConnect;
+    bool startFullscreen = opts.startFullscreen;
+    int probeSamples = opts.probeSamples;
+    bool forceAudio = opts.forceAudio;
+    std::string forceAudioCodec = opts.forceAudioCodec;
+    int forceAudioBufferMs = opts.forceAudioBufferMs;
+    std::string profilePath = opts.profilePath;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--demo") {
-            demoMode = true;
-        } else if (arg == "--no-mirror") {
-            noMirror = true;
-        } else if (arg == "--console") {
-            showConsole = true;
-        } else if (arg == "--probe-on-connect") {
-            probeOnConnect = true;
-        } else if (arg == "--fullscreen") {
-            startFullscreen = true;
-        } else if (arg == "--audio") {
-            forceAudio = true;
-        } else if (arg.find("--audio-codec=") == 0) {
-            std::string ac = arg.substr(14);
-            if (ac == "raw" || ac == "aac") {
-                forceAudioCodec = ac;
-                forceAudio = true;
-            }
-        } else if (arg.find("--audio-buffer=") == 0) {
-            int ms = std::atoi(arg.c_str() + 15);
-            if (ms >= 15 && ms <= 100) {
-                forceAudioBufferMs = ms;
-            }
-        } else if (arg.find("--probe-samples=") == 0) {
-            int n = std::atoi(arg.c_str() + 16);
-            if (n >= 5 && n <= 200) probeSamples = n;
-        } else if (arg == "--help" || arg == "-h") {
-            showConsole = true;
-            AllocConsole();
-            std::freopen("CONOUT$", "w", stdout);
-            printUsage();
-            return 0;
-        } else if (arg == "--profile" && i + 1 < argc) {
-            profilePath = argv[++i];
-            explicitProfile = true;
-        } else if (!arg.empty() && arg[0] != '-') {
-            profilePath = arg;
-            explicitProfile = true;
-        }
+    if (opts.showHelp) {
+        showConsole = true;
+        AllocConsole();
+        std::freopen("CONOUT$", "w", stdout);
+        printUsage();
+        return 0;
     }
 
     if (showConsole) {
@@ -120,11 +88,19 @@ int Application::run(int argc, char** argv) {
         setvbuf(stdout, NULL, _IONBF, 0);
     }
 
-    // Single-instance guard: bring existing Phantom Touch shell to front instead of double-launching
+    // Single-instance guard: bring existing Phantom Touch shell to front (or forward --app=<pkg>)
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Local\\PhantomTouchEmulatorShellMutex");
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(L"PhantomTouchShellClass", NULL);
         if (existing) {
+            if (!opts.launchAppPackage.empty()) {
+                COPYDATASTRUCT cds;
+                cds.dwData = 0x50544150u; // "PTAP"
+                cds.cbData = static_cast<DWORD>(opts.launchAppPackage.size());
+                cds.lpData = const_cast<char*>(opts.launchAppPackage.data());
+                SendMessageTimeoutW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds),
+                                    SMTO_ABORTIFHUNG, 1500, NULL);
+            }
             if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
         }
@@ -167,7 +143,7 @@ int Application::run(int argc, char** argv) {
 
     ShellWindow shell(&bridge, &engine, exeDir, profilesDir, profilePath, settingsPath, demoMode, noMirror);
     shell.setLaunchOptions(showConsole, probeOnConnect, probeSamples, startFullscreen,
-                           forceAudio, forceAudioCodec, forceAudioBufferMs);
+                           forceAudio, forceAudioCodec, forceAudioBufferMs, opts.launchAppPackage);
     int exitCode = 1;
     if (shell.create(GetModuleHandleA(NULL))) {
         exitCode = shell.runMessageLoop();

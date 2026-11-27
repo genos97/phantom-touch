@@ -1,11 +1,13 @@
 #include "ui/ShellWindow.hpp"
 #include "config/KeyCodes.hpp"
 #include "config/ProfileStore.hpp"
+#include "ui/DesktopShortcut.hpp"
 #include "ui/Strings.hpp"
 #include "ui/Theme.hpp"
 
 #include <shellapi.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #include <imm.h>
 #include <cmath>
 #include <cstdio>
@@ -371,6 +373,18 @@ bool ShellWindow::create(HINSTANCE hInst) {
         }
         if (initW > 0 && initH > 0) {
             ensurePaintCache(initDc, initW, initH);
+            if (cacheDC_) {
+                Gdiplus::Graphics gWarm(cacheDC_);
+                gWarm.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                gWarm.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+                RECT warmRc = { 0, 0, 128, 36 };
+                GdiPlusDraw::roundedCard(gWarm, warmRc, 6.0f, Theme::BG_DRAWER, Theme::BORDER_STRONG, 1.0f);
+                GdiPlusDraw::drawIcon(gWarm, ICON_LOGO, 16.0f, 18.0f, 16.0f, Theme::ACCENT_CYAN);
+                GdiPlusDraw::textLeft(gWarm, "Warm", 32.0f, 18.0f, 12.0f, true, Theme::TEXT_PRIMARY, 90.0f);
+                GdiPlusDraw::textLeft(gWarm, "Warm", 32.0f, 18.0f, 11.0f, false, Theme::TEXT_MUTED, 90.0f);
+                SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
+                FillRect(cacheDC_, &warmRc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            }
         }
         ReleaseDC(hwnd_, initDc);
     }
@@ -1111,6 +1125,14 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         self->pendingDiscoveredEncoder_.clear();
         LeaveCriticalSection(&self->auxLock_);
 
+        std::string appToLaunchOverride;
+        bool forceVdOnce = false;
+        EnterCriticalSection(&self->auxLock_);
+        appToLaunchOverride = self->pendingLaunchApp_;
+        forceVdOnce = self->forceVirtualDisplayOnce_;
+        self->forceVirtualDisplayOnce_ = false;
+        LeaveCriticalSection(&self->auxLock_);
+
         BridgeStreamConfig cfg;
         cfg.maxSize = self->settings_.mirrorMaxSize;
         cfg.maxFps = self->settings_.mirrorFps;
@@ -1119,7 +1141,7 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
         cfg.clipboardAutosync = self->settings_.clipboardSync;
         cfg.enableAudio = wantAudio;
         cfg.audioCodec = self->forceAudioCodec_;
-        cfg.virtualDisplay = self->settings_.virtualDisplayMode;
+        cfg.virtualDisplay = (self->settings_.virtualDisplayMode || forceVdOnce || !appToLaunchOverride.empty());
         cfg.virtualDisplaySpec = self->settings_.virtualDisplaySpec;
         cfg.videoCodecOptions = self->settings_.videoCodecOptions;
         cfg.videoEncoder = chosenEnc;
@@ -1142,7 +1164,14 @@ DWORD WINAPI ShellWindow::connectThreadProc(LPVOID param) {
             }
             if (cfg.virtualDisplay) {
                 std::string appToLaunch = "com.android.settings";
-                if (self->profile_.keymapEnabled && !self->profile_.appPackage.empty()) {
+                if (!appToLaunchOverride.empty()) {
+                    appToLaunch = appToLaunchOverride;
+                    EnterCriticalSection(&self->auxLock_);
+                    if (self->pendingLaunchApp_ == appToLaunchOverride) {
+                        self->pendingLaunchApp_.clear();
+                    }
+                    LeaveCriticalSection(&self->auxLock_);
+                } else if (self->profile_.keymapEnabled && !self->profile_.appPackage.empty()) {
                     size_t comma = self->profile_.appPackage.find(',');
                     std::string first = (comma == std::string::npos)
                         ? self->profile_.appPackage
@@ -1495,15 +1524,21 @@ DWORD WINAPI ShellWindow::screenshotThreadProc(LPVOID param) {
         std::string fname = (sl == std::string::npos) ? fullPath : fullPath.substr(sl + 1);
         std::string err;
         bool ok = false;
+        std::vector<uint8_t> dib;
         if (self->viewportHost_.isNativeVideoActive() && self->viewportHost_.hasNativeVideoFrame()) {
-            ok = self->viewportHost_.captureNativeScreenshot(fullPath, err);
+            ok = self->viewportHost_.captureNativeScreenshot(fullPath, err, &dib);
         }
         if (!ok) {
             ok = self->bridge_->captureScreenshot(fullPath, err);
+            if (ok && dib.empty()) {
+                D3D11Renderer::buildDibFromPngFile(fullPath, dib);
+            }
         }
         EnterCriticalSection(&self->auxLock_);
+        self->pendingScreenshotDib_.swap(dib);
         self->pendingScreenshotToast_ = ok
-            ? (std::string("Screenshot saved -> screenshots\\") + fname)
+            ? (std::string("Screenshot saved -> screenshots\\") + fname +
+               (self->pendingScreenshotDib_.empty() ? "" : " (copied to clipboard)"))
             : ("Screenshot failed: " + err);
         LeaveCriticalSection(&self->auxLock_);
         job->ctx->postMsg(MSG_SCREENSHOT_DONE, 0, 0);
@@ -2022,6 +2057,33 @@ void ShellWindow::handleForegroundAppChanged(const std::string& pkg) {
     }
 }
 
+bool ShellWindow::writeWindowsClipboardDib(const std::vector<uint8_t>& dibBytes) {
+    if (dibBytes.empty()) return false;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dibBytes.size());
+    if (!hMem) return false;
+    void* dst = GlobalLock(hMem);
+    if (!dst) {
+        GlobalFree(hMem);
+        return false;
+    }
+    std::memcpy(dst, dibBytes.data(), dibBytes.size());
+    GlobalUnlock(hMem);
+
+    bool ok = false;
+    if (OpenClipboard(hwnd_)) {
+        EmptyClipboard();
+        if (SetClipboardData(CF_DIB, hMem)) {
+            ok = true;
+        } else {
+            GlobalFree(hMem);
+        }
+        CloseClipboard();
+    } else {
+        GlobalFree(hMem);
+    }
+    return ok;
+}
+
 DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
     SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
     if (!job || !job->ctx) {
@@ -2030,8 +2092,11 @@ DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
     }
     ShellWindow* self = job->shell;
     std::vector<std::string> files;
+    std::string targetDir;
     EnterCriticalSection(&self->auxLock_);
     files.swap(self->pendingDropFiles_);
+    targetDir = self->pendingDropTargetDir_.empty() ? std::string("/sdcard/Download") : self->pendingDropTargetDir_;
+    self->pendingDropTargetDir_ = "/sdcard/Download";
     LeaveCriticalSection(&self->auxLock_);
 
     auto notifyToast = [&](const std::string& msg) {
@@ -2042,6 +2107,9 @@ DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
         job->ctx->postMsg(MSG_DROP_TOAST, 0, 0);
     };
 
+    bool anyNonApkOk = false;
+    bool allOk = true;
+    std::string lastSummary;
     for (size_t i = 0; i < files.size() && !self->stopAuxThreads_ && job->ctx->alive; ++i) {
         const std::string& path = files[i];
         size_t slash = path.find_last_of("\\/");
@@ -2049,17 +2117,33 @@ DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
         size_t dot = fname.find_last_of('.');
         bool isApk = (dot != std::string::npos && lstrcmpiA(fname.c_str() + dot, ".apk") == 0);
 
+        char progBuf[256];
         std::string resultMsg;
         if (isApk) {
-            notifyToast("Installing " + fname + "...");
-            self->bridge_->installApk(path, resultMsg);
+            std::snprintf(progBuf, sizeof(progBuf), "Installing (%zu/%zu) %s...", i + 1, files.size(), fname.c_str());
+            notifyToast(progBuf);
+            if (!self->bridge_->installApk(path, resultMsg)) allOk = false;
+            lastSummary = resultMsg;
             notifyToast(resultMsg);
         } else {
-            notifyToast("Sending " + fname + " to Downloads...");
-            self->bridge_->pushFileToDownloads(path, resultMsg);
+            std::snprintf(progBuf, sizeof(progBuf), "Sending (%zu/%zu) %s -> %s...", i + 1, files.size(), fname.c_str(), targetDir.c_str());
+            notifyToast(progBuf);
+            if (self->bridge_->pushFileToRemoteDir(path, targetDir, resultMsg)) {
+                anyNonApkOk = true;
+                resultMsg += " (Gallery scanned)";
+            } else {
+                allOk = false;
+            }
+            lastSummary = resultMsg;
             notifyToast(resultMsg);
         }
     }
+
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingFileTransferOk_ = allOk;
+    self->pendingFileTransferMsg_ = lastSummary;
+    LeaveCriticalSection(&self->auxLock_);
+    job->ctx->postMsg(MSG_FILE_TRANSFER_DONE, anyNonApkOk ? 1u : 0u, 0);
 
     InterlockedExchange(&self->dropping_, 0);
     job->ctx->release();
@@ -2068,6 +2152,10 @@ DWORD WINAPI ShellWindow::dropWorkerThreadProc(LPVOID param) {
 }
 
 void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) {
+    startAsyncPushFiles(files, "/sdcard/Download");
+}
+
+void ShellWindow::startAsyncPushFiles(const std::vector<std::string>& files, const std::string& targetDir) {
     if (files.empty() || !bridge_->isConnected()) {
         showToast("Connect a phone first to install APKs or push files", 2200);
         return;
@@ -2078,6 +2166,7 @@ void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) 
     }
     EnterCriticalSection(&auxLock_);
     pendingDropFiles_ = files;
+    pendingDropTargetDir_ = targetDir.empty() ? std::string("/sdcard/Download") : targetDir;
     LeaveCriticalSection(&auxLock_);
     asyncCtx_->addRef();
     HANDLE hDrop = CreateThread(NULL, 0, dropWorkerThreadProc,
@@ -2086,6 +2175,217 @@ void ShellWindow::startAsyncDropTransfer(const std::vector<std::string>& files) 
     else {
         InterlockedExchange(&dropping_, 0);
         asyncCtx_->release();
+    }
+}
+
+DWORD WINAPI ShellWindow::pullFileThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
+    std::string remotePath, localPath;
+    EnterCriticalSection(&self->auxLock_);
+    remotePath = self->pendingPullRemote_;
+    localPath = self->pendingPullLocal_;
+    LeaveCriticalSection(&self->auxLock_);
+
+    std::string msg;
+    bool ok = self->bridge_->pullRemoteFile(remotePath, localPath, msg);
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingFileTransferOk_ = ok;
+    self->pendingFileTransferMsg_ = msg;
+    LeaveCriticalSection(&self->auxLock_);
+    job->ctx->postMsg(MSG_FILE_TRANSFER_DONE, 0, 0);
+
+    InterlockedExchange(&self->pullingFile_, 0);
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+void ShellWindow::startAsyncPullRemoteFile(const std::string& remotePath, const std::string& fileName) {
+    if (!bridge_->isConnected() || remotePath.empty()) {
+        showToast("Connect a phone first to save files to PC", 2200);
+        return;
+    }
+    if (pullingFile_ != 0) {
+        showToast("A file download is already in progress...", 1800);
+        return;
+    }
+
+    wchar_t fileBuf[MAX_PATH * 2] = {0};
+    std::wstring wDefName = utf8ToWide(fileName);
+    if (!wDefName.empty() && wDefName.size() < MAX_PATH) {
+        std::memcpy(fileBuf, wDefName.c_str(), (wDefName.size() + 1) * sizeof(wchar_t));
+    }
+    std::wstring initDirW;
+    wchar_t profBuf[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, SHGFP_TYPE_CURRENT, profBuf))) {
+        initDirW = std::wstring(profBuf) + L"\\Downloads";
+    }
+
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd_;
+    ofn.lpstrFilter = L"All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = sizeof(fileBuf) / sizeof(fileBuf[0]);
+    if (!initDirW.empty()) ofn.lpstrInitialDir = initDirW.c_str();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    std::string localDest = wideToUtf8(fileBuf);
+    if (localDest.empty()) return;
+
+    if (InterlockedCompareExchange(&pullingFile_, 1, 0) != 0) {
+        showToast("A file download is already in progress...", 1800);
+        return;
+    }
+    EnterCriticalSection(&auxLock_);
+    pendingPullRemote_ = remotePath;
+    pendingPullLocal_ = localDest;
+    LeaveCriticalSection(&auxLock_);
+    showToast("Saving " + fileName + " to PC...", 2400);
+    asyncCtx_->addRef();
+    HANDLE hPull = CreateThread(NULL, 0, pullFileThreadProc,
+                                new SimpleAsyncJob{ this, asyncCtx_, "", 0 }, 0, NULL);
+    if (hPull) CloseHandle(hPull);
+    else {
+        InterlockedExchange(&pullingFile_, 0);
+        asyncCtx_->release();
+    }
+}
+
+DWORD WINAPI ShellWindow::listAppsThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
+    std::vector<DeviceAppInfo> apps;
+    bool ok = self->bridge_->listInstalledApps(self->tools_, job->arg, apps);
+    EnterCriticalSection(&self->auxLock_);
+    self->appsListSerial_ = job->arg;
+    self->pendingAppsList_.swap(apps);
+    self->pendingAppsOk_ = ok;
+    LeaveCriticalSection(&self->auxLock_);
+    job->ctx->postMsg(MSG_APPS_LIST_DONE, 0, 0);
+    InterlockedExchange(&self->listingApps_, 0);
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+void ShellWindow::requestInstalledApps(bool forceRefresh) {
+    if (!bridge_->isConnected() || !toolsReady_) {
+        drawerPanel_.setInstalledApps(std::vector<DeviceAppInfo>(), false, "Connect a phone to list apps.");
+        return;
+    }
+    const std::string ser = bridge_->activeSerial();
+    if (!forceRefresh) {
+        std::map<std::string, std::vector<DeviceAppInfo>>::const_iterator it = appListCache_.find(ser);
+        if (it != appListCache_.end() && !it->second.empty()) {
+            char msgBuf[96];
+            std::snprintf(msgBuf, sizeof(msgBuf), "%zu apps cached for %s", it->second.size(), ser.c_str());
+            drawerPanel_.setInstalledApps(it->second, false, msgBuf);
+            invalidateShell();
+            return;
+        }
+    }
+    if (InterlockedCompareExchange(&listingApps_, 1, 0) != 0) return;
+    drawerPanel_.setInstalledApps(std::vector<DeviceAppInfo>(), true, "Loading installed Android apps...");
+    invalidateShell();
+    asyncCtx_->addRef();
+    HANDLE hApps = CreateThread(NULL, 0, listAppsThreadProc,
+                                new SimpleAsyncJob{ this, asyncCtx_, ser, 0 }, 0, NULL);
+    if (hApps) CloseHandle(hApps);
+    else {
+        InterlockedExchange(&listingApps_, 0);
+        asyncCtx_->release();
+    }
+}
+
+DWORD WINAPI ShellWindow::listFilesThreadProc(LPVOID param) {
+    SimpleAsyncJob* job = static_cast<SimpleAsyncJob*>(param);
+    if (!job || !job->ctx) {
+        delete job;
+        return 0;
+    }
+    ShellWindow* self = job->shell;
+    std::vector<RemoteFileEntry> entries;
+    std::string err;
+    bool ok = self->bridge_->listRemoteDirectory(job->arg, entries, err);
+    EnterCriticalSection(&self->auxLock_);
+    self->pendingBrowseDir_ = job->arg;
+    self->pendingRemoteFiles_.swap(entries);
+    self->pendingFilesOk_ = ok;
+    self->pendingFilesErr_ = err;
+    LeaveCriticalSection(&self->auxLock_);
+    job->ctx->postMsg(MSG_FILES_LIST_DONE, 0, 0);
+    InterlockedExchange(&self->listingFiles_, 0);
+    job->ctx->release();
+    delete job;
+    return 0;
+}
+
+void ShellWindow::requestBrowseRemoteDir(const std::string& dir) {
+    if (!bridge_->isConnected()) {
+        drawerPanel_.setRemoteFiles(remoteCurrentDir_, std::vector<RemoteFileEntry>(), false, "Connect a phone to browse files.");
+        return;
+    }
+    std::string target = dir.empty() ? std::string("/sdcard") : dir;
+    if (InterlockedCompareExchange(&listingFiles_, 1, 0) != 0) return;
+    remoteCurrentDir_ = target;
+    drawerPanel_.setRemoteFiles(remoteCurrentDir_, std::vector<RemoteFileEntry>(), true, "Listing " + target + "...");
+    invalidateShell();
+    asyncCtx_->addRef();
+    HANDLE hFiles = CreateThread(NULL, 0, listFilesThreadProc,
+                                 new SimpleAsyncJob{ this, asyncCtx_, target, 0 }, 0, NULL);
+    if (hFiles) CloseHandle(hFiles);
+    else {
+        InterlockedExchange(&listingFiles_, 0);
+        asyncCtx_->release();
+    }
+}
+
+void ShellWindow::openAppInSecondPhone(const std::string& pkg, const std::string& label) {
+    std::string clean = sanitizePackageNameToken(pkg);
+    if (clean.empty()) return;
+    std::string shown = label.empty() ? clean : label;
+
+    if (bridge_->isConnected() && bridge_->isVirtualDisplayActive()) {
+        bridge_->sendStartApp(clean);
+        showToast("Opening " + shown + " in Second Phone...", 2200, TOAST_SUCCESS);
+        return;
+    }
+
+    EnterCriticalSection(&auxLock_);
+    pendingLaunchApp_ = clean;
+    forceVirtualDisplayOnce_ = true;
+    LeaveCriticalSection(&auxLock_);
+
+    if (!toolsReady_) {
+        showToast("Preparing Second Phone for " + shown + "...", 2400);
+        return;
+    }
+    std::string ser = bridge_->activeSerial();
+    if (ser.empty()) {
+        for (size_t i = 0; i < adbDevices_.size(); ++i) {
+            if (adbDevices_[i].state == "device") {
+                ser = adbDevices_[i].serial;
+                break;
+            }
+        }
+    }
+    if (!ser.empty()) {
+        showToast("Opening " + shown + " in Second Phone...", 2600);
+        startAsyncConnect(ser);
+    } else {
+        showToast("Connect a phone to open " + shown + " in Second Phone", 2600);
     }
 }
 
@@ -2245,6 +2545,11 @@ void ShellWindow::setDrawerState(bool open, int tab) {
     if (open) {
         drawerPanel_.setActiveTab(tab);
         drawerPanel_.setProfilesDir(profilesDir_, profilePath_);
+        if (tab == 5) {
+            requestInstalledApps(false);
+        } else if (tab == 6) {
+            requestBrowseRemoteDir(drawerPanel_.remoteCurrentDir());
+        }
         if (tab != 0) {
             editTestLive_ = false;
             drawerPanel_.setEditTestLive(false);
@@ -2780,6 +3085,70 @@ void ShellWindow::handleDrawerResult(const DrawerActionResult& res) {
         onboardingView_.setStep(toolsReady_ ? OB_STEP_PREPARE : OB_STEP_TOOLS);
         syncHudAndVideo();
     }
+    if (res.requestRefreshApps) {
+        requestInstalledApps(true);
+    }
+    if (res.requestOpenAppSecondPhone && !res.appPackage.empty()) {
+        openAppInSecondPhone(res.appPackage, res.appName);
+    }
+    if (res.requestLaunchAppCurrent && !res.appPackage.empty()) {
+        if (bridge_->isConnected()) {
+            bridge_->sendStartApp(res.appPackage);
+            showToast("Launching " + res.appName + "...", 1800, TOAST_SUCCESS);
+        } else {
+            showToast("Connect a phone first to launch apps", 1800);
+        }
+    }
+    if (res.requestCreateAppShortcut && !res.appPackage.empty()) {
+        std::string lnkPath, scErr;
+        if (DesktopShortcut::createDesktopAppShortcut(exeDir_ + "\\PhantomTouch.exe", exeDir_,
+                                                      res.appName, res.appPackage, lnkPath, scErr)) {
+            showToast("Desktop shortcut created for " + res.appName, 2600, TOAST_SUCCESS);
+        } else {
+            showToast("Shortcut failed: " + scErr, 2800);
+        }
+    }
+    if (res.requestBrowseRemoteDir) {
+        requestBrowseRemoteDir(res.browseRemoteDir);
+    }
+    if (res.requestPullRemoteFile && !res.pullRemotePath.empty()) {
+        startAsyncPullRemoteFile(res.pullRemotePath, res.pullFileName);
+    }
+    if (res.requestPushFilePicker) {
+        if (!bridge_->isConnected()) {
+            showToast("Connect a phone first to push files", 2200);
+        } else {
+            wchar_t fileBuf[8192] = {0};
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd_;
+            ofn.lpstrFilter = L"All Files (*.*)\0*.*\0";
+            ofn.lpstrFile = fileBuf;
+            ofn.nMaxFile = static_cast<DWORD>(sizeof(fileBuf) / sizeof(fileBuf[0]));
+            ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+            if (GetOpenFileNameW(&ofn)) {
+                std::vector<std::string> chosen;
+                std::wstring first(fileBuf);
+                const wchar_t* pNext = fileBuf + first.size() + 1;
+                if (*pNext == L'\0') {
+                    std::string u8 = wideToUtf8(first.c_str());
+                    if (!u8.empty()) chosen.push_back(u8);
+                } else {
+                    while (*pNext != L'\0') {
+                        std::wstring fnameW(pNext);
+                        std::wstring fullW = first + L"\\" + fnameW;
+                        std::string u8 = wideToUtf8(fullW.c_str());
+                        if (!u8.empty()) chosen.push_back(u8);
+                        pNext += fnameW.size() + 1;
+                    }
+                }
+                if (!chosen.empty()) {
+                    startAsyncPushFiles(chosen, res.pushTargetDir);
+                }
+            }
+        }
+    }
 
     // N32 + F6: KEYS tab (0) or PAD tab (4) while picking a node enters Edit Mode
     bool wantEdit = (drawerOpen_ &&
@@ -3216,11 +3585,78 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         case MSG_SCREENSHOT_DONE: {
             std::string toast;
+            std::vector<uint8_t> dib;
             EnterCriticalSection(&auxLock_);
             toast = pendingScreenshotToast_;
+            dib.swap(pendingScreenshotDib_);
             LeaveCriticalSection(&auxLock_);
+            if (!dib.empty()) {
+                writeWindowsClipboardDib(dib);
+            }
             if (!toast.empty()) {
                 showToast(toast, 2400);
+            }
+            return 0;
+        }
+        case MSG_APPS_LIST_DONE: {
+            std::string ser, status;
+            std::vector<DeviceAppInfo> apps;
+            bool ok = false;
+            EnterCriticalSection(&auxLock_);
+            ser = appsListSerial_;
+            apps.swap(pendingAppsList_);
+            ok = pendingAppsOk_;
+            LeaveCriticalSection(&auxLock_);
+            if (ok && !apps.empty() && !ser.empty()) {
+                appListCache_[ser] = apps;
+            }
+            if (ok && !apps.empty()) {
+                char buf[80];
+                std::snprintf(buf, sizeof(buf), "%zu apps ready on phone", apps.size());
+                status = buf;
+            } else {
+                status = "Could not load app list — click Sync to retry.";
+            }
+            drawerPanel_.setInstalledApps(apps, false, status);
+            if (drawerOpen_ && drawerPanel_.activeTab() == 5) {
+                InvalidateRect(hwnd, &drawerRc_, FALSE);
+            }
+            return 0;
+        }
+        case MSG_FILES_LIST_DONE: {
+            std::string dir, err;
+            std::vector<RemoteFileEntry> entries;
+            bool ok = false;
+            EnterCriticalSection(&auxLock_);
+            dir = pendingBrowseDir_;
+            entries.swap(pendingRemoteFiles_);
+            ok = pendingFilesOk_;
+            err = pendingFilesErr_;
+            LeaveCriticalSection(&auxLock_);
+            if (ok && !dir.empty()) {
+                remoteCurrentDir_ = dir;
+            }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%zu items in %s", entries.size(),
+                          (dir.empty() ? std::string("/sdcard") : dir).c_str());
+            drawerPanel_.setRemoteFiles(dir, entries, false, ok ? std::string(buf) : err);
+            if (drawerOpen_ && drawerPanel_.activeTab() == 6) {
+                InvalidateRect(hwnd, &drawerRc_, FALSE);
+            }
+            return 0;
+        }
+        case MSG_FILE_TRANSFER_DONE: {
+            std::string msg;
+            bool ok = false;
+            EnterCriticalSection(&auxLock_);
+            msg = pendingFileTransferMsg_;
+            ok = pendingFileTransferOk_;
+            LeaveCriticalSection(&auxLock_);
+            if (wParam == 0 && !msg.empty()) {
+                showToast(msg, 2400, ok ? TOAST_SUCCESS : TOAST_INFO);
+            }
+            if (wParam != 0 && drawerOpen_ && drawerPanel_.activeTab() == 6) {
+                requestBrowseRemoteDir(remoteCurrentDir_);
             }
             return 0;
         }
@@ -3431,6 +3867,16 @@ LRESULT ShellWindow::dispatchMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case MSG_ANDROID_BACK:
             bridge_->sendAndroidNav(4 /* KEYCODE_BACK */);
             return 0;
+
+        case WM_COPYDATA: {
+            const COPYDATASTRUCT* cds = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+            if (cds && cds->dwData == 0x50544150u && cds->lpData && cds->cbData > 0 && cds->cbData < 512) {
+                std::string pkg(reinterpret_cast<const char*>(cds->lpData), cds->cbData);
+                openAppInSecondPhone(pkg, pkg);
+                return TRUE;
+            }
+            break;
+        }
 
         case WM_DROPFILES: {
             HDROP hDrop = reinterpret_cast<HDROP>(wParam);
@@ -4517,7 +4963,8 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
         paintRc = rc;
     }
 
-    if (ensurePaintCache(hdc, w, h)) {
+    const bool cacheRecreated = ensurePaintCache(hdc, w, h);
+    if (cacheRecreated) {
         paintRc = rc;
     }
 
@@ -4532,16 +4979,18 @@ void ShellWindow::onPaint(HDC hdc, const RECT& dirtyRc) {
     double msHub = 0.0, msTop = 0.0, msDraw = 0.0, msRail = 0.0;
     TelemetrySummary vidTel = telemetry_.getSummary();
     {
-        // Fast native GDI clear before GDI+ vector overlay (skip occluded viewport when native/embedded video active)
-        HBRUSH bgBr = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-        SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
-        if (!childCoversViewport) {
-            FillRect(cacheDC_, &paintRc, bgBr);
-        } else {
-            RECT rClear;
-            if (IntersectRect(&rClear, &paintRc, &topBarRc_)) FillRect(cacheDC_, &rClear, bgBr);
-            if (IntersectRect(&rClear, &paintRc, &railRc_))   FillRect(cacheDC_, &rClear, bgBr);
-            if (drawerOpen_ && IntersectRect(&rClear, &paintRc, &drawerRc_)) FillRect(cacheDC_, &rClear, bgBr);
+        // Fast native GDI clear before GDI+ vector overlay (skip if ensurePaintCache just filled cacheDC_)
+        if (!cacheRecreated) {
+            HBRUSH bgBr = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+            SetDCBrushColor(cacheDC_, RGB(0x0B, 0x0F, 0x17));
+            if (!childCoversViewport) {
+                FillRect(cacheDC_, &paintRc, bgBr);
+            } else {
+                RECT rClear;
+                if (IntersectRect(&rClear, &paintRc, &topBarRc_)) FillRect(cacheDC_, &rClear, bgBr);
+                if (IntersectRect(&rClear, &paintRc, &railRc_))   FillRect(cacheDC_, &rClear, bgBr);
+                if (drawerOpen_ && IntersectRect(&rClear, &paintRc, &drawerRc_)) FillRect(cacheDC_, &rClear, bgBr);
+            }
         }
 
         Gdiplus::Graphics g(cacheDC_);
@@ -4868,6 +5317,8 @@ void ShellWindow::initCommandPalette() {
     addCmd("drawer.profiles", "Open Profiles Manager",             "profile config template import","",            "Profiles");
     addCmd("drawer.device",   "Open Device & Stream Settings",     "device stream fps bitrate adb","",            "Device");
     addCmd("tab.gamepad",     "Open Gamepad & Controller Tab",     "gamepad pad controller uhid",   "",            "Gamepad");
+    addCmd("drawer.apps",     "Open Apps & Second Phone Launcher", "apps second phone launch shortcut","",          "Apps");
+    addCmd("drawer.files",    "Open Phone File Browser (PC <-> Phone)","files sdcard pull push download","",         "Files");
     addCmd("pad.mode",        "Switch Gamepad Touch / Native UHID","gamepad uhid native touch mode","",            "Gamepad");
     addCmd("fire.cycle",      "Cycle Fire Mode",                   "fire drag claw dual",          "F3",          "Play");
     addCmd("hud.toggle",      "Toggle HUD Overlay Badges",         "hud hide show opacity",        "F4",          "Play");
@@ -5005,6 +5456,8 @@ void ShellWindow::executeCommandById(const std::string& cmdId) {
     if (cmdId == "drawer.profiles") { setDrawerState(true, 2); return; }
     if (cmdId == "drawer.device")   { setDrawerState(true, 3); return; }
     if (cmdId == "tab.gamepad")     { setDrawerState(true, 4); return; }
+    if (cmdId == "drawer.apps")     { setDrawerState(true, 5); return; }
+    if (cmdId == "drawer.files")    { setDrawerState(true, 6); return; }
     if (cmdId == "pad.mode") {
         profile_.padMode = (profile_.padMode == PAD_MODE_NATIVE) ? PAD_MODE_TOUCH : PAD_MODE_NATIVE;
         applyProfileToEngine(true);

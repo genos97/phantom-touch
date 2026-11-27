@@ -79,7 +79,7 @@ DrawerPanel::DrawerPanel() {
     ZeroMemory(&bounds_, sizeof(bounds_));
     ZeroMemory(&bodyClip_, sizeof(bodyClip_));
     ZeroMemory(&activeSliderTrack_, sizeof(activeSliderTrack_));
-    for (int i = 0; i < 5; ++i) scrollY_[i] = 0;
+    for (int i = 0; i < 7; ++i) scrollY_[i] = 0;
 }
 
 void DrawerPanel::setProfilesDir(const std::string& dir, const std::string& activePath) {
@@ -104,11 +104,25 @@ void DrawerPanel::refreshProfileList() {
 
 void DrawerPanel::setActiveTab(int tab) {
     if (tab < 0) tab = 0;
-    if (tab > 4) tab = 4;
+    if (tab > 6) tab = 6;
     if (tab != 4) selectedPadBtn_ = -1;
     activeTab_ = tab;
     clearFocus();
     if (tab == 2) refreshProfileList();
+}
+
+void DrawerPanel::setInstalledApps(const std::vector<DeviceAppInfo>& apps, bool loading, const std::string& statusMsg) {
+    installedApps_ = apps;
+    appsLoading_ = loading;
+    appsStatusMsg_ = statusMsg;
+}
+
+void DrawerPanel::setRemoteFiles(const std::string& currentDir, const std::vector<RemoteFileEntry>& entries,
+                                 bool loading, const std::string& statusMsg) {
+    if (!currentDir.empty()) remoteCurrentDir_ = currentDir;
+    remoteEntries_ = entries;
+    filesLoading_ = loading;
+    filesStatusMsg_ = statusMsg;
 }
 
 std::string DrawerPanel::specialRebindLabel() const {
@@ -249,14 +263,16 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
     const int hdrY = bounds.top + dp(10);
 
     // 1. Drawer Header + Close button
-    static const char* kTitles[5] = {
+    static const char* kTitles[7] = {
         "KEYMAP STUDIO",
         "SENSITIVITY & PHYSICS",
         "PROFILES MANAGER",
         "DEVICE & STREAM",
-        "GAMEPAD v2"
+        "GAMEPAD v2",
+        "PHONE APPS (2ND PHONE)",
+        "PHONE FILES (PC <-> PHONE)"
     };
-    GdiPlusDraw::textLeft(g, kTitles[(activeTab_ >= 0 && activeTab_ < 5) ? activeTab_ : 0], static_cast<float>(x0), static_cast<float>(hdrY + dp(12)), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - dp(32)));
+    GdiPlusDraw::textLeft(g, kTitles[(activeTab_ >= 0 && activeTab_ < 7) ? activeTab_ : 0], static_cast<float>(x0), static_cast<float>(hdrY + dp(12)), 13.0f, true, Theme::ACCENT_CYAN, static_cast<float>(w - dp(32)));
 
     RECT rCls = { bounds.right - dp(34), hdrY, bounds.right - dp(12), hdrY + dp(24) };
     bool hovCls = ptIn(rCls, hoverX, hoverY);
@@ -267,18 +283,22 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
                           hovCls ? Theme::ACCENT_RED : Theme::TEXT_SECONDARY);
     hotspots_.push_back(Hotspot{ rCls, DA_CLOSE, 0 });
 
-    // 2. 5 Navigation Tabs (KEYS | SENS | CFG | DEV | PAD)
-    const std::string tabNames[5] = {
+    // 2. 7 Navigation Tabs across 2 compact rows:
+    //    Row 1: KEYS | SENS | CFG | DEV
+    //    Row 2: PAD | APPS | FILES
+    const std::string tabNames[7] = {
         Strings::tr("tab.keys", "KEYS"),
         Strings::tr("tab.sens", "SENS"),
         Strings::tr("tab.cfg",  "CFG"),
         Strings::tr("tab.dev",  "DEV"),
-        Strings::tr("tab.pad",  "PAD")
+        Strings::tr("tab.pad",  "PAD"),
+        Strings::tr("tab.apps", "APPS"),
+        Strings::tr("tab.files","FILES")
     };
     int tabY = hdrY + dp(32);
-    int tabW = (w - dp(16)) / 5;
-    for (int i = 0; i < 5; ++i) {
-        RECT tr = { x0 + i * (tabW + dp(4)), tabY, x0 + i * (tabW + dp(4)) + tabW, tabY + dp(26) };
+    int row1W = (w - dp(12)) / 4;
+    for (int i = 0; i < 4; ++i) {
+        RECT tr = { x0 + i * (row1W + dp(4)), tabY, x0 + i * (row1W + dp(4)) + row1W, tabY + dp(24) };
         bool active = (activeTab_ == i);
         bool hov = ptIn(tr, hoverX, hoverY);
         GdiPlusDraw::roundedCard(g, tr, GdiPlusDraw::dpf(6.0f),
@@ -288,12 +308,29 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
         GdiPlusDraw::textCenter(g, tabNames[i],
                                 static_cast<float>(tr.left + tr.right) * 0.5f,
                                 static_cast<float>(tr.top + tr.bottom) * 0.5f,
-                                9.8f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+                                9.5f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
+        hotspots_.push_back(Hotspot{ tr, DA_TAB_0 + i, 0 });
+    }
+    int tabY2 = tabY + dp(28);
+    int row2W = (w - dp(8)) / 3;
+    for (int i = 4; i < 7; ++i) {
+        int col = i - 4;
+        RECT tr = { x0 + col * (row2W + dp(4)), tabY2, x0 + col * (row2W + dp(4)) + row2W, tabY2 + dp(24) };
+        bool active = (activeTab_ == i);
+        bool hov = ptIn(tr, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, tr, GdiPlusDraw::dpf(6.0f),
+                                 active ? Theme::ACCENT_CYAN_BG : (hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD),
+                                 active ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE,
+                                 active ? 1.4f : 1.0f);
+        GdiPlusDraw::textCenter(g, tabNames[i],
+                                static_cast<float>(tr.left + tr.right) * 0.5f,
+                                static_cast<float>(tr.top + tr.bottom) * 0.5f,
+                                9.5f, true, active ? Theme::ACCENT_CYAN : Theme::TEXT_SECONDARY);
         hotspots_.push_back(Hotspot{ tr, DA_TAB_0 + i, 0 });
     }
     const size_t chromeHdrHotspotsEnd = hotspots_.size();
 
-    int sepTop = tabY + dp(34);
+    int sepTop = tabY2 + dp(30);
     int footerH = dp(46);
     int sepBot = bounds.bottom - footerH;
     GdiPlusDraw::hLine(g, bounds.left + 1, bounds.right, sepTop, Theme::BORDER_CHROME);
@@ -318,8 +355,12 @@ void DrawerPanel::paint(Gdiplus::Graphics& g, const RECT& rawBounds,
         endY = paintTabProfiles(g, x0, startY, w, profile, activeProfilePath, foregroundPkg, hoverX, hoverY);
     } else if (activeTab_ == 3) {
         endY = paintTabDevice(g, x0, startY, w, settings, connected, deviceLabel, logs, hoverX, hoverY);
-    } else {
+    } else if (activeTab_ == 4) {
         endY = paintTabGamepad(g, x0, startY, w, profile, settings, hoverX, hoverY);
+    } else if (activeTab_ == 5) {
+        endY = paintTabApps(g, x0, startY, w, settings, connected, hoverX, hoverY);
+    } else {
+        endY = paintTabFiles(g, x0, startY, w, connected, hoverX, hoverY);
     }
 
     int contentH = (endY - startY) + dp(20);
@@ -1362,6 +1403,26 @@ int DrawerPanel::paintTabDevice(Gdiplus::Graphics& g, int x, int y, int w,
         }
     }
 
+    // Quick links to F8 Apps & F9 Two-Way Files
+    {
+        int qw = (w - 6) / 2;
+        RECT rApps = { x, y, x + qw, y + 28 };
+        RECT rFiles = { x + qw + 6, y, x + w, y + 28 };
+        bool hA = ptIn(rApps, hoverX, hoverY);
+        bool hF = ptIn(rFiles, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rApps, 6.0f, hA ? Theme::ACCENT_PURPLE : Theme::ACCENT_PURPLE_BG, Theme::ACCENT_PURPLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Apps & 2nd Phone", static_cast<float>(rApps.left + rApps.right) * 0.5f,
+                                static_cast<float>(y + 14), 10.0f, true, hA ? 0xFFFFFFFFu : Theme::ACCENT_PURPLE);
+        GdiPlusDraw::roundedCard(g, rFiles, 6.0f, hF ? Theme::ACCENT_CYAN : Theme::ACCENT_CYAN_BG, Theme::ACCENT_CYAN, 1.0f);
+        GdiPlusDraw::textCenter(g, "Browse / Pull Files", static_cast<float>(rFiles.left + rFiles.right) * 0.5f,
+                                static_cast<float>(y + 14), 10.0f, true, hF ? 0xFF08121Au : Theme::ACCENT_CYAN);
+        if (rApps.bottom > bodyClip_.top && rApps.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rApps, DA_OPEN_APPS_TAB, 0 });
+            hotspots_.push_back(Hotspot{ rFiles, DA_OPEN_FILES_TAB, 0 });
+        }
+        y += 34;
+    }
+
     // U4: Danger Zone / Stream Session Controls
     RECT rDZ = { x, y, x + w, y + 58 };
     GdiPlusDraw::roundedCard(g, rDZ, 8.0f, Theme::BG_CARD, Theme::SEM_DANGER, 1.0f);
@@ -1546,6 +1607,319 @@ int DrawerPanel::paintTabGamepad(Gdiplus::Graphics& g, int x, int y, int w,
     return rRstPad.bottom + 12;
 }
 
+int DrawerPanel::paintTabApps(Gdiplus::Graphics& g, int x, int y, int w,
+                              const AppSettings& s, bool connected, int hoverX, int hoverY) {
+    GdiPlusDraw::textLeft(g, "INSTALLED APPS & SECOND PHONE (F8)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::ACCENT_CYAN);
+    y += 20;
+
+    // Search input + Clear + Refresh + System filter
+    const int btnW = 54;
+    RECT rSearch = { x, y, x + w - btnW * 2 - 8, y + 26 };
+    RECT rRefresh = { rSearch.right + 4, y, rSearch.right + 4 + btnW, y + 26 };
+    RECT rFilter  = { rRefresh.right + 4, y, x + w, y + 26 };
+    GdiPlusDraw::roundedCard(g, rSearch, 6.0f, Theme::BG_INPUT,
+                             editingAppsSearch_ ? Theme::ACCENT_CYAN : Theme::BORDER_SUBTLE,
+                             editingAppsSearch_ ? 1.4f : 1.0f);
+    std::string searchShown = appsSearch_.empty() ? "Search apps..." : (editingAppsSearch_ ? (appsSearch_ + "_") : appsSearch_);
+    GdiPlusDraw::textLeft(g, searchShown, static_cast<float>(rSearch.left + 8), static_cast<float>(y + 13),
+                          10.5f, false, appsSearch_.empty() ? Theme::TEXT_MUTED : Theme::TEXT_PRIMARY,
+                          static_cast<float>((rSearch.right - rSearch.left) - 16));
+    if (rSearch.bottom > bodyClip_.top && rSearch.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rSearch, DA_APPS_FOCUS_SEARCH, 0 });
+    }
+
+    bool hovRef = ptIn(rRefresh, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rRefresh, 6.0f, hovRef ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textCenter(g, appsLoading_ ? "..." : "Sync", static_cast<float>(rRefresh.left + rRefresh.right) * 0.5f,
+                            static_cast<float>(y + 13), 10.0f, true, Theme::ACCENT_CYAN);
+    if (rRefresh.bottom > bodyClip_.top && rRefresh.top < bodyClip_.bottom && !appsLoading_) {
+        hotspots_.push_back(Hotspot{ rRefresh, DA_APPS_REFRESH, 0 });
+    }
+
+    bool hovSys = ptIn(rFilter, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rFilter, 6.0f,
+                             showSystemApps_ ? Theme::ACCENT_PURPLE_BG : (hovSys ? Theme::BG_CARD_HOVER : Theme::BG_CARD),
+                             showSystemApps_ ? Theme::ACCENT_PURPLE : Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textCenter(g, showSystemApps_ ? "All" : "User", static_cast<float>(rFilter.left + rFilter.right) * 0.5f,
+                            static_cast<float>(y + 13), 10.0f, true, showSystemApps_ ? Theme::ACCENT_PURPLE : Theme::TEXT_SECONDARY);
+    if (rFilter.bottom > bodyClip_.top && rFilter.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rFilter, DA_APPS_TOGGLE_SYSTEM, 0 });
+    }
+    y += 32;
+
+    if (!appsSearch_.empty()) {
+        RECT rClr = { x, y, x + w, y + 20 };
+        GdiPlusDraw::roundedCard(g, rClr, 5.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Clear filter: '" + appsSearch_ + "'", static_cast<float>(x + w / 2), static_cast<float>(y + 10), 9.5f, false, Theme::TEXT_SECONDARY);
+        if (rClr.bottom > bodyClip_.top && rClr.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rClr, DA_APPS_CLEAR_SEARCH, 0 });
+        }
+        y += 24;
+    }
+
+    if (!connected && installedApps_.empty()) {
+        RECT rEmpty = { x, y, x + w, y + 54 };
+        GdiPlusDraw::roundedCard(g, rEmpty, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Connect phone (USB or Wi-Fi) to list apps", static_cast<float>(x + w / 2), static_cast<float>(y + 20), 10.5f, false, Theme::TEXT_MUTED);
+        GdiPlusDraw::textCenter(g, "Tip: Use 2nd Phone or create Desktop .lnk shortcuts", static_cast<float>(x + w / 2), static_cast<float>(y + 38), 9.5f, false, Theme::TEXT_SECONDARY);
+        return rEmpty.bottom + 12;
+    }
+
+    if (appsLoading_ && installedApps_.empty()) {
+        RECT rLoad = { x, y, x + w, y + 48 };
+        GdiPlusDraw::roundedCard(g, rLoad, 8.0f, Theme::BG_CARD, Theme::ACCENT_CYAN, 1.0f);
+        GdiPlusDraw::textCenter(g, "Querying installed Android apps (list_apps)...", static_cast<float>(x + w / 2), static_cast<float>(y + 24), 10.5f, true, Theme::ACCENT_CYAN);
+        return rLoad.bottom + 12;
+    }
+
+    int userCount = 0;
+    for (size_t i = 0; i < installedApps_.size(); ++i) {
+        if (!installedApps_[i].isSystem || s.isAppPinned(installedApps_[i].packageName)) ++userCount;
+    }
+    const bool includeSys = showSystemApps_ || !appsSearch_.empty() || (userCount == 0);
+
+    std::vector<int> pinnedIdx, userIdx, sysIdx;
+    for (size_t i = 0; i < installedApps_.size(); ++i) {
+        const DeviceAppInfo& app = installedApps_[i];
+        bool match = appsSearch_.empty() ||
+                     containsCaseInsensitive(app.name, appsSearch_) ||
+                     containsCaseInsensitive(app.packageName, appsSearch_);
+        if (!match) continue;
+        bool pinned = s.isAppPinned(app.packageName);
+        if (pinned) pinnedIdx.push_back(static_cast<int>(i));
+        else if (!app.isSystem) userIdx.push_back(static_cast<int>(i));
+        else if (includeSys) sysIdx.push_back(static_cast<int>(i));
+    }
+
+    std::vector<int> shownIdx;
+    shownIdx.reserve(pinnedIdx.size() + userIdx.size() + sysIdx.size());
+    shownIdx.insert(shownIdx.end(), pinnedIdx.begin(), pinnedIdx.end());
+    shownIdx.insert(shownIdx.end(), userIdx.begin(), userIdx.end());
+    shownIdx.insert(shownIdx.end(), sysIdx.begin(), sysIdx.end());
+
+    if (!appsStatusMsg_.empty()) {
+        GdiPlusDraw::textLeft(g, appsStatusMsg_, static_cast<float>(x + 2), static_cast<float>(y + 8), 9.5f, false, Theme::TEXT_SECONDARY, static_cast<float>(w - 4));
+        y += 18;
+    }
+
+    if (shownIdx.empty()) {
+        RECT rNone = { x, y, x + w, y + 48 };
+        GdiPlusDraw::roundedCard(g, rNone, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "No matching apps. Click Sync or toggle All.", static_cast<float>(x + w / 2), static_cast<float>(y + 24), 10.5f, false, Theme::TEXT_MUTED);
+        return rNone.bottom + 12;
+    }
+
+    static const uint32_t kAvatarColors[6] = {
+        0xFF1A6ED8u, 0xFF148A5Au, 0xFF7B42BCu, 0xFFB85C14u, 0xFF0E7A8Au, 0xFFB03454u
+    };
+
+    const int maxRows = (appsSearch_.empty() && !showSystemApps_) ? 48 : 80;
+    const int renderCount = (static_cast<int>(shownIdx.size()) > maxRows) ? maxRows : static_cast<int>(shownIdx.size());
+    for (int ri = 0; ri < renderCount; ++ri) {
+        const int idx = shownIdx[ri];
+        const DeviceAppInfo& app = installedApps_[idx];
+        const bool pinned = s.isAppPinned(app.packageName);
+
+        RECT row = { x, y, x + w, y + 58 };
+        bool hovRow = ptIn(row, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, row, 7.0f, hovRow ? Theme::BG_CARD_HOVER : Theme::BG_CARD,
+                                 pinned ? Theme::ACCENT_AMBER : Theme::BORDER_SUBTLE, pinned ? 1.2f : 1.0f);
+
+        // Letter avatar (P6 fallback when Android app icon bitmap is unavailable)
+        char letter[2] = { 'A', '\0' };
+        for (size_t ci = 0; ci < app.name.size(); ++ci) {
+            unsigned char ch = static_cast<unsigned char>(app.name[ci]);
+            if (std::isalnum(ch)) {
+                letter[0] = static_cast<char>(std::toupper(ch));
+                break;
+            }
+        }
+        uint32_t hash = 0;
+        for (size_t pi = 0; pi < app.packageName.size(); ++pi) {
+            hash = hash * 33u + static_cast<unsigned char>(app.packageName[pi]);
+        }
+        RECT rAv = { x + 8, y + 8, x + 32, y + 32 };
+        GdiPlusDraw::roundedCard(g, rAv, 12.0f, kAvatarColors[hash % 6u], 0x33FFFFFFu, 1.0f);
+        GdiPlusDraw::textCenter(g, letter, static_cast<float>(rAv.left + rAv.right) * 0.5f,
+                                static_cast<float>(rAv.top + rAv.bottom) * 0.5f, 11.5f, true, 0xFFFFFFFFu);
+
+        GdiPlusDraw::textLeft(g, app.name, static_cast<float>(x + 40), static_cast<float>(y + 13), 11.0f, true, Theme::TEXT_PRIMARY, static_cast<float>(w - 72));
+        GdiPlusDraw::textLeft(g, app.packageName, static_cast<float>(x + 40), static_cast<float>(y + 26), 9.0f, false, Theme::TEXT_MUTED, static_cast<float>(w - 72));
+
+        // Pin pill (top-right)
+        RECT rPin = { x + w - 26, y + 6, x + w - 6, y + 26 };
+        bool hovPin = ptIn(rPin, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rPin, 5.0f,
+                                 pinned ? Theme::ACCENT_AMBER_BG : (hovPin ? Theme::BG_INPUT : 0x00000000u),
+                                 pinned ? Theme::ACCENT_AMBER : Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, pinned ? "*" : "+", static_cast<float>(rPin.left + rPin.right) * 0.5f,
+                                static_cast<float>(rPin.top + rPin.bottom) * 0.5f, 11.0f, true,
+                                pinned ? Theme::ACCENT_AMBER : Theme::TEXT_SECONDARY);
+
+        // Action row: [Open in 2nd Phone] [Launch] [Shortcut .lnk]
+        int bw1 = w - 132;
+        if (bw1 < 96) bw1 = 96;
+        RECT rSec = { x + 8, y + 34, x + 8 + bw1, y + 53 };
+        RECT rRun = { rSec.right + 4, y + 34, rSec.right + 56, y + 53 };
+        RECT rLnk = { rRun.right + 4, y + 34, x + w - 6, y + 53 };
+
+        bool hovSec = ptIn(rSec, hoverX, hoverY);
+        bool hovRun = ptIn(rRun, hoverX, hoverY);
+        bool hovLnk = ptIn(rLnk, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rSec, 5.0f, hovSec ? Theme::ACCENT_PURPLE : Theme::ACCENT_PURPLE_BG, Theme::ACCENT_PURPLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "2nd Phone", static_cast<float>(rSec.left + rSec.right) * 0.5f, static_cast<float>(y + 43.5f),
+                                9.5f, true, hovSec ? 0xFFFFFFFFu : Theme::ACCENT_PURPLE);
+        GdiPlusDraw::roundedCard(g, rRun, 5.0f, hovRun ? Theme::ACCENT_CYAN : Theme::BG_INPUT, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Open", static_cast<float>(rRun.left + rRun.right) * 0.5f, static_cast<float>(y + 43.5f),
+                                9.5f, true, hovRun ? 0xFF08121Au : Theme::TEXT_PRIMARY);
+        GdiPlusDraw::roundedCard(g, rLnk, 5.0f, hovLnk ? Theme::ACCENT_GREEN : Theme::ACCENT_GREEN_BG, Theme::ACCENT_GREEN, 1.0f);
+        GdiPlusDraw::textCenter(g, ".lnk", static_cast<float>(rLnk.left + rLnk.right) * 0.5f, static_cast<float>(y + 43.5f),
+                                9.5f, true, hovLnk ? 0xFF08121Au : Theme::ACCENT_GREEN);
+
+        if (row.bottom > bodyClip_.top && row.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rPin, DA_APP_TOGGLE_PIN, idx });
+            hotspots_.push_back(Hotspot{ rSec, DA_APP_OPEN_SECOND_PHONE, idx });
+            hotspots_.push_back(Hotspot{ rRun, DA_APP_LAUNCH_CURRENT, idx });
+            hotspots_.push_back(Hotspot{ rLnk, DA_APP_CREATE_SHORTCUT, idx });
+        }
+        y += 63;
+    }
+
+    if (static_cast<int>(shownIdx.size()) > renderCount) {
+        char truncBuf[96];
+        std::snprintf(truncBuf, sizeof(truncBuf), "Showing %d of %zu apps — type in Search to narrow.",
+                      renderCount, shownIdx.size());
+        GdiPlusDraw::textCenter(g, truncBuf, static_cast<float>(x + w / 2), static_cast<float>(y + 10), 9.5f, false, Theme::TEXT_MUTED);
+        y += 22;
+    }
+    return y + 10;
+}
+
+int DrawerPanel::paintTabFiles(Gdiplus::Graphics& g, int x, int y, int w,
+                               bool connected, int hoverX, int hoverY) {
+    GdiPlusDraw::textLeft(g, "TWO-WAY FILE BROWSER (F9)", static_cast<float>(x), static_cast<float>(y + 8), 10.5f, true, Theme::ACCENT_CYAN);
+    y += 20;
+
+    // Path card + Up + Refresh
+    RECT rPath = { x, y, x + w - 104, y + 26 };
+    RECT rUp   = { rPath.right + 4, y, rPath.right + 44, y + 26 };
+    RECT rRef  = { rUp.right + 4, y, x + w, y + 26 };
+    GdiPlusDraw::roundedCard(g, rPath, 6.0f, Theme::BG_INPUT, Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textLeft(g, remoteCurrentDir_.empty() ? "/sdcard" : remoteCurrentDir_,
+                          static_cast<float>(rPath.left + 8), static_cast<float>(y + 13), 10.0f, false,
+                          Theme::TEXT_PRIMARY, static_cast<float>((rPath.right - rPath.left) - 14));
+    GdiPlusDraw::roundedCard(g, rUp, 6.0f, ptIn(rUp, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textCenter(g, "Up", static_cast<float>(rUp.left + rUp.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::TEXT_PRIMARY);
+    GdiPlusDraw::roundedCard(g, rRef, 6.0f, ptIn(rRef, hoverX, hoverY) ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+    GdiPlusDraw::textCenter(g, filesLoading_ ? "..." : "Sync", static_cast<float>(rRef.left + rRef.right) * 0.5f, static_cast<float>(y + 13), 10.0f, true, Theme::ACCENT_CYAN);
+    if (rUp.bottom > bodyClip_.top && rUp.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rUp, DA_FILES_UP, 0 });
+        if (!filesLoading_) hotspots_.push_back(Hotspot{ rRef, DA_FILES_REFRESH, 0 });
+    }
+    y += 32;
+
+    // Quick folder jump pills
+    static const char* kJumpLbls[4] = { "/sdcard", "Download", "DCIM", "Pictures" };
+    int jw = (w - 12) / 4;
+    for (int ji = 0; ji < 4; ++ji) {
+        RECT rJ = { x + ji * (jw + 4), y, x + ji * (jw + 4) + jw, y + 22 };
+        bool hov = ptIn(rJ, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rJ, 5.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, kJumpLbls[ji], static_cast<float>(rJ.left + rJ.right) * 0.5f, static_cast<float>(y + 11),
+                                9.5f, false, Theme::TEXT_SECONDARY);
+        if (rJ.bottom > bodyClip_.top && rJ.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ rJ, DA_FILES_JUMP_DIR, ji });
+        }
+    }
+    y += 28;
+
+    // Push button + tip
+    RECT rPush = { x, y, x + w, y + 28 };
+    bool hovPush = ptIn(rPush, hoverX, hoverY);
+    GdiPlusDraw::roundedCard(g, rPush, 6.0f, hovPush ? Theme::ACCENT_GREEN : Theme::ACCENT_GREEN_BG, Theme::ACCENT_GREEN, 1.1f);
+    GdiPlusDraw::textCenter(g, "Push File from PC -> Phone (or Drag & Drop)",
+                            static_cast<float>(x + w / 2), static_cast<float>(y + 14), 10.0f, true,
+                            hovPush ? 0xFF08121Au : Theme::ACCENT_GREEN);
+    if (rPush.bottom > bodyClip_.top && rPush.top < bodyClip_.bottom) {
+        hotspots_.push_back(Hotspot{ rPush, DA_FILES_PUSH_PICKER, 0 });
+    }
+    y += 34;
+
+    if (!filesStatusMsg_.empty()) {
+        GdiPlusDraw::textLeft(g, filesStatusMsg_, static_cast<float>(x + 2), static_cast<float>(y + 8), 9.5f, false, Theme::TEXT_SECONDARY, static_cast<float>(w - 4));
+        y += 18;
+    }
+
+    if (!connected && remoteEntries_.empty()) {
+        RECT rEmpty = { x, y, x + w, y + 48 };
+        GdiPlusDraw::roundedCard(g, rEmpty, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Connect phone to browse /sdcard/ & pull files", static_cast<float>(x + w / 2), static_cast<float>(y + 24), 10.5f, false, Theme::TEXT_MUTED);
+        return rEmpty.bottom + 12;
+    }
+
+    if (filesLoading_ && remoteEntries_.empty()) {
+        RECT rLoad = { x, y, x + w, y + 44 };
+        GdiPlusDraw::roundedCard(g, rLoad, 8.0f, Theme::BG_CARD, Theme::ACCENT_CYAN, 1.0f);
+        GdiPlusDraw::textCenter(g, "Listing phone directory...", static_cast<float>(x + w / 2), static_cast<float>(y + 22), 10.5f, true, Theme::ACCENT_CYAN);
+        return rLoad.bottom + 12;
+    }
+
+    if (remoteEntries_.empty()) {
+        RECT rEmpty = { x, y, x + w, y + 44 };
+        GdiPlusDraw::roundedCard(g, rEmpty, 8.0f, Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, "Empty directory (click Sync to refresh)", static_cast<float>(x + w / 2), static_cast<float>(y + 22), 10.0f, false, Theme::TEXT_MUTED);
+        return rEmpty.bottom + 12;
+    }
+
+    auto formatFileSize = [](uint64_t bytes) -> std::string {
+        char buf[32];
+        if (bytes < 1024u) {
+            std::snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
+        } else if (bytes < 1024u * 1024u) {
+            std::snprintf(buf, sizeof(buf), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+        } else if (bytes < 1024ull * 1024ull * 1024ull) {
+            std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+        } else {
+            std::snprintf(buf, sizeof(buf), "%.2f GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+        }
+        return buf;
+    };
+
+    const int maxRows = 120;
+    const int nShow = (static_cast<int>(remoteEntries_.size()) > maxRows) ? maxRows : static_cast<int>(remoteEntries_.size());
+    for (int i = 0; i < nShow; ++i) {
+        const RemoteFileEntry& fe = remoteEntries_[i];
+        const bool isFolder = (fe.isDir || fe.isSymlink);
+        RECT row = { x, y, x + w, y + 36 };
+        bool hov = ptIn(row, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, row, 6.0f, hov ? Theme::BG_CARD_HOVER : Theme::BG_CARD, Theme::BORDER_SUBTLE, 1.0f);
+
+        GdiPlusDraw::textLeft(g, isFolder ? "[DIR]" : "[FILE]", static_cast<float>(x + 8), static_cast<float>(y + 18),
+                              9.5f, true, isFolder ? Theme::ACCENT_AMBER : Theme::ACCENT_CYAN);
+        GdiPlusDraw::textLeft(g, fe.name, static_cast<float>(x + 48), static_cast<float>(y + 12),
+                              10.5f, isFolder, Theme::TEXT_PRIMARY, static_cast<float>(w - 116));
+        std::string sub = isFolder
+            ? (fe.modified.empty() ? std::string("Folder") : fe.modified)
+            : (formatFileSize(fe.sizeBytes) + (fe.modified.empty() ? std::string() : ("  |  " + fe.modified)));
+        GdiPlusDraw::textLeft(g, sub, static_cast<float>(x + 48), static_cast<float>(y + 25),
+                              8.8f, false, Theme::TEXT_MUTED, static_cast<float>(w - 116));
+
+        RECT rAct = { x + w - 62, y + 7, x + w - 6, y + 29 };
+        bool hovAct = ptIn(rAct, hoverX, hoverY);
+        GdiPlusDraw::roundedCard(g, rAct, 5.0f,
+                                 hovAct ? (isFolder ? Theme::ACCENT_AMBER : Theme::ACCENT_CYAN) : Theme::BG_INPUT,
+                                 isFolder ? Theme::ACCENT_AMBER : Theme::BORDER_SUBTLE, 1.0f);
+        GdiPlusDraw::textCenter(g, isFolder ? "Open" : "Save...", static_cast<float>(rAct.left + rAct.right) * 0.5f,
+                                static_cast<float>(y + 18), 9.5f, true,
+                                hovAct ? 0xFF08121Au : (isFolder ? Theme::ACCENT_AMBER : Theme::TEXT_PRIMARY));
+        if (row.bottom > bodyClip_.top && row.top < bodyClip_.bottom) {
+            hotspots_.push_back(Hotspot{ row, isFolder ? DA_FILE_OPEN_DIR : DA_FILE_PULL, i });
+        }
+        y += 40;
+    }
+    return y + 10;
+}
+
 void DrawerPanel::applySliderValue(int sliderId, float normT, Profile& p, int selectedBtnIndex) {
     normT = clampf(normT, 0.0f, 1.0f);
     for (size_t i = 0; i < sliders_.size(); ++i) {
@@ -1668,6 +2042,17 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
     switch (hs.id) {
             case DA_TAB_0: case DA_TAB_1: case DA_TAB_2: case DA_TAB_3: case DA_TAB_4:
                 setActiveTab(hs.id - DA_TAB_0);
+                return true;
+            case DA_TAB_5:
+                setActiveTab(5);
+                if (installedApps_.empty()) out.requestRefreshApps = true;
+                return true;
+            case DA_TAB_6:
+                setActiveTab(6);
+                if (remoteEntries_.empty()) {
+                    out.requestBrowseRemoteDir = true;
+                    out.browseRemoteDir = remoteCurrentDir_.empty() ? "/sdcard" : remoteCurrentDir_;
+                }
                 return true;
             case DA_CLOSE: out.requestCloseDrawer = true; return true;
             case DA_SAVE:  out.requestSave = true; return true;
@@ -2050,6 +2435,103 @@ bool DrawerPanel::activateHotspot(const Hotspot& hs, Profile& profile, AppSettin
                 out.profileModified = true;
                 out.toastMessage = "Reset controller mapping to defaults";
                 return true;
+
+            case DA_OPEN_APPS_TAB:
+                setActiveTab(5);
+                if (installedApps_.empty()) out.requestRefreshApps = true;
+                return true;
+            case DA_APPS_FOCUS_SEARCH:
+                editingAppsSearch_ = true;
+                return true;
+            case DA_APPS_CLEAR_SEARCH:
+                appsSearch_.clear();
+                scrollY_[5] = 0;
+                return true;
+            case DA_APPS_REFRESH:
+                out.requestRefreshApps = true;
+                return true;
+            case DA_APPS_TOGGLE_SYSTEM:
+                showSystemApps_ = !showSystemApps_;
+                scrollY_[5] = 0;
+                return true;
+            case DA_APP_TOGGLE_PIN:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(installedApps_.size())) {
+                    const DeviceAppInfo& app = installedApps_[hs.extra];
+                    settings.togglePinApp(app.packageName);
+                    out.settingsModified = true;
+                    out.toastMessage = (settings.isAppPinned(app.packageName) ? "Pinned " : "Unpinned ") + app.name;
+                }
+                return true;
+            case DA_APP_OPEN_SECOND_PHONE:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(installedApps_.size())) {
+                    out.requestOpenAppSecondPhone = true;
+                    out.appPackage = installedApps_[hs.extra].packageName;
+                    out.appName = installedApps_[hs.extra].name;
+                }
+                return true;
+            case DA_APP_LAUNCH_CURRENT:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(installedApps_.size())) {
+                    out.requestLaunchAppCurrent = true;
+                    out.appPackage = installedApps_[hs.extra].packageName;
+                    out.appName = installedApps_[hs.extra].name;
+                }
+                return true;
+            case DA_APP_CREATE_SHORTCUT:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(installedApps_.size())) {
+                    out.requestCreateAppShortcut = true;
+                    out.appPackage = installedApps_[hs.extra].packageName;
+                    out.appName = installedApps_[hs.extra].name;
+                }
+                return true;
+
+            case DA_OPEN_FILES_TAB:
+                setActiveTab(6);
+                if (remoteEntries_.empty()) {
+                    out.requestBrowseRemoteDir = true;
+                    out.browseRemoteDir = remoteCurrentDir_.empty() ? "/sdcard" : remoteCurrentDir_;
+                }
+                return true;
+            case DA_FILES_UP: {
+                std::string cur = remoteCurrentDir_.empty() ? std::string("/sdcard") : remoteCurrentDir_;
+                while (cur.size() > 1 && cur.back() == '/') cur.pop_back();
+                size_t sl = cur.find_last_of('/');
+                std::string parent = (sl == std::string::npos || sl == 0) ? "/" : cur.substr(0, sl);
+                scrollY_[6] = 0;
+                out.requestBrowseRemoteDir = true;
+                out.browseRemoteDir = parent;
+                return true;
+            }
+            case DA_FILES_REFRESH:
+                out.requestBrowseRemoteDir = true;
+                out.browseRemoteDir = remoteCurrentDir_.empty() ? "/sdcard" : remoteCurrentDir_;
+                return true;
+            case DA_FILES_JUMP_DIR: {
+                static const char* kDirs[4] = { "/sdcard", "/sdcard/Download", "/sdcard/DCIM", "/sdcard/Pictures" };
+                int idx = (hs.extra >= 0 && hs.extra < 4) ? hs.extra : 0;
+                scrollY_[6] = 0;
+                out.requestBrowseRemoteDir = true;
+                out.browseRemoteDir = kDirs[idx];
+                return true;
+            }
+            case DA_FILES_PUSH_PICKER:
+                out.requestPushFilePicker = true;
+                out.pushTargetDir = remoteCurrentDir_.empty() ? "/sdcard/Download" : remoteCurrentDir_;
+                return true;
+            case DA_FILE_OPEN_DIR:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(remoteEntries_.size())) {
+                    scrollY_[6] = 0;
+                    out.requestBrowseRemoteDir = true;
+                    out.browseRemoteDir = remoteEntries_[hs.extra].fullPath;
+                }
+                return true;
+            case DA_FILE_PULL:
+                if (hs.extra >= 0 && hs.extra < static_cast<int>(remoteEntries_.size())) {
+                    out.requestPullRemoteFile = true;
+                    out.pullRemotePath = remoteEntries_[hs.extra].fullPath;
+                    out.pullFileName = remoteEntries_[hs.extra].name;
+                }
+                return true;
+
             default:
                 break;
     }
@@ -2108,6 +2590,11 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
             out.toastMessage = lbl + " bound to " + KeyCodes::toName(vk);
         }
         specialRebind_ = SRB_NONE;
+        return true;
+    }
+    if (editingAppsSearch_) {
+        if (vk == VK_RETURN || vk == VK_ESCAPE) { editingAppsSearch_ = false; return true; }
+        if (vk == VK_BACK && !appsSearch_.empty()) { appsSearch_.pop_back(); scrollY_[5] = 0; }
         return true;
     }
     if (editingPaletteSearch_) {
@@ -2179,7 +2666,7 @@ bool DrawerPanel::onKeyDown(int vk, Profile& profile, AppSettings& settings,
                 return true;
             }
             auto segGroup = [](int id) -> int {
-                if (id >= DA_TAB_0 && id <= DA_TAB_4) return 1;
+                if (id >= DA_TAB_0 && id <= DA_TAB_6) return 1;
                 if (id == DA_FIRE_CLAW || id == DA_FIRE_DRAG || id == DA_FIRE_DUAL) return 2;
                 if (id == DA_BOUNDS_UNBOUNDED || id == DA_BOUNDS_BOXED) return 3;
                 if (id >= DA_POLL_125 && id <= DA_POLL_MAX) return 4;
@@ -2233,6 +2720,13 @@ bool DrawerPanel::onMouseBind(int mouseVk, Profile& profile, DrawerActionResult&
 bool DrawerPanel::onChar(char ch, Profile& profile, AppSettings& settings,
                          int selectedBtnIndex, DrawerActionResult& out) {
     if (ch < 32 || ch > 126) return false;
+    if (editingAppsSearch_) {
+        if (appsSearch_.size() < 32) {
+            appsSearch_.push_back(ch);
+            scrollY_[5] = 0;
+        }
+        return true;
+    }
     if (editingPaletteSearch_) {
         if (paletteSearch_.size() < 24) paletteSearch_.push_back(ch);
         return true;

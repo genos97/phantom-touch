@@ -4,6 +4,8 @@ tab.sens = सेंस
 tab.cfg = प्रोफाइल
 tab.dev = डिवाइस
 tab.pad = पैड
+tab.apps = ऐप्स
+tab.files = फ़ाइलें
 
 sec.connection = कनेक्शन
 sec.stream = स्ट्रीम

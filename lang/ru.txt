@@ -4,6 +4,8 @@ tab.sens = ЧУВСТ.
 tab.cfg = ПРОФ.
 tab.dev = УСТР.
 tab.pad = ГЕЙМП.
+tab.apps = ПРИЛ.
+tab.files = ФАЙЛЫ
 
 sec.connection = ПОДКЛЮЧЕНИЕ
 sec.stream = ПОТОК

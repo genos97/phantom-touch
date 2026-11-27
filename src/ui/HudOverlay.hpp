@@ -174,6 +174,7 @@ private:
     int dibH_ = 0;
 
     bool embeddedD3DMode_ = false;
+    std::vector<uint8_t> embeddedBuf_;
     HudBitmapReadyFn d3dBitmapCb_ = nullptr;
     void* d3dBitmapCtx_ = nullptr;
     float modePulseAlpha_ = 0.0f;

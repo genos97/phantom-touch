@@ -103,6 +103,9 @@ bool HudOverlay::create(HWND ownerShellHwnd, HINSTANCE hInst) {
     hwnd_ = CreateWindowExA(exStyle, "PhantomTouchHudOverlay", "Phantom Touch HUD",
                             WS_POPUP, 0, 0, 100, 100,
                             ownerShellHwnd, NULL, hInst, this);
+    if (hwnd_ && embeddedBuf_.size() < 16u * 1024u * 1024u) {
+        embeddedBuf_.assign(16u * 1024u * 1024u, 0);
+    }
     return hwnd_ != NULL;
 }
 
@@ -348,17 +351,40 @@ void HudOverlay::renderLayered() {
     int w = lastScreenRect_.right - lastScreenRect_.left;
     int h = lastScreenRect_.bottom - lastScreenRect_.top;
     if (w < 32 || h < 32) return;
-    if (!ensureSurface(w, h)) return;
+    const size_t pixelBytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+    uint8_t* pixels = NULL;
+    if (embeddedD3DMode_) {
+        if (embeddedBuf_.size() < pixelBytes) {
+            embeddedBuf_.resize(pixelBytes);
+        }
+        pixels = embeddedBuf_.data();
+    } else {
+        if (!ensureSurface(w, h)) return;
+        pixels = static_cast<uint8_t*>(dibBits_);
+    }
 
     const Profile& p = host_->hudProfile();
     EngineTelemetry tel = host_->hudTelemetry();
     bool editMode = host_->hudIsEditMode();
     bool demoMode = host_->hudIsDemoMode();
     bool aimMode  = host_->hudIsAimMode();
+    const bool hasToast = (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0);
+    if (!editMode) {
+        std::memset(pixels, 0, pixelBytes);
+    }
+    const bool needPlayPaint =
+        (p.keymapEnabled && (p.showHudInPlay || demoMode)) ||
+        (!embeddedD3DMode_ && modePulseAlpha_ > 0.01f) ||
+        (p.keymapEnabled && aimMode && !demoMode && !embeddedD3DMode_) ||
+        (host_->hudIsFullscreen() && !aimMode) ||
+        hasToast;
+    if (!editMode && !hasToast) {
+        ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
+    }
 
-    {
-        // Wrap our 32-bit top-down DIBSection directly as PixelFormat32bppPARGB for perfect alpha compositing!
-        Gdiplus::Bitmap bmp(w, h, w * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(dibBits_));
+    if (editMode || needPlayPaint) {
+        // Wrap our 32-bit top-down pixel buffer directly as PixelFormat32bppPARGB for perfect alpha compositing!
+        Gdiplus::Bitmap bmp(w, h, w * 4, PixelFormat32bppPARGB, pixels);
         Gdiplus::Graphics g(&bmp);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
@@ -401,9 +427,7 @@ void HudOverlay::renderLayered() {
                 HudRenderer::paintRebindPrompt(g, w, h, targetName, specialAim);
             }
         } else {
-            // Play Mode: 100% transparent outside the frosted keycaps!
-            g.Clear(Gdiplus::Color(0, 0, 0, 0));
-
+            // Play Mode: dibBits_ is already 100% transparent outside keycaps!
             std::vector<KeyConflict> playConflicts = EditorGeometry::detectConflicts(p, aimMode);
             HudEditExtras ex;
             ex.conflicts = &playConflicts;
@@ -429,7 +453,7 @@ void HudOverlay::renderLayered() {
             }
         }
 
-        if (!toastMsg_.empty() && static_cast<LONG>(GetTickCount() - toastExpireTick_) < 0) {
+        if (hasToast) {
             HudRenderer::paintToastWithAction(g, w, h, toastMsg_, toastActionLabel_, &toastActionRc_);
         } else {
             ZeroMemory(&toastActionRc_, sizeof(toastActionRc_));
@@ -438,7 +462,7 @@ void HudOverlay::renderLayered() {
 
     if (embeddedD3DMode_) {
         if (d3dBitmapCb_) {
-            d3dBitmapCb_(d3dBitmapCtx_, dibBits_, w, h);
+            d3dBitmapCb_(d3dBitmapCtx_, pixels, w, h);
         }
         return;
     }
